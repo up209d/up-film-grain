@@ -1,0 +1,275 @@
+:root {
+  --bg: #0d0e10;
+  --panel: #16181c;
+  --panel2: #1d2026;
+  --line: #2a2e36;
+  --text: #e6e8ec;
+  --dim: #8b929e;
+  --accent: #d8a05a;
+  --accent2: #c46a4a;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 ui-sans-serif, -apple-system, "SF Pro Text", Inter, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app { display: flex; flex-direction: column; height: 100%; }
+
+/* ------------------------------------------------------------------ bar -- */
+.bar {
+  display: flex; align-items: center; gap: 14px;
+  padding: 10px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; letter-spacing: .2px; }
+.dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: radial-gradient(circle at 30% 30%, var(--accent), var(--accent2));
+}
+.spacer { flex: 1; }
+.meta { color: var(--dim); font-variant-numeric: tabular-nums; }
+.status { color: var(--dim); font-variant-numeric: tabular-nums; min-width: 66px; text-align: right; }
+.status.busy { color: var(--accent); }
+
+/* ----------------------------------------------------------------- body -- */
+.body { display: flex; flex: 1; min-height: 0; }
+
+.stage {
+  flex: 1; min-width: 0;
+  display: flex; align-items: stretch;
+  background:
+    repeating-conic-gradient(#141519 0% 25%, #101115 0% 50%) 50% / 22px 22px;
+  overflow: hidden;
+  position: relative;
+}
+.stage.grab .panes { cursor: grab; }
+.stage.grab .panes:active { cursor: grabbing; }
+
+/* One pane in overlay mode, two in side-by-side. Each clips its own image, so
+   a pane is the viewport the fit zoom is computed against. */
+.panes { flex: 1; min-width: 0; display: flex; gap: 2px; }
+.pane { flex: 1; min-width: 0; position: relative; overflow: hidden; }
+.stage.side .pane + .pane { border-left: 1px solid var(--line); }
+
+/* Position and size come from JS -- the image is placed in source pixels
+   times the zoom, not fitted by CSS, so both panes land on identical
+   coordinates. */
+.frame {
+  position: absolute;
+  display: block;
+  user-select: none;
+  max-width: none; max-height: none;
+}
+
+.tag {
+  position: absolute; z-index: 2; top: 8px; left: 8px;
+  padding: 2px 7px; border-radius: 4px;
+  background: rgba(10,11,14,.72); border: 1px solid var(--line);
+  color: var(--dim); font-size: 10.5px; letter-spacing: .5px;
+  text-transform: uppercase; pointer-events: none;
+}
+
+.divider {
+  position: absolute; top: 0; bottom: 0; width: 1px;
+  background: rgba(255,255,255,.75);
+  box-shadow: 0 0 0 1px rgba(0,0,0,.45);
+  pointer-events: none;
+}
+
+/* Zoom controls, overlaid on the preview rather than parked in the panel --
+   they act on what is directly under them. */
+.viewbar {
+  position: absolute; z-index: 3; top: 10px; right: 10px;
+  display: flex; gap: 4px;
+  padding: 4px; border-radius: 8px;
+  background: rgba(10,11,14,.78);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(6px);
+}
+.viewbar .seg { padding: 4px 9px; font-size: 11.5px; }
+/* Shown only while the view is enlarged past what the proxy can resolve. */
+.viewbar .fid {
+  display: inline-flex; align-items: center;
+  padding: 0 8px; border-radius: 5px;
+  background: #4a3410; border: 1px solid #7a5715; color: #f0c674;
+  font-size: 10.5px; letter-spacing: .5px; text-transform: uppercase;
+}
+.viewbar .seg.icon { width: 28px; padding: 4px 0; font-size: 14px; line-height: 1; }
+.viewbar .zoomval { min-width: 52px; font-variant-numeric: tabular-nums; }
+
+.stage.empty { border: none; align-items: center; justify-content: center; }
+.drop {
+  display: flex; flex-direction: column; gap: 6px; align-items: center;
+  padding: 46px 60px;
+  border: 1px dashed var(--line); border-radius: 10px;
+  color: var(--dim);
+}
+.drop strong { color: var(--text); font-size: 15px; font-weight: 600; }
+
+/* ---------------------------------------------------------------- panel -- */
+.panel {
+  flex: 0 0 330px;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  padding: 12px;
+  overflow-y: auto;
+  display: flex; flex-direction: column; gap: 10px;
+}
+
+.row { display: flex; gap: 6px; }
+.row > * { flex: 1; }
+
+.hint { margin: 0; color: var(--dim); font-size: 11.5px; line-height: 1.4; }
+
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field > label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .6px; }
+.fieldbody { display: flex; align-items: center; gap: 8px; }
+.fieldbody input[type="range"] { flex: 1; }
+.val { color: var(--dim); min-width: 46px; text-align: right; font-variant-numeric: tabular-nums; }
+
+button, select, .btn {
+  background: var(--panel2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+button:hover:not(:disabled), .btn:hover { border-color: #3a404a; }
+button:disabled { opacity: .45; cursor: default; }
+.btn { display: inline-flex; align-items: center; justify-content: center; }
+.btn.primary { background: var(--accent); color: #1a1206; border-color: var(--accent); font-weight: 600; }
+.btn.ghost { background: transparent; }
+.seg.on { background: var(--accent); color: #1a1206; border-color: var(--accent); font-weight: 600; }
+
+/* ---------------------------------------------------------------- zoom -- */
+/* Per-section reset and on/off, in the group header. */
+.grpbtn {
+  width: 18px; height: 18px; padding: 0;
+  border-radius: 4px;
+  background: var(--panel2); border: 1px solid var(--line);
+  color: var(--dim); font-size: 11px; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: 0 0 auto;
+}
+/* The first of the pair takes the slack, so both sit hard right. */
+.grpbtn:first-of-type { margin-left: auto; }
+.grpbtn:hover { color: var(--text); border-color: var(--accent); }
+.grpbtn.on { background: var(--accent); color: #1a1206; border-color: var(--accent); }
+
+.swap {
+  flex: 0 0 68px;
+  background: var(--panel2); border: 1px solid var(--line);
+  font-weight: 600; letter-spacing: .2px;
+}
+.swap.on { background: #e8ecf2; color: #14161a; border-color: #e8ecf2; }
+
+/* -------------------------------------------------------------- tooltip -- */
+.help {
+  flex: 0 0 auto;
+  width: 15px; height: 15px; padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  color: var(--dim);
+  font-size: 10px; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: help;
+}
+.title:hover .help, .help:focus-visible { color: var(--text); border-color: var(--accent); outline: none; }
+
+.tip {
+  position: fixed;
+  z-index: 50;
+  width: 252px;
+  padding: 9px 11px;
+  background: #23262c;
+  border: 1px solid #3a404a;
+  border-radius: 7px;
+  color: var(--text);
+  font-size: 12px; line-height: 1.45;
+  box-shadow: 0 8px 26px rgba(0,0,0,.55);
+  pointer-events: none;
+}
+
+/* --------------------------------------------------------------- groups -- */
+.groups { display: flex; flex-direction: column; gap: 2px; }
+.group { border-top: 1px solid var(--line); padding-top: 6px; }
+.group h3 {
+  margin: 0 0 6px; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .7px; color: var(--dim);
+  cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 6px;
+}
+.chev { display: inline-block; transition: transform .12s ease; }
+.chev.open { transform: rotate(90deg); }
+
+.slider { margin-bottom: 9px; }
+.slabel {
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 3px; font-size: 12px;
+}
+/* The title and its help badge are one hover target -- see Help() in App.tsx.
+   `flex: 1` keeps the numeric field pinned to the right of the row. */
+.slabel > .title {
+  flex: 1;
+  display: inline-flex; align-items: center; gap: 6px;
+  min-width: 0;
+  cursor: help;
+}
+.slabel em { color: var(--dim); font-style: normal; font-size: 11px; }
+.num {
+  width: 62px; text-align: right;
+  background: var(--panel2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 2px 5px; font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+input[type="range"] {
+  width: 100%; height: 18px; margin: 0;
+  -webkit-appearance: none; appearance: none; background: transparent;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 3px; border-radius: 2px; background: #33383f;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 13px; height: 13px; border-radius: 50%;
+  background: var(--text); border: none; margin-top: -5px;
+}
+input[type="range"]:active::-webkit-slider-thumb { background: var(--accent); }
+
+/* --------------------------------------------------------------- export -- */
+.export { display: flex; gap: 6px; border-top: 1px solid var(--line); padding-top: 10px; }
+.export select { flex: 0 0 130px; }
+.export .btn { flex: 1; }
+
+.job { display: flex; align-items: center; gap: 8px; color: var(--dim); font-size: 11.5px; }
+.pbar { flex: 1; height: 4px; background: #2a2e36; border-radius: 2px; overflow: hidden; }
+.pbar > div { height: 100%; background: var(--accent); transition: width .2s ease; }
+
+.err {
+  background: #3a1d1d; border: 1px solid #6b2f2f; color: #ffbcbc;
+  padding: 7px 9px; border-radius: 6px; font-size: 12px;
+}
+
+/* Confirmations for actions with no visible result of their own -- a browser
+   download in particular is completely silent. Not an error, so not red. */
+.note {
+  margin: 0;
+  background: var(--panel2); border: 1px solid var(--line); color: var(--dim);
+  padding: 6px 9px; border-radius: 6px; font-size: 11.5px; line-height: 1.4;
+  word-break: break-word;
+}

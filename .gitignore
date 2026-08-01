@@ -1,0 +1,22 @@
+# Compiled distribution. Reproduced by ./build.sh, and it carries copies of
+# server/, web/dist/ and presets/ that would otherwise be committed twice.
+build/
+
+# Compiled client. Also a build artifact -- ./build.sh (or `npm run build` in
+# web/) regenerates it. run.sh checks for it and says so if it is missing.
+web/dist/
+
+# Environments. .venv is ~720MB of torch and is per-machine anyway; the exact
+# versions are pinned in Pipfile.lock.
+.venv/
+web/node_modules/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local Claude Code permissions -- machine-specific by design.
+.claude/settings.local.json
+
+# macOS
+.DS_Store
