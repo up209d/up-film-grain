@@ -95,7 +95,7 @@ exports are wrong.
 pass-through, luminance response, edge bias, the smooth-area guard, 16-bit PNG
 validity, the global-grain overlay, edge softening, edge jitter and its
 direction bias, edge sanding, scatter, output sharpening and the film-texture
-section — 94 checks. It exits non-zero on failure.
+section — 119 checks. It exits non-zero on failure.
 
 The global-grain, edge-softening, edge-sanding, scatter and sharpening checks
 exist because those stages ship at 0, so the default-parameter checks render
@@ -173,6 +173,120 @@ breaks their whole purpose:
 `ENGINE.render_view` / `render_crop` are no longer called by `main.py` but are
 still exercised by `verify.py`, which is the only place the crop and zoom
 invariants are checked at all now. Do not delete them.
+
+## Halation blue compensation, and why it runs *before* the wash (2026-08-01)
+
+Halation adds warm light in linear light, and **adding light desaturates
+whatever it lands on** — that is not a bug to tune out, it is what addition
+does. A red-tinted bloom lifts a blue sky's red channel by the full glow and
+its blue channel by a tenth of it, so the sky loses colour toward grey and
+drifts toward purple. Reported by the user, and real: measured on an ordinary
+sky, **16% of the saturation gone and a +5.8° hue swing**.
+
+There are two regimes, and they want different answers:
+
+* **Threshold above the sky's luma** (the default 0.72). The wash is a *local*
+  rim: measured, sat 0.769 → 0.574 at 10px outside a highlight, 0.732 at 50px,
+  and untouched past 90px. A uniform compensation over-corrects the 90% of the
+  frame that was never damaged.
+* **Threshold below the sky's luma** (`Stock`-era presets, and `Organic` at
+  0.30 against a sky luma of 0.366). The sky is over the threshold, so **it
+  blooms onto itself** and the loss is uniform across the frame. This is the
+  case the control is for, and the one a shipped preset actually hits.
+
+Worth saying out loud: in the second regime **raising `halation_threshold`
+above the sky's luma fixes it outright** — 0.30 → 0.45 on `Organic` measures
+sat 0.660 → 0.778 and hue 225.3 → 219.7, against an untouched 0.769/220.0.
+Reach for the compensation when the low threshold is wanted for the look.
+
+**Before the wash, not after** — I measured both with the identical mask:
+
+| amount | before the wash | after the wash |
+|---|---|---|
+| 0.5 | +0.6% past target | +8.8% |
+| 1.0 | +3.5% | **+30%, a channel driven to black** |
+| 3.0 | +3.5% | pinned at fully saturated |
+
+Compensating *before* is self-limiting because the wash eats the same share of
+whatever is added, so the control has a natural brake and cannot be over-cooked.
+Applied *after* there is no brake at all, and by amount 1.0 it has crushed the
+minimum channel to zero — posterisation and hue break, not a correction.
+
+Two more reasons, both structural:
+
+* After the wash there is no way to tell blue that was *unfairly* greyed from
+  blue the bloom is **supposed** to be sitting on. Re-saturating there fights
+  the glow you paid for. It would need the glow field carried out of the
+  halation block to know the difference. Before the wash the question never
+  arises: this changes what was *recorded*, and halation then does its job to
+  it — which is also the physical order, a punchier blue layer or a polariser
+  rather than retouching.
+* It is the cheaper place. Purely per-pixel, no kernel, so `pad_for` is
+  unchanged (pinned at 58px in `verify.py`).
+
+Two things that had to be right:
+
+* **The glow is computed before the compensation runs**, so dialling blue
+  cannot move the bloom. Pinned bit-exactly: probed on a grey field lit by a
+  saturated blue source, the glow on the surrounding ring moves **0.00e+00**
+  while the blue source itself moves 0.432. Without that ordering,
+  `halation_blue` and `halation_threshold` would fight each other.
+* **Saturation cannot fix hue.** Scaling chroma about the luma axis is a
+  radial operation and by construction rotates nothing — measured, +7.1° of
+  error left on the table by the amount slider alone, and `halation_blue_shift`
+  at −8° takes it to +0.1°. The second slider is not decoration.
+
+### The gate is brightness, not hue width (corrected 2026-08-01)
+
+The first version exposed a **Blue Range** hue-width slider. That was the wrong
+control, and the user found it by using it: cranking Blue Compensation made
+deep blue go lurid. The mask knew *what colour* a pixel was and nothing about
+whether the wash had ever reached it, so every bit of correction on an
+undamaged pixel was pure overshoot.
+
+Measured up a sky gradient away from the sun, saturation loss runs **23% at the
+bright end and flat 0% below about half brightness** — halation only reaches
+what is near the light. And at amount 2.0 the ungated mask took an untouched
+deep sky from 0.872 saturation to **1.000**: a channel clamped to black. That is
+a missing term in the mask, not a setting to avoid.
+
+So the hue width is a constant (`_BLUE_RANGE`, 70°) and the slider is
+`halation_blue_level` — how light a blue has to be before it is worth saving —
+with `halation_blue_falloff` as a **separate** width, because deriving the ramp
+from the knee would make moving one change the other and a sky is exactly the
+broad gradient that shows up a hard switch-on. Same pattern as
+`lum_low`/`shadow_falloff`, and quintic for the same reason.
+
+**Read the brightness display-referred, and encode before taking the luma.**
+`_linear_to_srgb(_luma(lin))` is cheaper and wrong — the transfer curve is
+non-linear so it does not commute with a weighted sum, and it reads a deep sky
+**23% brighter than it is**, putting this slider on a different scale from the
+Luminance Response knees it is meant to match. Linear luma is worse still: it
+crushes an ordinary sky to 0.05 and wastes the top nine tenths of the slider.
+
+Known limit, measured: a fixed brightness gate is a *proxy* for "where the wash
+reached", and in the high-threshold regime the two do not line up exactly —
+0.487 display luma carries 1.8% damage and 0.519 carries 23.4%, only 0.03
+apart. The exact answer is to weight the mask by the **glow field itself**,
+which is already computed two lines above, is tile-independent (fixed
+threshold, no statistics) and would make over-correction structurally
+impossible in both regimes. Not done: it would silently change what every
+existing `halation_blue` value means, and the brightness gate is what the user
+asked for. One multiply if it is ever wanted.
+
+`_BLUE_HUE` is **230°, measured in linear light** where the stage runs, not the
+sRGB number. The transfer curve is per-channel and monotonic so it preserves
+the hue *sector* but moves the angle inside it by 6–10°: an ordinary sky is
+220° in sRGB and 230° in linear. Skies span 222° (pale) to 236° (zenith);
+cyan water is 194° and purple shadow 249°, so the fixed 70° window separates
+them. The mask is weighted by existing saturation on `vibrance`'s reasoning —
+it must strengthen blue that is *there* and never invent it in grey, or every
+neutral in the frame picks up a cast. Grey and red are left **bit-exact** at
+maximum settings.
+
+Gated on `halation > 0.01`. With no wash there is nothing to compensate and the
+control would just be a blue grade, which is deferred — `verify.py` pins it at
+0.00e+00.
 
 ## Scatter: diffusion without the average (added 2026-08-01)
 
@@ -270,12 +384,23 @@ Everything above it models what the *emulsion* does; this models what happened
 to the strip of film afterwards. It is weighted by none of the image masks — a
 scratch does not care what is underneath it — and every parameter ships at 0.
 
-**Do not reimplement this by scattering objects.** A list of speck positions is
-a statistic of the region: an export would split a scratch across two tiles, or
-draw a different list per tile. Every mark here is a *threshold on a noise
-field addressed in global coordinates*, so every pixel gets the same answer
-whichever tile asks. It also happens to look better — the outlines are organic
-because the field is, where stamped sprites repeat.
+**Do not reimplement dust, scratches or hair by scattering objects.** A list of
+speck positions is a statistic of the region: an export would split a scratch
+across two tiles, or draw a different list per tile. Those three marks are each
+a *threshold on a noise field addressed in global coordinates*, so every pixel
+gets the same answer whichever tile asks. It also happens to look better — the
+outlines are organic because the field is, where stamped sprites repeat.
+
+**Light leaks are the exception, and the distinction is worth being precise
+about.** `_leak_sites` does build a list of objects, and it is tile-independent
+anyway, because the list is a function of the *count, the seed and nothing
+else* — every tile builds the identical list, and so does the proxy, and so
+does the export. What breaks tile independence is deriving a list from the
+region being rendered: N specks per tile, or positions drawn against the tile's
+own area. Neither happens here. Leaks earn the exception because a leak is not
+a mark, it is a beam with a source, a direction and a length, and a field that
+only knows "how far am I from the nearest border" can express none of those —
+see the section below for what that cost.
 
 How each shape is made, and the measured result at full strength:
 
@@ -284,7 +409,7 @@ How each shape is made, and the measured result at full strength:
 | dust | isotropic fine noise, two populations (dark motes, bright pinholes) | 0.62% | 1.0:1, compact |
 | scratches | noise with cells ~2px wide and ~900px tall — the anisotropy *is* the scratch | 0.18% | 74:1, 1.1px wide |
 | hair | level set of a smooth field: `|n − 0.5| < eps` is a curve that wanders | 0.37% | 2.0px wide |
-| light leak | frame-edge falloff × slow noise, added in **linear** light | 22% | broad |
+| light leak | oriented beams anchored on the perimeter, added in **linear** light | 34% at 6 | 1.3:1 along/deep |
 
 Every mark type is passed through `_weather()`, which is what stops the section
 looking generated. A thresholded field gives every mark an identical crisp edge
@@ -298,41 +423,174 @@ slope down 26-33%, while the crisp-to-soft ratio *widens* (scratches 13.8x to
 asserted: a uniform blur would pass a mean test and be exactly the artificial
 result this exists to avoid.
 
-Light leaks vary per leak too, through `leak_variation`: reach into the frame
-(the size), falloff exponent (the halo, broad glow versus tight rim), edge
-hardness and strength. At 0 every leak is identical, which is exactly what read
-as stamped. Two things had to be fixed together to make it work, and either
-alone does nothing:
+### A leak is a beam, not a border wash (rewritten 2026-08-02)
 
-* The wash cell was 700px — **wider than a frame**, so there was only ever one
-  leak and nothing to be non-uniform *against*. Same trap as the hair gate.
-  240px gives three or four along a border.
-* Value noise is far too centre-weighted to use raw as a variation field:
-  measured p10-p90 spans only 0.41-0.71, std 0.11. A 9x range of available
-  reach still produced near-identical leaks. `_spread()` stretches it about the
-  field's median (0.578) before use.
+The user reported the leak shape as "very off" and they were right. Everything
+above the shape — pixel sizes, the feather-to-exponent mapping, the centre-fog
+cap — survived the rewrite unchanged; the *shape itself* was replaced.
 
-Measured on a 2000x1400 plate, per-leak strength spread goes 3% at variation 0
-to 20% at 1. Note the plate size: the leak field's cells are fixed in pixels,
-so on a small frame only a handful of leaks fit and the corners truncate them —
-the statistic then ranks the two settings *backwards*. The check uses its own
-larger plate for that reason.
+**What it used to be.** `edge_d = min(distance to each border)`, raised to a
+falloff exponent, multiplied by a slow noise field gated along the perimeter.
+Read out loud that is: a soft inward wash, present on all four borders at once,
+with a boundary made entirely of noise. Rendered, it is a chewed-up vignette.
+It had none of the three things a light leak actually has:
 
-A light leak has **two** visible edges and both need softening or it reads as
-a painted shape: the radial falloff coming in from the border, and the
-transition along the border where one leak stops. `leak_feather` drives both --
-the falloff exponent (4.0 tight rim down to 0.5 broad wash) and the gate band
-width. The exponent matters more than the reach: at a high exponent a leak with
-plenty of reach still lands as a thin bright rim, because it drops away
-immediately past the border.
+* **No direction.** The only spatial variable was depth from the nearest
+  border, which is isotropic along it. A leak could not lean, could not cross
+  the frame, could not point anywhere.
+* **No definite edge.** Every boundary was a `smoothstep` on value noise, so
+  everything faded into everything. The reference photographs are unanimous
+  that a leak has "a definite edge that is limiting its reach" — that is the
+  shadow of whatever the light got past, and it is most of what separates a
+  leak from haze.
+* **No count.** The gate was a pair of noise quantiles, so asking for two
+  leaks still washed most of the border; the control really only moved how
+  ragged the wash was.
 
-**The gate must vary only *along* the border, never with depth.** It used to be
-one isotropic field, which also varied going inward -- so it shut the leak off a
-little way in however much reach it had, and `leak_size` was fighting the gate
-rather than setting the size. There are now two washes, each stretched to be
-constant inward (`cell_y` of 40000px for the horizontal one), selected by which
-border a pixel is nearest. Measured after the fix: size 0.1 reaches 69px into a
-1000px frame, size 1.0 reaches 193px, coverage 4.1% to 20.7%.
+It also had a bug that shows in any render: `torch.where(near_horizontal, ...)`
+picked between a horizontal and a vertical wash field on the frame's diagonals,
+which draws a **hard 45° crease out of every corner**.
+
+**What it is now.** `_leak_sites` returns one record per leak — position on the
+perimeter, reach, along-border length, lean, fan, edge hardness, strength, hue
+— and each is drawn as a beam:
+
+```
+u  = perpendicular depth from that leak's own border   (+ domain warp)
+v  = (s - s0) - shear * u                              (+ domain warp)
+along  = clamp(1 - u/reach, 0) ** expo                 <- the feather mapping
+across = band(|v| / halfwidth(u)), one edge hard       <- the definite edge
+```
+
+Four things about that are deliberate:
+
+* **The obliquity is a shear on `v`, not a rotation of the frame.** A rotated
+  beam's "length" is measured along its own axis, and `leak_size` would stop
+  being the depth it promises. Sheared, a leak can lean 60° across the picture
+  while `reach` stays exactly the perpendicular penetration — so every existing
+  size and feather measurement still means what it meant.
+* **The along-border length is a fraction of the *border*, not a multiple of
+  the reach** (floored at `0.55 * reach`, since light through a slot cannot be
+  much narrower than it is deep). A seal fails along a seam: the leak runs a
+  long way sideways and comes in a modest depth. Sizing the length off the
+  depth instead — which is what I tried first — makes every leak roughly as
+  long as it is deep, i.e. a blob. Measured, median length/depth 1.30.
+* **One edge is much harder than the other**, picked per leak. Both soft is
+  haze; both hard is a painted shape. Measured, median steepest-edge ratio 2.55
+  between a leak's two sides, and `verify.py` pins it.
+* **Noise perturbs the shape instead of being the shape.** Two octaves of
+  domain warp on `u` and `v`. That inversion is the whole difference between an
+  organic outline and fog.
+
+**`_LEAK_CORNER_BIAS` must stay under 1/2π = 0.159.** The corner pull is
+`t - bias * sin(2πt)` applied inside a border segment, and above that threshold
+the map stops being monotonic and starts *folding*: at my first value of 0.24
+its slope reaches −0.51, which sends a quarter of the way along a border to one
+hundredth of the way along it. Every leak then piles into a corner — not a
+bias, a collapse, and it looks exactly like the four-corner symmetry the
+rewrite was meant to escape. It is 0.10.
+
+**A leak's core is white and only its falloff is coloured, and no fixed tint
+can do that.** Adding `leak * (1, 0.45, 0.19)` keeps the same chromaticity at
+every strength, which is why the old wash read as flat tan wherever it was
+visible. The response is now per channel and saturating —
+`added = 1 − exp(−k_c · E)` — which is one dye layer clipping at a time, and it
+gives the real progression: deep red where only the red-sensitive layer caught
+enough light, through orange and yellow, to white where all three are at the
+top. It also self-limits at 1.0 in linear light, so a hot leak cannot drive a
+channel past white.
+
+The consequence worth knowing: **`leak_feather` is the half-strength distance
+of the light the leak *deposits*, not of the pixels.** The response compresses
+the top, so on a blown leak the visible half-way point sits deeper — measured,
+the same 150px feather reads as 227px at full strength and 149px where the
+response is linear. `verify.py` measures the falloff, so it probes at
+`leak_strength 0.1`, and it does it on **one** leak walked down its own centre
+line: light adds, so a profile through a frame of twelve overlapping beams
+keeps being propped up by the next leak along and read a 20px feather as 37px.
+
+`leak_strength` is new, and there genuinely was no brightness control before —
+the gain was hard-coded at 0.55 with only `leak_variation` moving it. Past
+about 1.5 most leaks have a blown white core.
+
+Cost is **+0.10s per leak** on a 24MP frame (1.05s with leaks off, 1.67s at 6,
+2.25s at 12). `pad_for` is unchanged: the stage is per-pixel from global
+coordinates with no kernel, so a tile needs no overlap for it.
+
+### Leak sizes are pixels (changed 2026-08-01)
+
+`leak_size` (a 0.05–10 fraction of a hidden maximum) is gone. Leaks draw their
+reach from between **`leak_size_min` and `leak_size_max`, both lengths in
+full-resolution pixels**, and `leak_feather` is a pixel distance too — *the
+distance from the border at which the leak has fallen to half strength.* All
+three are `spatial=True`, so a preset rescales them like every other length.
+
+Feather-as-half-distance resolves to the same falloff exponent the old 0–1
+softness drove, so none of that tuning was thrown away: solving
+`(1 − hl/reach)^e = 0.5` gives `e = ln(0.5) / ln(1 − hl/reach)`. A short
+half-distance is a large exponent and a tight bright rim; half the reach is
+`e = 1`, a straight ramp; most of the reach is a broad wash. Because it is
+absolute rather than a fraction, the same feather is a wash on a small leak and
+a rim on a large one — which is what stops a frame of differently-sized leaks
+looking like one shape at several scales. Measured on a 300px leak: asked
+20/80/150/285px, delivered 20/78/149/270px.
+
+Two things this fixed on the way:
+
+* **The old edge distance was anisotropic.** It was the *normalised* distance,
+  and X divides by the width where Y divides by the height — so on a 3:2 frame
+  the same size reached 1.5× deeper from a side border than from the top, for
+  no reason anybody asked for. In pixels the two agree by construction (240px
+  now measures 220px from the side and 214px from the top).
+* **`clamp_min(1e-4)` before the falloff power is a global fog.** Raising a
+  1e-4 floor to a *small* exponent does not give a small number: at exponent
+  0.23 it is **0.12**, a 12% lift over the whole frame wherever the leak
+  reaches. It hid while the exponent bottomed out at 0.5 (a 1% floor) and reach
+  was capped to a sixth of the frame — with both feather and size in pixels, a
+  broad feather on a small leak reaches that exponent easily. Floor the base at
+  zero instead; the exponent is always positive, so `0 ** e` is 0 and no guard
+  is needed.
+
+**A leak must not reach the middle of the frame.** The centre-fog guard is
+**geometric rather than a taste constant**: reach is capped at half the frame's
+short side, which is where `edge_d` tops out and therefore the reach at which a
+leak just dies in the middle. Below it the pixel numbers are honoured exactly;
+above it there is nothing left to reach. An earlier attempt let large sizes
+lift a floor under the whole leak, which fogged the centre — measurably wrong,
+and it reads as a bad exposure rather than as a leak. `verify.py` pins the
+centre at **0.00e+00** for every size from 60 to 3000px and every feather from
+2 to 1500px.
+
+The cap has to be paid for **twice**, and that is easy to miss: the domain warp
+can pull the falloff `_LEAK_WARP · reach` further in than the reach alone, so
+the divisor is `_LEAK_REACH_SAFETY = 1.25` against a warp of 0.15 rather than
+landing exactly on zero. A falloff exponent below 1 turns a float epsilon into
+a visible lift, so the margin is not decoration.
+
+`leak_variation` does not drive reach — the two size sliders state that
+outright — and drives everything else: length, lean, fan, edge hardness, halo,
+strength and hue. At 0 every leak is identical in all of those, which is
+exactly what read as stamped.
+
+**Measure the variation on few leaks, not many.** A run of lit border is only
+one leak's peak if no other leak overlaps it, and light adds. Measured with the
+same probe, the strength-spread ratio between variation 0 and 1 comes out 1.19
+at eight leaks per frame and 2.07 at three — at eight it is mostly measuring
+the brightest member of each merged pair. Measure at low `leak_strength` too,
+or every leak drives its brightest channel to 1.0 and the spread reads as zero
+whatever the setting.
+
+**Calibrate pixel defaults against a photograph, not against the test plate.**
+The first pixel defaults were 40–200px, which is about right on the 1500x1000
+plate this section renders and **three to six times too small on a 6000px
+frame** — leaks shipped as a few thin lines hugging the border and the user
+reported it immediately. Every check passed, because every check ran on the
+small plate. The defaults are 250/850 with a 180px feather. `verify.py` renders
+a full-size frame at defaults for exactly this, and pins the proxy against it
+(42.0% coverage at 1:1 and at half scale — a leak is a length, so the preview
+owes the export the same scale invariance everything else does). Absolute
+pixels do not adapt to frame size by design; that is what `reference_mp`
+rescaling is for, and the bare defaults are tuned for a full-resolution photo.
 
 Dust composites rather than adds, which is the only way opacity and luminosity
 can be separate controls: added together they are the same number, since a
@@ -348,20 +606,6 @@ as "softness does nothing" for exactly that reason, and the measurement was
 survivorship-biased on top: only the specks that survived were left to measure.
 Expanding the band symmetrically about its midpoint keeps the count and makes
 each speck gradual. Measured 52% softer at 2px specks with coverage *rising*.
-
-**A leak must not reach the middle of the frame.** Inward reach is capped at
-`_LEAK_REACH_MAX = 0.17` of the half-frame and saturates by size 1; past that,
-Leak Size opens more of the *border* (by widening the gate) rather than going
-deeper. An earlier attempt let large sizes lift a floor under the whole leak,
-which fogged the centre -- measurably wrong, and it reads as a bad exposure
-rather than as a leak. Measured now: centre lift 0.0000 at every size from 0.55
-to 10, while coverage still grows 10% to 33%.
-
-Corners bloom `_LEAK_CORNER = 1.6` times further in than edge midpoints, keyed
-on the diagonal distance rather than the nearest-edge distance. That is where
-the cassette mouth and the film gate actually let light past, and it is most of
-what makes a leak read as a leak: measured 0.315 at the corners against 0.024
-at an edge midpoint.
 
 Three traps, all of which cost me a rebuild:
 
@@ -405,6 +649,28 @@ the zoom controls, on the same reasoning that put zoom there: they change the
 *view*, not the render, and driving a wipe across the photo from a panel on the
 other side of the screen means looking away from the thing you are judging.
 
+## The mark-count dead zone (found 2026-08-02)
+
+`dust`, `scratches`, `hair` and `light_leak` are **counts**, and the engine
+gates each on `>= 1.0` — you cannot render a third of a scratch. So any value
+in **(0, 1) renders nothing at all** while reading, in the panel and in the
+file, as though the section were slightly on.
+
+Three shipped presets sat squarely in it. `Organic`, `Dreamy` and `Dreamy+1`
+carried `dust 0.62`, `scratches 0.48`, `hair 0.10`, `light_leak 0.05` — 0–1
+*amounts* from before these parameters became counts, never migrated. Their
+entire Film Texture section had been silently inert, which is how the user
+came to report light leaks as not rendering: nothing they did to the leak
+sliders could matter while the count was 0.05.
+
+Migrated to **0**, not to a count. Zero is what those presets have actually
+been rendering ever since, so it is the faithful migration; rounding 0.62 up to
+1 would change their look without being asked.
+
+`verify.py` now refuses any shipped preset with a count in (0, 1). It is worth
+a check rather than a comment because it is invisible from both ends — the code
+looks right, the file looks deliberate, and the UI shows a number.
+
 ## Presets rescale across image sizes (added 2026-08-01)
 
 A preset dialled in on one photo is locked to that photo's size: every spatial
@@ -413,15 +679,16 @@ bigger frame give proportionally finer grain and tighter halation. Preset files
 now carry `reference_mp`, the size they were authored at, and the client sends
 it with every render; `_params_for` rescales before the engine sees anything.
 
-**The ratio is linear, not area.** Thirteen parameters are marked
+**The ratio is linear, not area.** Eighteen parameters are marked
 `spatial=True` and multiplied by `sqrt(current_mp / reference_mp)`. A 16MP
 frame is 0.816x the *width* of a 24MP one, not 0.667x -- scaling lengths by the
 megapixel ratio overshoots by the square root. `edge_jitter` is in that list
 despite having no `px` unit: `_JITTER_MAX` makes it a length multiplier.
 
 Not rescaled, on purpose: amounts and blend weights (dimensionless, per-pixel),
-mark counts (already resolved against frame area inside the engine, so 50
-specks is 50 specks at any size), and `leak_size` (a fraction of the frame).
+and mark counts (already resolved against frame area inside the engine, so
+50 specks is 50 specks at any size). Leak sizes and the leak feather *are*
+rescaled now that they are pixel lengths; they used to be exempt as fractions.
 
 Measured on the same scene at 6MP and 15.4MP, both resampled to a common 900px
 display width and grain isolated against a same-parameter grain-off render:
@@ -458,10 +725,16 @@ Two ways to populate it instead:
 | `_AMP_SCALE` | 0.38 | Maps the 0–100 intensity slider to amplitude; default 32 lands near 3.5% luminance sigma. Was 0.5 — recalibrated when `_fbm` started preserving variance, since the old value was silently compensating for a field running at 43% strength. |
 | `_MIN_CELL` | 0.8 | Floor on lattice cell size in working pixels. Below Nyquist it is pure aliasing. |
 | `_SAND_TAPS` | ±2σ, 5 taps | Tangential sanding filter. Reaches ±2σ, not ±1 — contour roughness sits at longer wavelengths than it appears to, and a ±1σ filter removed only 2% of it. Weights are normalised at use: the table sums to 0.991. |
+| `_BLUE_HUE` | 230.0 | Centre of the blue-compensation window, **in linear light** where the stage runs — the sRGB number is 220. Skies span 222-236 there; cyan water 194, purple shadow 249. |
+| `_BLUE_SAT_FLOOR` | 0.12 | Below this a pixel is grey and the compensation leaves it alone. Without it every neutral in the frame takes a cast — the failure `vibrance` is also written against. |
 | `_SCATTER_STENCILS` | 9 entries | Scatter footprints: (name, first angle, count, locus, inner, alt). **Indexed by the parameter value, which is what a preset file stores** — renumbering silently changes every preset that used one, so append rather than insert. `verify.py` pins it against `choices` in params.py name-for-name. Every entry must keep peak travel ≤ reach, which is what `pad_for` reserves for; an L∞ "square" locus would reach 1.41× and would have to be paid for. |
 | `_JITTER_MAX` | 3.0 | Peak edge displacement in full-res px at `edge_jitter` 1. Was an inline 0.6, whose *typical* displacement was 0.227px — invisible. |
 | `_STEP_LO` / `_STEP_HI` | 0.030 / 0.110 | Luma-step bounds separating a real transition from fine texture, for the edge-softening mask. Fine texture measures an order of magnitude under a hard border, which is the gap that lets softening take the snap off a border and leave fabric alone. |
 | `_TEX_LO` / `_TEX_HI` | 0.002 / 0.015 | Local mean-abs-deviation bounds separating "smooth" from "textured" for the smooth-area guard. Skin and clear sky sit at or below `_TEX_LO`; fabric, foliage and hair sit above `_TEX_HI`. |
+| `_LEAK_PHI` | 0.618… | Golden step placing leaks around the perimeter. A low-discrepancy sequence, not a stratification, so leak *k* lands in the same place whatever the count is — raising the count must add a leak, not reshuffle the ones already on the frame. |
+| `_LEAK_CORNER_BIAS` | 0.10 | Pull toward the ends of a border, as `t − bias·sin(2πt)`. **Must stay under 1/2π = 0.159** or the map folds and every leak collapses into a corner; measured slope −0.51 at 0.24. |
+| `_LEAK_WARP` / `_LEAK_REACH_SAFETY` | 0.15 / 1.25 | Domain-warp peak as a fraction of a leak's reach, and the divisor on the reach cap that pays for it. The warp can carry the falloff inward, so the centre-fog cap has to cover both or the frame's centre stops being exactly zero. |
+| `_LEAK_GAIN` | 2.0 | Exposure per unit of leak before `leak_strength`. Sized so a default-strength leak's core just saturates — that is what makes the core white and leaves the colour in the falloff. |
 | `_MID_GREY` | 0.46 | Pivot for the (deferred) contrast section. |
 | `MAX_UPLOAD_BYTES` | 30MB (imageio.py) | Input cap. JPEG/PNG only (`INPUT_FORMATS`, which also accepts `MPO` — a multi-frame JPEG; cameras emit it for burst and 3D and the file is still a .jpg). Not arbitrary — it is what keeps a full-resolution-per-keystroke preview affordable. |
 
@@ -541,6 +814,19 @@ says so and points at 5–20 as the usable range.
   0.0544), i.e. a second unpredictable strength knob dressed up as a
   structural one — while widening `pad_for` to 4× the reach. Cut. `scatter_radius`
   is the frequency control.
+* **Noise must perturb a shape, not be one.** The light leak was a falloff
+  field multiplied by a noise gate, and that is a recipe for fog: every
+  boundary in it was a `smoothstep` on value noise, so nothing had an edge and
+  nothing had a direction. The fix was not more noise or better noise, it was
+  giving the leak an actual geometry — a source, a lean, a length, a hard side
+  — and demoting the noise to a domain warp on top. The same test tells you
+  which side of that line you are on: can the parameter set describe *one*
+  mark, or only a texture? See the beam section for the full post-mortem.
+* **A `sin` remap can fold.** `t − 0.24·sin(2πt)`, used to bias leaks toward
+  the corners of their border, is not monotonic — slope −0.51 near the ends —
+  so it does not bias, it collapses, and it sent a quarter of the way along a
+  border to one hundredth of the way along it. Every such remap needs its
+  coefficient checked against the derivative, not eyeballed.
 * **"Softer" is not "blurrier", and a blur is the wrong tool for it.**
   `micro_blur` diffuses the whole frame, so it takes texture down with the
   edges: measured on a half-border/half-texture frame, `micro_blur 3.0` left

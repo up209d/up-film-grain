@@ -23,7 +23,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from server import imageio as iio  # noqa: E402
 from server import params as P  # noqa: E402
-from server.engine import GrainEngine, device_name, pick_device  # noqa: E402
+from server.engine import (  # noqa: E402
+    GrainEngine, _leak_anchor, _leak_sites, device_name, pick_device,
+)
 from tests.scene import patch as scene_patch  # noqa: E402
 from tests.scene import scene  # noqa: E402
 
@@ -165,7 +167,7 @@ def main() -> int:
         f"24MP -> 96MP is 4x the pixels, {P.scale_factor(24.0, 96.0):.2f}x the width",
     )
     src = P.sanitize({"grain_size": 2.0, "halation_radius": 20.0,
-                      "intensity": 45.0, "dust": 50.0, "leak_size": 0.5})
+                      "intensity": 45.0, "dust": 50.0, "leak_variation": 0.5})
     got = P.rescale(src, 1.6)
     check(
         "lengths scale", abs(got["grain_size"] - 3.2) < 1e-4
@@ -176,15 +178,16 @@ def main() -> int:
     check(
         "amounts and counts do not",
         got["intensity"] == src["intensity"] and got["dust"] == src["dust"]
-        and got["leak_size"] == src["leak_size"],
-        "intensity, dust count and leak_size all unchanged",
+        and got["leak_variation"] == src["leak_variation"],
+        "intensity, dust count and leak_variation all unchanged",
     )
     check(
         "every spatial param is marked",
         {x.key for x in P.PARAMS if x.spatial} == {
             "dust_size", "edge_jitter", "edge_sand_grit", "edge_soften_radius",
             "global_size", "grain_size", "hair_length", "halation_radius",
-            "highpass_radius", "micro_blur", "pre_sharpen_radius",
+            "highpass_radius", "leak_feather", "leak_size_max", "leak_size_min",
+            "micro_blur", "pre_sharpen_radius",
             "scatter_cell", "scatter_radius",
             "scratch_width", "sharpen_radius"},
         f"{sum(1 for x in P.PARAMS if x.spatial)} marked spatial",
@@ -192,6 +195,28 @@ def main() -> int:
     check(
         "no reference means no change", P.rescale(src, 1.0) == src,
         "scale_factor(None, x) = " f"{P.scale_factor(None, 40.0):.1f}",
+    )
+
+    # -- 3d. no shipped preset may sit in a mark count's dead zone -----------
+    # dust/scratches/hair/light_leak are *counts*, and the engine gates each on
+    # `>= 1.0` -- you cannot render a third of a scratch. So a value in (0, 1)
+    # renders nothing at all while reading, in the panel and in the file, as
+    # though the section were slightly on. Three shipped presets sat there:
+    # they carried 0-1 amounts from before these became counts and were never
+    # migrated, so their entire Film Texture section had been silently inert.
+    # It is invisible from the code and invisible from the UI, which is exactly
+    # the kind of thing that only a check catches.
+    print("\npreset sanity (mark counts must not sit in the dead zone)")
+    dead = [
+        (q["name"], k, q["values"][k])
+        for q in P.load_presets()
+        for k in ("dust", "scratches", "hair", "light_leak")
+        if 0.0 < q["values"][k] < 1.0
+    ]
+    check(
+        "no count between 0 and 1", not dead,
+        "all counts are 0 or a real number of marks" if not dead
+        else ", ".join(f"{n}.{k}={x}" for n, k, x in dead),
     )
 
     # -- 4. luminance response peaks in the 15-65% band ----------------------
@@ -767,6 +792,207 @@ def main() -> int:
     d = float(np.abs(ref[: n[0], : n[1]] - view[: n[0], : n[1]]).max())
     check("scale invariance", d < 6e-3, f"max delta {d:.2e}")
 
+    # -- 5e4. halation blue compensation -------------------------------------
+    # Halation adds warm light, and adding light desaturates whatever it lands
+    # on. On a blue sky that reads as the colour draining toward grey, which
+    # is what this stage puts back -- *before* the wash, on the recorded
+    # colour, rather than repainting the result. The checks are that it
+    # recovers the loss, that it stops there instead of running away, that it
+    # touches nothing outside its hue window, and that it leaves the bloom
+    # itself alone.
+    print("\nhalation blue compensation (put the sky back before the wash)")
+    bh, bw = 400, 900
+    bl_sky = np.zeros((bh, bw, 3), np.float32)
+    bl_sky[:] = np.array([0.18, 0.38, 0.78], np.float32)
+    byy, bxx = np.mgrid[0:bh, 0:bw]
+    bl_sun = np.clip(1.0 - np.hypot(byy - 200, bxx - 200) / 70.0, 0, 1).astype(np.float32)
+    bl_img = np.ascontiguousarray(np.clip(
+        bl_sky + bl_sun[..., None] * np.array([1.0, 0.95, 0.85], np.float32), 0, 1
+    ).astype(np.float32))
+    bl_off = {
+        "intensity": 0, "global_intensity": 0, "micro_blur": 0, "acutance": 0,
+        "edge_erosion": 0, "edge_jitter": 0, "sharpen": 0, "edge_soften": 0,
+        "scatter": 0,
+    }
+    # A threshold *under* the sky's own luma (0.366), so the whole sky blooms
+    # onto itself and the loss is uniform rather than a rim around the sun.
+    # That is the case the control exists for, and the one a shipped preset
+    # actually hits.
+    bl_hal = {"halation": 0.6, "halation_radius": 7.5, "halation_threshold": 0.30}
+
+    def bl_run(over: dict, im: np.ndarray = bl_img) -> np.ndarray:
+        return eng.render_image(im, P.sanitize({**bl_off, **over}), 1.0, supersample=1)
+
+    def bl_sat(px) -> float:
+        px = np.asarray(px, float)
+        return float((px.max() - px.min()) / max(px.max(), 1e-6))
+
+    def bl_hue(px) -> float:
+        px = np.asarray(px, float)
+        return float(_cs.rgb_to_hsv(*px)[0] * 360.0)
+
+    sky_at = (350, 800)  # far from the sun: pure wash, no local bloom
+    tgt = bl_run({"halation": 0.0})[sky_at]
+    washed = bl_run(bl_hal)[sky_at]
+    check(
+        "the wash really does grey the sky",
+        bl_sat(washed) < bl_sat(tgt) * 0.9,
+        f"sat {bl_sat(tgt):.3f} -> {bl_sat(washed):.3f} "
+        f"({(1 - bl_sat(washed) / bl_sat(tgt)) * 100:.0f}% of the colour gone), "
+        f"hue {bl_hue(tgt):.1f} -> {bl_hue(washed):.1f} deg",
+    )
+    fixed = bl_run({**bl_hal, "halation_blue": 0.5})[sky_at]
+    check(
+        "compensation puts it back",
+        abs(bl_sat(fixed) - bl_sat(tgt)) < bl_sat(tgt) * 0.05,
+        f"sat {bl_sat(washed):.3f} -> {bl_sat(fixed):.3f} against a target of "
+        f"{bl_sat(tgt):.3f}",
+    )
+    # The reason this runs before the wash rather than after it. Anything
+    # added here is eaten by the wash in the same proportion, so the control
+    # cannot run away; the identical correction applied afterwards has no such
+    # brake and pins the sky at fully saturated.
+    runaway = [bl_sat(bl_run({**bl_hal, "halation_blue": k})[sky_at])
+               for k in (1.0, 2.0, 3.0)]
+    check(
+        "and stops there -- the wash is its brake",
+        max(runaway) - min(runaway) < 0.01 and max(runaway) < bl_sat(tgt) * 1.10,
+        "sat at amount 1/2/3 = " + ", ".join(f"{s:.3f}" for s in runaway)
+        + f" (target {bl_sat(tgt):.3f})",
+    )
+    # Saturation scales chroma about the luma axis, which by construction
+    # cannot rotate anything -- so the hue swing needs its own control. This
+    # is the check that says the second slider is not decoration.
+    sat_only = bl_run({**bl_hal, "halation_blue": 1.0})[sky_at]
+    shifted = bl_run({**bl_hal, "halation_blue": 1.0, "halation_blue_shift": -8})[sky_at]
+    check(
+        "the hue shift fixes what saturation cannot",
+        abs(bl_hue(sat_only) - bl_hue(tgt)) > 4.0
+        and abs(bl_hue(shifted) - bl_hue(tgt)) < 1.5,
+        f"hue error {bl_hue(sat_only) - bl_hue(tgt):+.1f} deg on saturation alone, "
+        f"{bl_hue(shifted) - bl_hue(tgt):+.1f} deg with -8 deg of shift",
+    )
+    # The brightness gate, and the bug it exists for. The wash only reaches
+    # what is near the light, so a deep blue is never damaged -- and
+    # compensating it anyway is pure overshoot. Measured before the gate
+    # existed, amount 2.0 took an untouched deep sky from 0.872 saturation to
+    # 1.000, which is a channel clamped to black.
+    bl_grad = np.zeros((600, 900, 3), np.float32)
+    gt = np.linspace(0, 1, 600, dtype=np.float32)[:, None, None]
+    bl_grad[:] = (np.array([0.06, 0.18, 0.58], np.float32) * (1 - gt)
+                  + np.array([0.52, 0.68, 0.90], np.float32) * gt)
+    gyy2, gxx2 = np.mgrid[0:600, 0:900]
+    bl_grad = np.ascontiguousarray(np.clip(
+        bl_grad + np.clip(1.0 - np.hypot(gyy2 - 520, gxx2 - 450) / 90.0, 0, 1)
+        .astype(np.float32)[..., None] * np.array([1.0, 0.95, 0.85], np.float32),
+        0, 1).astype(np.float32))
+    g_hal2 = {"halation": 0.8, "halation_radius": 30.0, "halation_threshold": 0.55}
+    grad_ref = bl_run({"halation": 0.0}, bl_grad)
+    grad_hal = bl_run(g_hal2, bl_grad)
+    deep = (20, 450)   # top of the frame, far from the sun: provably undamaged
+    check(
+        "deep blue is not damaged in the first place",
+        abs(bl_sat(grad_hal[deep]) - bl_sat(grad_ref[deep])) < 0.005,
+        f"sat {bl_sat(grad_ref[deep]):.3f} -> {bl_sat(grad_hal[deep]):.3f} "
+        f"at display luma "
+        f"{float(np.dot(grad_ref[deep], (0.2126, 0.7152, 0.0722))):.3f}",
+    )
+    hot = bl_run({**g_hal2, "halation_blue": 2.0}, bl_grad)[deep]
+    ungated = bl_run({**g_hal2, "halation_blue": 2.0, "halation_blue_level": 0.0,
+                      "halation_blue_falloff": 0.02}, bl_grad)[deep]
+    check(
+        "so the gate leaves it alone even when cranked",
+        abs(bl_sat(hot) - bl_sat(grad_ref[deep])) < 0.01
+        and bl_sat(ungated) > bl_sat(grad_ref[deep]) * 1.1,
+        f"sat {bl_sat(grad_ref[deep]):.3f} -> {bl_sat(hot):.3f} gated, "
+        f"{bl_sat(ungated):.3f} with the gate open",
+    )
+    # Raising the level must progressively exclude darker blue, monotonically.
+    mid = (260, 450)
+    ladder = [bl_sat(bl_run({**g_hal2, "halation_blue": 1.0,
+                             "halation_blue_level": L}, bl_grad)[mid])
+              for L in (0.30, 0.45, 0.60, 0.75)]
+    check(
+        "the level progressively excludes darker blue",
+        all(ladder[k] >= ladder[k + 1] - 1e-4 for k in range(len(ladder) - 1))
+        and ladder[0] > ladder[-1] + 0.05,
+        "sat at level 0.30/0.45/0.60/0.75 = "
+        + ", ".join(f"{s:.3f}" for s in ladder)
+        + f" (untouched {bl_sat(grad_ref[mid]):.3f})",
+    )
+    # Knee and falloff are separate controls -- the lesson the Luminance
+    # Response band already learned. Widening the falloff must move the *foot*
+    # of the ramp and leave its top where the knee put it, so changing one
+    # never silently changes the other.
+    def foot(fall: float) -> float:
+        """Lowest display luma still getting any compensation."""
+        col = bl_run({**g_hal2, "halation_blue": 1.5, "halation_blue_level": 0.55,
+                      "halation_blue_falloff": fall}, bl_grad)[:, 450]
+        ref = grad_ref[:, 450]
+        moved = np.where(np.abs(col - ref).max(1) > 2e-3)[0]
+        return float(np.dot(ref[moved.min()], (0.2126, 0.7152, 0.0722))) if len(moved) else 1.0
+
+    f_narrow, f_wide = foot(0.05), foot(0.45)
+    check(
+        "knee and falloff are independent",
+        f_wide < f_narrow - 0.10,
+        f"ramp foot at display luma {f_narrow:.2f} with a 0.05 falloff, "
+        f"{f_wide:.2f} with 0.45 -- same 0.55 knee",
+    )
+    # Nothing outside the hue window may move, at any setting. Grey especially:
+    # a compensation that lifts colour where there is none puts a cast on every
+    # neutral in the frame, which is the failure `vibrance` is written against.
+    hard = {**bl_hal, "halation_blue": 3.0, "halation_blue_shift": 45.0}
+    for name, swatch in (
+        ("grey", (0.5, 0.5, 0.5)),
+        ("red", (0.75, 0.22, 0.18)),
+        ("foliage green", (0.24, 0.52, 0.20)),
+    ):
+        sw_ = np.ascontiguousarray(
+            np.tile(np.array(swatch, np.float32), (64, 64, 1)).astype(np.float32)
+        )
+        d = float(np.abs(bl_run(hard, sw_) - bl_run(bl_hal, sw_)).max())
+        check(f"{name} is left alone", d < 1e-6, f"max delta {d:.2e} at maximum settings")
+    # The glow is computed *before* the compensation runs, so the two controls
+    # are independent: dialling blue must not move the bloom. Probed on a grey
+    # field lit by a saturated blue source -- grey is untouched by the
+    # compensation (checked above), so any change there is the glow moving.
+    gh = 300
+    gp = np.full((gh, gh, 3), 0.5, np.float32)
+    gyy, gxx = np.mgrid[0:gh, 0:gh]
+    gr = np.hypot(gyy - 150, gxx - 150)
+    gp[gr < 40] = np.array([0.30, 0.55, 0.99], np.float32)
+    gp = np.ascontiguousarray(gp)
+    g_hal = {"halation": 0.9, "halation_radius": 25.0, "halation_threshold": 0.45}
+    g_ring = (gr > 55) & (gr < 95)
+    g_off = bl_run(g_hal, gp)
+    g_on = bl_run({**g_hal, "halation_blue": 3.0, "halation_blue_shift": -45.0}, gp)
+    moved = float(np.abs(g_on[g_ring] - g_off[g_ring]).max())
+    lit = float(np.abs(g_on[gr < 40] - g_off[gr < 40]).max())
+    check(
+        "compensation does not move the bloom", moved < 1e-6 < lit,
+        f"glow on the grey ring moved {moved:.2e} while the blue source itself "
+        f"moved {lit:.3f}",
+    )
+    # With no wash there is nothing to compensate, and this must not become a
+    # general blue grade -- colour grading is deferred.
+    #
+    # Both sides carry a live micro_blur so both actually render. Without it
+    # the halation_blue = 0 side has every NEUTRAL_ZERO parameter at zero, so
+    # render_image short-circuits and hands back the input bit-exactly, and
+    # the comparison measures the sRGB round trip rather than this stage.
+    dead = {"halation": 0.0, "micro_blur": 0.45}
+    d = float(np.abs(bl_run({**dead, "halation_blue": 3.0, "halation_blue_shift": 45.0})
+                     - bl_run(dead)).max())
+    check("inert with halation off", d == 0.0, f"max delta {d:.2e}")
+    # Purely per-pixel, so it must not widen the tile overlap.
+    check(
+        "costs no tile overlap",
+        eng.pad_for(P.sanitize({**bl_hal, "halation_blue": 3.0}), 1.0)
+        == eng.pad_for(P.sanitize(bl_hal), 1.0),
+        f"pad_for unchanged at {eng.pad_for(P.sanitize(bl_hal), 1.0)}px",
+    )
+
     # -- 5f. output sharpening cranks existing grain, invents none -----------
     # The stage is an unsharp mask placed last precisely so the detail it
     # amplifies is the grain. Two things have to hold: with grain on it must
@@ -913,12 +1139,22 @@ def main() -> int:
     # 11-20% at 1); at 1400x900 it is noise.
     leak_plate = np.full((1400, 2000, 3), 0.5, np.float32)
 
+    # Three leaks over many seeds rather than eight over a few. A run of lit
+    # border is only one leak's peak if no other leak overlaps it, and eight
+    # beams on one frame merge into each other -- measured, the same probe
+    # reports a spread ratio of 1.19 at eight leaks and 2.07 at three, because
+    # at eight it is mostly measuring the brightest member of each merged pair.
     def leak_peaks(var: float) -> np.ndarray:
         got = []
-        for sd in (11, 77, 404, 909):
+        for sd in (11, 77, 404, 909, 1234, 5678, 31, 42):
             o = eng.render_image(
                 leak_plate,
-                P.sanitize({**tex_off, "light_leak": 8.0,
+                # Low strength, or the measurement is taken on a clipped
+                # signal: at the shipped strength every leak drives its
+                # brightest channel to 1.0 on this plate, so all of them peak
+                # at exactly the same number and the spread reads as zero
+                # whatever the variation is set to.
+                P.sanitize({**tex_off, "light_leak": 3.0, "leak_strength": 0.15,
                             "leak_variation": var, "texture_seed": sd}),
                 1.0, supersample=1,
             )
@@ -938,6 +1174,149 @@ def main() -> int:
                         k += 1
         return np.array(got)
 
+    # Leak sizes and the feather are lengths in pixels now, so they have to
+    # deliver the pixels they claim -- and the two frame axes have to agree,
+    # which the old normalised distance did not do: X divided by the width and
+    # Y by the height, so on a 3:2 frame the same size came in 1.5x deeper
+    # from a side border than from the top.
+    lk_plate = np.ascontiguousarray(np.full((1000, 1500, 3), 0.5, np.float32))
+    lk_off = {
+        "intensity": 0, "global_intensity": 0, "micro_blur": 0, "acutance": 0,
+        "edge_erosion": 0, "halation": 0, "edge_jitter": 0, "sharpen": 0,
+        "scatter": 0, "edge_soften": 0,
+    }
+
+    def lk_run(over: dict) -> np.ndarray:
+        return eng.render_image(
+            lk_plate, P.sanitize({**lk_off, "light_leak": 12.0, **over}),
+            1.0, supersample=1,
+        )
+
+    def lk_depth(o: np.ndarray, side: str) -> int:
+        """Deepest pixel a leak reaches from one border, ignoring the others.
+
+        Every probe here has to be walled off from the *other* three borders,
+        which the perimeter wash never needed: leaks are discrete beams now and
+        a top-border one leans a long way sideways. Each window is chosen to
+        sit past the reach any leak on a perpendicular border could have, so
+        what it measures is only ever the border it is aimed at.
+        """
+        d = np.abs(o - lk_plate).max(2)
+        strip = (d[400:600, :700].max(0) if side == "left"
+                 else d[:400, 400:1100].max(1))
+        on = np.where(strip > 0.01)[0]
+        return int(on.max()) + 1 if len(on) else 0
+
+    grew = [lk_depth(lk_run({"leak_size_min": s, "leak_size_max": s,
+                             "leak_feather": max(2, s // 4),
+                             "leak_variation": 0.0}), "left")
+            for s in (60, 120, 240, 400)]
+    check(
+        "leak size is a distance in pixels",
+        all(grew[k] < grew[k + 1] for k in range(len(grew) - 1)) and grew[0] < 120,
+        "sizes 60/120/240/400px reach " + ", ".join(f"{g}" for g in grew) + "px",
+    )
+    iso = lk_run({"leak_size_min": 240, "leak_size_max": 240, "leak_feather": 60,
+                  "leak_variation": 0.0})
+    lft, tp = lk_depth(iso, "left"), lk_depth(iso, "top")
+    check(
+        "both frame axes agree", abs(lft - tp) < max(lft, tp) * 0.45,
+        f"240px reaches {lft}px from the side and {tp}px from the top on a 3:2 frame",
+    )
+    # The feather is the distance to *half* strength, which is the whole claim
+    # of putting it in pixels rather than on an abstract 0-1.
+    #
+    # Probed at a low strength on purpose. The falloff is defined on the light
+    # the leak *deposits*, and the response that turns that into pixels
+    # saturates one dye layer at a time -- which is what gives a hot leak its
+    # white core, and which also means the visible half-way point on a blown
+    # leak sits deeper than the exposure's does. Measured at full strength the
+    # same 150px feather reads as 227px, and neither number is wrong: this
+    # check is about the falloff, so it measures where the response is linear.
+    #
+    # And on *one* leak, walked down its own centre line. Light adds, so a
+    # profile drawn through a frame of twelve overlapping beams keeps being
+    # propped up by the next leak along and reads the falloff as longer than
+    # it is -- measured, a 20px feather came back as 37px that way.
+    lone = {"light_leak": 1.0, "leak_size_min": 300, "leak_size_max": 300,
+            "leak_variation": 0.0, "leak_strength": 0.1}
+
+    def lone_profile(f: int) -> np.ndarray:
+        """One leak's falloff, rotated so it runs inward from row 0."""
+        for sd in range(20, 80):
+            border, _ = _leak_anchor(_leak_sites(1.0, sd, 0.0)[0]["pos"],
+                                     1000.0, 1500.0)
+            g = np.abs(lk_run({**lone, "leak_feather": f,
+                               "texture_seed": float(sd)}) - lk_plate).max(2)
+            g = {0: g, 1: g[::-1], 2: g.T, 3: g.T[::-1]}[border]
+            xs = np.where(g[0] > 0.01)[0]
+            if len(xs) and xs.min() > 0 and xs.max() < g.shape[1] - 1:
+                return g[:, int(g[0].argmax())]
+        return np.zeros(1)
+
+    def half_at(f: int) -> int:
+        col = lone_profile(f)
+        below = np.where(col < col[:4].max() * 0.5)[0]
+        return int(below.min()) if len(below) else -1
+
+    asked = (20, 80, 150, 285)
+    got_half = [half_at(f) for f in asked]
+    check(
+        "leak feather is the distance to half strength",
+        all(abs(g - a) < max(12, a * 0.25) for g, a in zip(got_half, asked)),
+        "asked " + "/".join(str(a) for a in asked) + "px, measured "
+        + "/".join(str(g) for g in got_half) + "px",
+    )
+    # A leak must still not fog the middle. The reach is capped at half the
+    # short side, which is exactly where `edge_d` tops out -- so the falloff
+    # reaches zero *at* the centre however large a number is typed in. Without
+    # the cap, `1 - edge_d/reach` never gets to zero and the leak leaves a
+    # floor over the whole picture.
+    fog = max(
+        float(np.abs(lk_run({"leak_size_min": s, "leak_size_max": s,
+                             "leak_feather": f})[500, 750] - 0.5).max())
+        for s in (60, 300, 1200, 3000) for f in (2, 50, 1500)
+    )
+    check("no leak can fog the frame centre", fog == 0.0, f"worst centre lift {fog:.2e}")
+    # The defaults have to be usable on a *full-resolution photograph*, not
+    # just on the small plate the rest of this section renders. Sizes are
+    # absolute pixels now, so a number tuned against a 1500px test frame is
+    # three to six times too small on a 6000px one -- which is exactly how the
+    # first pixel defaults shipped as a few thin lines hugging the border.
+    big_leak = np.ascontiguousarray(np.full((1400, 2100, 3), 0.5, np.float32))
+    dflt = eng.render_image(
+        big_leak, P.sanitize({**lk_off, "light_leak": 6.0}), 1.0, supersample=1
+    )
+    dl = np.abs(dflt - big_leak).max(2)
+    on = np.where(dl[466:934, :1050].max(0) > 0.01)[0]
+    deep = (int(on.max()) + 1) if len(on) else 0
+    check(
+        "the defaults reach into a full-size frame",
+        deep > 1050 * 0.15 and float((dl > 0.01).mean()) > 0.02,
+        f"deepest {deep}px of a 1050px half-width, "
+        f"{float((dl > 0.01).mean()) * 100:.1f}% coverage",
+    )
+    # And a leak is a *length* now, so the proxy has to predict the export --
+    # the same scale invariance every other spatial quantity owes.
+    half = np.ascontiguousarray(iio.downscale(big_leak, 0.5))
+    small_leak = eng.render_image(
+        half, P.sanitize({**lk_off, "light_leak": 6.0}), 0.5, supersample=1
+    )
+    cov_full = float((dl > 0.01).mean())
+    cov_half = float((np.abs(small_leak - half).max(2) > 0.01).mean())
+    check(
+        "leaks hold their size at proxy scale",
+        abs(cov_full - cov_half) < 0.02,
+        f"coverage {cov_full * 100:.1f}% at 1:1 vs {cov_half * 100:.1f}% at half scale",
+    )
+    # Min and max given the wrong way round must swap rather than collapse.
+    a_ = lk_run({"leak_size_min": 80, "leak_size_max": 320, "leak_feather": 40})
+    b_ = lk_run({"leak_size_min": 320, "leak_size_max": 80, "leak_feather": 40})
+    check(
+        "the two sizes swap if crossed", float(np.abs(a_ - b_).max()) == 0.0,
+        "min 80/max 320 renders identically to min 320/max 80",
+    )
+
     flat_leaks, varied = leak_peaks(0.0), leak_peaks(1.0)
     # Coefficient of variation, not brightest-over-dimmest: with a dozen leaks
     # sampled, min/max turns on whichever corner sliver happened to clip the
@@ -945,6 +1324,61 @@ def main() -> int:
     cv0 = float(flat_leaks.std() / max(flat_leaks.mean(), 1e-9))
     cv1 = float(varied.std() / max(varied.mean(), 1e-9))
     check("several leaks per frame", len(varied) >= 8, f"{len(varied)} leaks sampled")
+    # The count has to be a count. Under the old perimeter wash it was not:
+    # the gate thresholds were quantiles of a noise field, so asking for two
+    # leaks still washed most of the border and the control only really moved
+    # how ragged that wash was. Beams are placed one per leak now, so coverage
+    # tracks the number asked for.
+    cov_n = [float((np.abs(lk_run({"light_leak": float(n),
+                                   "leak_size_min": 200, "leak_size_max": 200,
+                                   "leak_feather": 60}) - lk_plate).max(2)
+                    > 0.01).mean())
+             for n in (1, 2, 4, 8)]
+    check(
+        "the leak count controls how many there are",
+        all(cov_n[k] < cov_n[k + 1] for k in range(3)) and cov_n[0] < cov_n[3] * 0.4,
+        "1/2/4/8 leaks cover " + ", ".join(f"{c * 100:.1f}%" for c in cov_n),
+    )
+
+    # The two things the old perimeter wash could not do, and the reason this
+    # stage was rewritten: a leak has to run *along* its border rather than
+    # radiate inward from all of them, and it has to have a definite edge.
+    # Both are measured on one leak at a time, rotated so its own border is
+    # row 0, and only on leaks a corner has not truncated -- a clipped leak
+    # has no length to measure and no second edge to compare.
+    aspect, hardness = [], []
+    for sd in range(20, 44):
+        st = _leak_sites(1.0, sd, 1.0)[0]
+        border, _ = _leak_anchor(st["pos"], 1000.0, 1500.0)
+        o = lk_run({"light_leak": 1.0, "leak_strength": 0.2,
+                    "leak_size_min": 240, "leak_size_max": 240,
+                    "leak_feather": 120, "leak_variation": 1.0,
+                    "texture_seed": float(sd)})
+        g = np.abs(o - lk_plate).max(2)
+        g = {0: g, 1: g[::-1], 2: g.T, 3: g.T[::-1]}[border]
+        m = g > 0.01
+        xs = np.where(m[0])[0]
+        if not len(xs) or xs.min() == 0 or xs.max() == m.shape[1] - 1:
+            continue
+        a_, b_ = int(xs.min()), int(xs.max())
+        aspect.append((b_ - a_ + 1) / max(int(m[:, a_:b_ + 1].max(1).sum()), 1))
+        # Steepest step just inside each end of the run at the border. One end
+        # is the obstruction's shadow and one is the penumbra, and a leak soft
+        # on both sides reads as haze rather than as light getting past
+        # something.
+        gl = float(np.abs(np.diff(g[0, max(a_ - 8, 0):a_ + 40])).max())
+        gr = float(np.abs(np.diff(g[0, max(b_ - 40, 0):b_ + 8])).max())
+        hardness.append(max(gl, gr) / max(min(gl, gr), 1e-9))
+    asp, hard = float(np.median(aspect)), float(np.median(hardness))
+    check(
+        "a leak runs along its border, not inward from every border",
+        len(aspect) >= 8 and asp > 1.15,
+        f"median length/depth {asp:.2f} over {len(aspect)} leaks",
+    )
+    check(
+        "a leak has one hard edge and one soft one",
+        hard > 2.0, f"median steepest-edge ratio {hard:.2f} between a leak's two sides",
+    )
     check(
         "variation spreads the leaks apart", cv1 > cv0 * 1.4,
         f"strength spread {cv0 * 100:.0f}% at 0 -> {cv1 * 100:.0f}% at 1",

@@ -169,6 +169,7 @@ button, select, .btn {
 button:hover:not(:disabled), .btn:hover { border-color: #3a404a; }
 button:disabled { opacity: .45; cursor: default; }
 .btn { display: inline-flex; align-items: center; justify-content: center; }
+.btn.dropping { border-color: var(--accent); color: var(--accent); border-style: dashed; }
 .btn.primary { background: var(--accent); color: #1a1206; border-color: var(--accent); font-weight: 600; }
 .btn.ghost { background: transparent; }
 .seg.on { background: var(--accent); color: #1a1206; border-color: var(--accent); font-weight: 600; }

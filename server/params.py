@@ -327,6 +327,64 @@ PARAMS: list[Param] = [
         "here because this is a look tool. Was a 0-1 red-to-amber ramp that "
         "only spanned 25 degrees.",
     ),
+    # Blue compensation. Applied to the image *before* the wash lands, so the
+    # blue is strengthened on clean data and the wash is left alone -- see
+    # step 2a in engine.render() for why that beats correcting afterwards.
+    Param(
+        "halation_blue", "Blue Compensation", "Halation",
+        0.0, 3.0, 0.01, 0.0, "",
+        "Strengthens blue *before* the bloom lands on it, so it survives the "
+        "wash instead of being greyed by it. Halation adds warm light, and "
+        "adding light to a colour desaturates it -- a red bloom over a blue "
+        "sky lifts the red channel far more than the blue one, so the sky "
+        "loses its colour and drifts toward grey. This puts the colour back "
+        "in the exposure rather than repainting it afterwards, which is what "
+        "a punchier blue-sensitive stock or a polariser would do.\n"
+        "\n"
+        "It is self-limiting, which is the main reason it runs here rather "
+        "than after the wash: whatever you add, the wash eats the same share "
+        "of it, so the recovered saturation flattens off instead of running "
+        "away. Measured on a sky the bloom had cost 16% of its colour, 0.5 "
+        "puts it back to within 1% of untouched and everything from 1.0 "
+        "upward sits at 3% past it -- 3.0 included. The same correction "
+        "applied *after* the wash has no such brake: it is 9% past by 0.5 and "
+        "by 1.0 it has driven a channel to black, pinning the sky at fully "
+        "saturated. Only does anything while Halation is above 0: with no "
+        "wash there is nothing to compensate for, and this is not a grading "
+        "control. 0 = off.",
+    ),
+    Param(
+        "halation_blue_level", "Blue Level", "Halation",
+        0.0, 1.0, 0.005, 0.45, "",
+        "How light a blue has to be before it is worth saving. The wash only "
+        "reaches what is near the light, so pale sky loses colour and deep "
+        "sky loses none -- measured on a sky gradient, the loss is 23% at the "
+        "bright end and flat 0% below about half brightness. Compensating "
+        "everything regardless is what makes a deep blue go lurid: it was "
+        "never damaged, so every bit of the correction is overshoot. Blue "
+        "above this brightness is compensated and blue below it is left as "
+        "it was. Read on the picture's own brightness scale, the same one the "
+        "Luminance Response knees use.",
+    ),
+    Param(
+        "halation_blue_falloff", "Blue Level Falloff", "Halation",
+        0.02, 0.5, 0.005, 0.25, "",
+        "How wide the fade is below the level, so the change from saved to "
+        "left-alone is a ramp rather than a line across the sky. Independent "
+        "of the level itself on purpose -- deriving the width from the knee "
+        "would mean moving the knee also changed the softness, and a sky is "
+        "exactly the smooth gradient that shows up a hard switch-on.",
+    ),
+    Param(
+        "halation_blue_shift", "Blue Hue Shift", "Halation",
+        -45.0, 45.0, 1.0, 0.0, "deg",
+        "Rotates the selected blue before the wash. Saturation alone cannot "
+        "fix the *hue*: measured, a red bloom swings an ordinary sky about 6 "
+        "degrees toward purple, and scaling saturation about the luma axis "
+        "leaves that swing exactly where it is. Negative turns the sky toward "
+        "cyan, which is the direction that cancels a warm bloom. Applied only "
+        "where Blue Range selects, so the rest of the frame keeps its hue.",
+    ),
     Param(
         "halation_sat", "Halation Saturation", "Halation",
         0.0, 1.0, 0.01, 0.86, "",
@@ -606,34 +664,67 @@ PARAMS: list[Param] = [
         "Counted against the perimeter rather than the area, because that "
         "is where they happen. Added in linear light so it behaves like "
         "light falling on the emulsion, not a gradient painted over the "
-        "picture. 0 = none.",
+        "picture. 0 = none -- and so is anything below 1, because you "
+        "cannot render a fraction of a leak. A hand-edited file holding "
+        "0.05 here renders nothing at all rather than a faint leak.",
     ),
     Param(
-        "leak_size", "Leak Size", "Film Texture",
-        0.05, 10.0, 0.05, 0.55, "",
-        "How much of the frame edge a leak takes up. Up to 1 it also reaches "
-        "a little further in; past 1 it spreads *along* the border and into "
-        "the corners instead of deeper, because a leak that washes the middle "
-        "of the frame stops reading as a leak and starts reading as a bad "
-        "exposure. Corners bloom further than edge midpoints either way -- "
-        "that is where the cassette mouth and the film gate let light past.",
+        "leak_strength", "Leak Strength", "Film Texture",
+        0.0, 3.0, 0.01, 1.0, "",
+        "How much light each leak lets in. The response saturates one dye "
+        "layer at a time, so this is not just an opacity: a faint leak is deep "
+        "red because only the red-sensitive layer caught enough light, and "
+        "pushing it up takes the core through orange and yellow to white while "
+        "leaving the colour in the falloff. Past about 1.5 most leaks have a "
+        "blown white core, which is the 'sun got in the back' look.",
+    ),
+    Param(
+        "leak_size_min", "Leak Size Min", "Film Texture",
+        5.0, 3000.0, 1.0, 250.0, "px",
+        "How far the *smallest* leak reaches in from the frame edge, at full "
+        "resolution. Each leak picks its own reach somewhere between this and "
+        "the maximum, so the two together are what makes a frame of leaks look "
+        "accidental rather than stamped -- set them equal and every leak comes "
+        "in exactly as far as the next.",
+        spatial=True,
+    ),
+    Param(
+        "leak_size_max", "Leak Size Max", "Film Texture",
+        5.0, 3000.0, 1.0, 850.0, "px",
+        "How far the *largest* leak reaches in. Given below the minimum the "
+        "two simply swap, so you can drag either one past the other without "
+        "the leaks disappearing. Corners bloom further than edge midpoints "
+        "whatever this says -- that is where the cassette mouth and the film "
+        "gate actually let light past. Reach is capped at half the frame's "
+        "short side, which is the distance at which a leak just dies in the "
+        "middle: past that it would leave a floor over the whole frame, and a "
+        "leak that fogs the centre reads as a bad exposure rather than a leak.",
+        spatial=True,
     ),
     Param(
         "leak_feather", "Leak Feather", "Film Texture",
-        0.0, 1.0, 0.01, 0.6, "",
-        "How softly a leak fades, on both of its edges: the radial falloff "
-        "coming in from the border and the transition along the border where "
-        "one leak ends. 0 is a hard-edged rim, 1 is a broad wash that hardly "
-        "falls off at all. This is usually the control you want when a leak "
-        "looks like a painted shape rather than light.",
+        1.0, 1500.0, 1.0, 180.0, "px",
+        "How far in from the border a leak has faded to *half* strength, at "
+        "full resolution -- so it is a distance you can see rather than an "
+        "abstract softness. Small against the size gives a tight bright rim "
+        "hugging the edge; around half the size gives a straight ramp; most of "
+        "the way to the size gives a broad wash that hardly falls off until it "
+        "ends. Because it is absolute, the same feather is a wash on a small "
+        "leak and a rim on a large one, which is what stops a frame of "
+        "differently-sized leaks looking like one shape at several scales.\n"
+        "\n"
+        "It softens the leak's *other* edge too -- the transition along the "
+        "border where one leak stops. A leak has two visible edges and "
+        "softening only one still reads as a painted shape.",
+        spatial=True,
     ),
     Param(
         "leak_variation", "Leak Variation", "Film Texture",
         0.0, 1.0, 0.01, 0.7, "",
-        "How much one leak differs from the next -- how far it reaches into "
-        "the frame, how broad or tight its halo is, how hard its edge is, and "
-        "how strong it arrives. 0 makes every leak identical, which is what "
-        "gives a frame of them that stamped look; 1 is a wide spread. Light "
+        "How much one leak differs from the next in everything *except* size, "
+        "which Leak Size Min and Max now set directly: how hard its edge is, "
+        "how broad or tight its halo is, and how strong it arrives. 0 makes "
+        "every leak identical in those respects; 1 is a wide spread. Light "
         "gets in through whatever gap it finds, and no two gaps are alike.",
     ),
     Param(
@@ -674,7 +765,7 @@ NEUTRAL_ZERO: tuple[str, ...] = (
     "vibrance", "base_fog",
     "intensity",
     "edge_erosion", "acutance", "edge_soften", "edge_sand", "edge_jitter",
-    "halation",
+    "halation", "halation_blue",
     "micro_blur", "scatter",
     "warm_highlights", "cool_shadows",
     "global_intensity",
@@ -711,9 +802,14 @@ def rescale(values: dict[str, float], k: float) -> dict[str, float]:
     * Mark counts (dust, scratches, hair, leaks). Those already resolve against
       the frame's area inside the engine, so 50 specks is 50 specks whatever
       the resolution -- which is what keeps the look constant.
-    * ``leak_size``, which is a fraction of the frame rather than a length.
     * Discrete choices (``scatter_pattern``). It is an index into a list of
       stencils, not a quantity -- scaling it would silently swap the shape.
+
+    Leak sizes and the leak feather *are* rescaled, because they became
+    lengths in pixels. They used to be fractions of the frame and so were
+    exempt; a preset written against the old fraction will read its number as
+    pixels and produce a hairline leak, which is why the shipped ones were
+    migrated in place.
 
     Values are clamped back into range afterwards, so a large upscale can
     saturate a parameter rather than escaping its slider.

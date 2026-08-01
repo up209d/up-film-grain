@@ -1,0 +1,41 @@
+---
+description: Machine environment, run/build workflow, and server-process gotchas
+alwaysApply: true
+---
+
+# Environment & workflow (this machine)
+
+- **Python 3.13, not 3.14** (PyTorch has no 3.14 wheels). `pipenv` with
+  `PIPENV_VENV_IN_PROJECT=1`; venv is `.venv/`. Run engine code as
+  `pipenv run python ...`.
+- **Node via nvm, but Homebrew/Herd sit ahead of nvm in `PATH`** — `nvm use`
+  alone doesn't switch `node`. Prepend explicitly (`dev.sh` already does):
+  `export PATH="$HOME/.nvm/versions/node/v24.15.0/bin:$PATH"`.
+- **npm blocks postinstall here**: a fresh `npm install` needs
+  `npm approve-scripts esbuild` or Vite won't build.
+- Torch runs on **Apple MPS**; 64-bit int ops are poor there, so the noise hash
+  is computed in uint64 on the **CPU** over the lattice, not per-pixel on device.
+
+## Run / build
+
+- `./dev.sh` — Vite HMR + `uvicorn --reload`, `APP_ENV=development`.
+- `./run.sh` — production from source (default env is production).
+- `./build.sh` — compile a distribution into `build/`.
+- Both scripts accept `PORT=8001` and preflight the port.
+
+`APP_ENV` **defaults to production**: CORS for Vite, `/docs`, `/openapi.json`
+are dev-only, and a production process with no `web/dist` raises at import. Gate
+any dev convenience on `IS_DEV` or it ships.
+
+## Starting a server for testing
+
+Background long-running servers with the tool's background mode — a trailing `&`
+in one bash call may not survive, and a stale instance holds port 8000. **Stop
+any server you start before handing back**, or the user's own `./dev.sh` can't
+bind.
+
+## Benchmarking on MPS
+
+Benchmark in a **fresh process per configuration** and take best-of-N: run-to-run
+variance is ±1s, and repeated large renders in one process get progressively
+slower — enough to reverse an ablation's conclusion.

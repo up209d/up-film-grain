@@ -92,6 +92,25 @@ _TEX_HI = 0.015
 _STEP_LO = 0.030
 _STEP_HI = 0.110
 
+# Hue the blue compensation centres on, in degrees, measured *in linear light*
+# because that is where the stage runs. Skies land at 222 (pale) to 236
+# (zenith) there, so 230 sits in the middle of them; cyan water is 194 and
+# purple shadow 249, comfortably outside a narrow Blue Range. Note these are
+# not the sRGB numbers -- the transfer curve is per-channel and monotonic, so
+# it preserves the hue *sector* but moves the angle inside it by 6-10 degrees.
+_BLUE_HUE = 230.0
+
+# Half-width of the hue window, in degrees. Fixed rather than exposed: the
+# discriminator that actually matters is *brightness*, not hue width -- the
+# wash only reaches what is near the light, so a deep blue is untouched
+# whatever its hue. This was a slider and it was the wrong control.
+_BLUE_RANGE = 70.0
+
+# Saturation below which a pixel counts as grey and the compensation leaves it
+# alone. Without it the mask would strengthen colour in something that has
+# none, which is the failure `vibrance` is written to avoid as well.
+_BLUE_SAT_FLOOR = 0.12
+
 # Peak edge displacement in full-resolution pixels at edge_jitter = 1.
 #
 # Was an inline 0.6, which made the control useless: the noise field averages
@@ -188,19 +207,47 @@ _BLOB_CELLS_DUST = 14.0
 _BLOB_CELLS_SCRATCH = 26.0
 _BLOB_CELLS_HAIR = 0.5
 
-# Floor on the width of a light leak's gate band, in field units. A leak with a
-# narrow gate has a hard edge, and a hard-edged leak reads as a painted shape
-# rather than as light -- so however few leaks are asked for, the gate keeps
-# enough of a ramp to fall off through.
-_LEAK_MIN_BAND = 0.16
+# -- light leaks ---------------------------------------------------------- #
+# A leak is a *shaft* of light past an obstruction, so it is drawn as a small
+# number of discrete oriented beams anchored on the perimeter, not as a wash
+# gated along the whole border. See `_leak_sites` for why a list of them does
+# not break tile independence the way a list of dust specks would.
 
-# Cap on how far a leak reaches in, as a fraction of the half-frame (edge_d
-# runs 0 at the border to 0.5 at the centre). Held low on purpose: a leak that
-# washes the middle stops reading as a leak.
-_LEAK_REACH_MAX = 0.17
+# Step used to place leaks around the perimeter, as a fraction of it. Golden
+# ratio, i.e. a low-discrepancy sequence rather than a stratification, so leak
+# k lands in the same place whatever the count is -- raising the count must add
+# a leak, not reshuffle the ones already on the frame.
+_LEAK_PHI = 0.6180339887498949
 
-# How much further a leak blooms at a corner than at an edge midpoint.
-_LEAK_CORNER = 1.6
+# How hard leaks are pulled toward the ends of their border. The film gate's
+# corners and the cassette mouth are where light actually gets past, and an
+# even spread along the perimeter is the single most "generated"-looking thing
+# a leak field can do. Applied inside one border segment, so it biases a leak
+# toward a corner without ever moving it onto a different edge.
+#
+# Must stay under 1 / 2pi = 0.159, or `t - bias * sin(2 pi t)` stops being
+# monotonic and starts *folding*: at 0.24 its slope goes to -0.51 near the
+# ends, which maps a quarter of the way along a border to one hundredth of the
+# way along it. Every leak then piles into a corner, which is not a bias, it is
+# a collapse -- and it looks exactly like the four-corner symmetry this stage
+# was rewritten to get away from.
+_LEAK_CORNER_BIAS = 0.10
+
+# Peak of the domain warp that breaks a leak's outline up, as a fraction of its
+# reach. The shape has a definite edge by construction -- that is the point,
+# real leaks have one -- and this is what stops that edge being a drawn curve.
+_LEAK_WARP = 0.15
+
+# Divisor on the reach cap. The cap exists so a leak cannot fog the centre, and
+# the warp above can carry the falloff `_LEAK_WARP * reach` further in than the
+# reach alone, so the cap has to be paid for twice over. 1.25 against a warp of
+# 0.15 leaves real margin rather than landing exactly on zero -- a falloff
+# exponent below 1 turns a float epsilon into a visible lift.
+_LEAK_REACH_SAFETY = 1.25
+
+# Exposure one unit of leak deposits, before `leak_strength`. Calibrated so the
+# default strength lands a hot leak's core just into saturation.
+_LEAK_GAIN = 2.0
 
 
 def _threshold_for(fraction: float) -> float:
@@ -229,6 +276,93 @@ def _count_threshold(
     """
     cells = max(frame_area / max(cell_area, 1e-6), 1.0)
     return _threshold_for(max(count, 0.0) / (cells * blob_cells))
+
+
+def _leak_sites(count: float, seed: int, var: float) -> list[dict]:
+    """Per-leak parameters, in units that do not depend on the frame's size.
+
+    This *is* a list of objects, which the rest of the film-texture section
+    refuses to use -- and it is still tile-independent, because the list is a
+    function of the count, the seed and nothing else. Every tile builds the
+    identical list; so does the proxy, so does the export. What breaks tile
+    independence is deriving a list from the *region being rendered* (N specks
+    per tile, or positions drawn against the tile's own area), and nothing
+    here reads either.
+
+    Objects rather than thresholded noise because a leak is not a mark, it is a
+    beam: it has a source, a direction and a length, and a field that only
+    knows "how far am I from the nearest border" can express none of those.
+
+    ``var`` is `leak_variation`: every draw except the reach is a blend from
+    the middle of its range toward the drawn value, so 0 makes every leak
+    identical in everything but where it sits and how far it comes in.
+    """
+    n = int(min(max(round(count), 0), 64))
+
+    def mix(u: float, lo: float, hi: float) -> float:
+        return 0.5 * (lo + hi) + var * (u - 0.5) * (hi - lo)
+
+    sites = []
+    for k in range(n):
+        # Seeded per leak, not once per frame, for the same reason the
+        # positions come off a low-discrepancy sequence: leak 3 must not
+        # change when leak 9 is added.
+        rng = np.random.default_rng(
+            np.uint64((int(seed) & 0xFFFF) * 1000003 + k * 7919 + 17)
+        )
+        u = rng.random(10)
+        sites.append({
+            # Where on the perimeter, 0..1. The jitter is small on purpose --
+            # the golden step already spreads them, and a large jitter just
+            # lets two leaks land on top of each other.
+            "pos": (0.37 + _LEAK_PHI * k + 0.10 * (u[0] - 0.5)) % 1.0,
+            # Reach is the one draw `var` does not touch: the two size sliders
+            # state its spread outright, and the help text promises variation
+            # changes everything *except* size.
+            "reach_t": u[1],
+            # Half-length along the border, as a fraction of that border.
+            # A fraction of the *border* rather than a multiple of the reach:
+            # a failed seal runs along a seam, so a leak is long sideways and
+            # shallow inward, and sizing it off its own depth makes blobs.
+            "width": mix(u[2], 0.03, 0.30),
+            # Lateral drift per unit depth. This is what makes a leak a streak
+            # leaning across the frame instead of a symmetric wedge, and it is
+            # kept as a shear rather than as a rotation so that "reach" stays
+            # exactly the perpendicular depth the slider claims.
+            "shear": mix(u[3], -1.7, 1.7),
+            # How much the beam fans out as it travels in.
+            "flare": mix(u[4], -0.55, 0.75),
+            # Asymmetry of the two long edges. A leak is light spilling past an
+            # obstruction, so one side is the obstruction's shadow and is much
+            # harder than the other; a shape soft on both sides reads as haze.
+            "hard": mix(u[5], 0.25, 1.0),
+            "hard_side": 1.0 if u[6] >= 0.5 else -1.0,
+            "strength": mix(u[7], 0.45, 1.35),
+            # Halo: pushes this leak's half-strength distance around.
+            "halo": u[8],
+            # Hue jitter, added to `leak_hue`.
+            "hue": mix(u[9], -0.20, 0.20),
+        })
+    return sites
+
+
+def _leak_anchor(pos: float, fh: float, fw: float) -> tuple[int, float]:
+    """Map a perimeter position to (border, along-border coordinate in px).
+
+    Borders are 0 top, 1 bottom, 2 left, 3 right; the coordinate is x on the
+    horizontal borders and y on the vertical ones.
+    """
+    a = (pos % 1.0) * 2.0 * (fh + fw)
+    for border, length in ((0, fw), (3, fh), (1, fw), (2, fh)):
+        if a < length or length <= 0.0:
+            t = (a / length) if length > 0.0 else 0.0
+            # Pull toward both ends of the segment, i.e. toward the corners.
+            t = min(max(t - _LEAK_CORNER_BIAS * math.sin(2.0 * math.pi * t),
+                        0.0), 1.0)
+            return border, t * length
+        a -= length
+    return 0, 0.0
+
 
 def pick_device() -> torch.device:
     if torch.cuda.is_available():
@@ -319,6 +453,50 @@ def _hsv_to_rgb(h_deg: float, sat: float, val: float = 1.0) -> tuple[float, floa
         (0.0, x, c), (x, 0.0, c), (c, 0.0, x),
     )[int(h) % 6]
     return (r + m, g + m, b + m)
+
+
+def _hue_sat(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Hue in degrees and HSV saturation, per pixel.
+
+    Saturation is chroma over value, the HSV definition, matching what
+    ``vibrance`` already uses: it reads a deep blue as fully saturated however
+    dark it is, where distance from the luma axis would call the same blue
+    unsaturated.
+    """
+    mx = x.amax(dim=1, keepdim=True)
+    mn = x.amin(dim=1, keepdim=True)
+    c = mx - mn
+    sat = c / mx.clamp_min(1e-6)
+    cc = c.clamp_min(1e-6)
+    r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+    h = torch.where(
+        mx == r, ((g - b) / cc) % 6.0,
+        torch.where(mx == g, (b - r) / cc + 2.0, (r - g) / cc + 4.0),
+    ) * 60.0
+    # Hue is undefined on grey, and the ratio above is 0/0 there.
+    return torch.where(c < 1e-6, torch.zeros_like(h), h), sat
+
+
+def _rotate_hue(x: torch.Tensor, deg: torch.Tensor) -> torch.Tensor:
+    """Rotate colours about the grey axis by a per-pixel angle.
+
+    Rodrigues about (1,1,1)/sqrt(3), which is exactly a hue rotation in RGB:
+    it leaves grey untouched by construction (grey lies *on* the axis) and
+    preserves the channel sum, so it changes colour without changing how
+    bright the pixel is. Cheaper and better behaved than a round trip through
+    HSV, which has to divide by a chroma that goes to zero.
+    """
+    th = deg * (math.pi / 180.0)
+    c, s = torch.cos(th), torch.sin(th)
+    k = 1.0 / math.sqrt(3.0)
+    r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+    # k . v, and the axis-aligned part that the rotation leaves alone.
+    axis = (r + g + b) * k * k * (1.0 - c)
+    return torch.cat([
+        r * c + (b - g) * k * s + axis,
+        g * c + (r - b) * k * s + axis,
+        b * c + (g - r) * k * s + axis,
+    ], dim=1)
 
 
 def _warp(
@@ -699,6 +877,72 @@ class GrainEngine:
         return t
 
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _blue_guard(
+        lin: torch.Tensor, amount: float, level: float, falloff: float,
+        shift: float,
+    ) -> torch.Tensor:
+        """Strengthen blue in linear light, before the halation wash lands.
+
+        Three things have to agree before a pixel is compensated, and the
+        third is the one that took a correction from the user to get right:
+
+        * **It is blue** -- a hue window around ``_BLUE_HUE``.
+        * **It has colour to strengthen** -- weighted by existing saturation,
+          the same principle as ``vibrance`` and for the same reason: it must
+          strengthen blue that is *there* and never invent it in something
+          grey, or every neutral shadow in the frame picks up a cast.
+        * **It is light enough to have been damaged.** The wash only reaches
+          what is near the light. Measured up a sky gradient away from the
+          sun, saturation loss is 23% at the bright end and flat *zero* below
+          about half brightness -- so compensating a deep blue is pure
+          overshoot, and at amount 2.0 it drove an untouched sky from 0.872
+          saturation to 1.000, i.e. a channel clamped to black. That is not a
+          setting to avoid, it is a missing term in the mask.
+
+        Knee and falloff are separate controls. Deriving the width from the
+        knee would make moving one change the other, and a sky is precisely
+        the broad smooth gradient that shows up a hard switch-on -- which is
+        also why the ramp is quintic, like the luminance band's.
+
+        Both operations are weighted by the mask *inside* themselves rather
+        than blended toward a fully-processed copy. A hue rotation of ``m *
+        shift`` degrees is the identity at ``m = 0``; cross-fading toward a
+        fully rotated colour instead would mix two different hues and lose a
+        little saturation in the middle of the ramp, which is exactly the
+        artifact this stage exists to fix.
+        """
+        h, sat = _hue_sat(lin)
+        d = (h - _BLUE_HUE).abs()
+        d = torch.minimum(d, 360.0 - d)  # the wheel wraps
+        m = (1.0 - _smoothstep(0.0, _BLUE_RANGE, d)) * _smoothstep(
+            0.0, _BLUE_SAT_FLOOR, sat
+        )
+        # Brightness gate, read display-referred so the slider means the same
+        # thing as every other luminance control in the app. Linear luma would
+        # crush an ordinary sky down to 0.05 and make the top nine tenths of
+        # the slider useless.
+        #
+        # Encode first, *then* take the luma. Taking the luma of the linear
+        # image and encoding that single number is cheaper and wrong: the
+        # transfer curve is non-linear, so it does not commute with a weighted
+        # sum. Measured, it reads a deep sky 23% brighter than it is, which
+        # would put this slider on a different scale from the Luminance
+        # Response knees it is meant to match.
+        lum_d = _luma(_linear_to_srgb(lin))
+        m = m * _smootherstep(max(0.0, level - falloff), level, lum_d)
+
+        if abs(shift) > 0.5:
+            lin = _rotate_hue(lin, m * shift)
+        if amount > 0.001:
+            lum_b = _luma(lin)
+            lin = lum_b + (lin - lum_b) * (1.0 + amount * m)
+        # The rotation can put a channel marginally below zero on a very
+        # saturated colour; halation adds to this and sRGB encoding assumes
+        # non-negative.
+        return lin.clamp_min(0.0)
+
+    # ------------------------------------------------------------------ #
     def _scatter(
         self, x: torch.Tensor, h: int, w: int, y0: float, x0: float,
         p: dict, scale: float,
@@ -832,6 +1076,44 @@ class GrainEngine:
             lum0 = _luma(lin)
             hi = ((lum0 - thr_lin) / max(1.0 - thr_lin, 0.02)).clamp(0.0, 1.0)
             glow = _blur(hi, max(1.0, p["halation_radius"] * scale))
+
+            # 2a. Blue compensation, applied to the image the wash is about to
+            #     land on rather than to the result.
+            #
+            #     Halation adds warm light, and *adding light desaturates
+            #     whatever it lands on* -- that is not a side effect to be
+            #     tuned out, it is what addition does. A red-tinted bloom
+            #     lifts a blue sky's red channel by the full glow and its blue
+            #     channel by a tenth of it, so the sky loses colour and drifts
+            #     toward grey and then toward purple.
+            #
+            #     Correcting afterwards was the obvious alternative and is
+            #     worse for two measured reasons. It has no brake: the wash
+            #     eats a fixed share of anything added *before* it, so
+            #     compensating here self-limits -- everything from amount 1.0
+            #     to 3.0 lands 3% past the untouched sky's own saturation --
+            #     where the identical correction applied *after* is 9% past by
+            #     0.5 and by 1.0 has driven a channel to black and pinned the
+            #     sky at fully saturated. And it cannot tell blue
+            #     that was unfairly washed from blue the bloom is *supposed*
+            #     to be sitting on, so re-saturating there fights the glow you
+            #     paid for -- it would need the glow field carried out of this
+            #     block to know the difference. Here the question never
+            #     arises: this changes what was recorded, and halation then
+            #     does its job to it. That is also the physical order --
+            #     a punchier blue layer or a polariser, not retouching.
+            #
+            #     Deliberately after `glow` is computed, so compensation
+            #     cannot move the bloom: the two controls stay independent and
+            #     `verify.py` pins it. Purely per-pixel, so `pad_for` is
+            #     unaffected.
+            blue = p["halation_blue"]
+            bshift = p["halation_blue_shift"]
+            if blue > 0.001 or abs(bshift) > 0.5:
+                lin = self._blue_guard(
+                    lin, blue, p["halation_blue_level"],
+                    p["halation_blue_falloff"], bshift,
+                )
             # Tint from a full hue wheel rather than the old red-to-amber
             # ramp, which spanned about 25 degrees and could not desaturate.
             # Real halation is red -- that is what the antihalation layer and
@@ -1226,144 +1508,156 @@ class GrainEngine:
         area = None if full_hw is None else max(full_hw[0] * full_hw[1], 1.0)
 
         # -- light leak ---------------------------------------------------
-        # Fogging from light that got in at the edges of the frame, so it is
-        # anchored to the frame rather than floating in the image, and it is
-        # added in linear light because it is light.
+        # Light that got past a seal, so it is anchored to the frame rather
+        # than floating in the image, and it is added in linear light because
+        # it is light.
+        #
+        # Drawn as a handful of discrete *beams*, which is the whole shape of
+        # this stage and the thing it got wrong before. The old version was a
+        # falloff from the nearest border gated by a slow noise field along it:
+        # every leak was therefore a soft inward wash with no direction, no
+        # length and no edge, present on all four borders at once -- a chewed-up
+        # vignette. Real leaks are streaks with a definite edge limiting their
+        # reach; they come from one or two places on the frame, they lean
+        # across it, and they stop somewhere.
+        #
+        # So each leak is a beam: a source on the perimeter, a depth it
+        # penetrates (`leak_size_*`), a lean (`shear`), a width that fans out
+        # as it travels, and one hard edge where the obstruction's shadow is.
+        # Noise now *perturbs* that shape instead of being it.
         ll = p["light_leak"]
         if ll >= 1.0 and full_hw is not None:
-            fh, fw = max(full_hw[0], 1.0), max(full_hw[1], 1.0)
-            ys = (torch.arange(h, device=dev, dtype=torch.float32) + y0) / fh
-            xs = (torch.arange(w, device=dev, dtype=torch.float32) + x0) / fw
-            Y, X = torch.meshgrid(ys, xs, indexing="ij")
-            # Distance to the nearest frame edge: 0 at the border, 0.5 centre.
-            edge_d = torch.minimum(
-                torch.minimum(X, 1.0 - X), torch.minimum(Y, 1.0 - Y)
-            )
-            edge_d = edge_d.unsqueeze(0).unsqueeze(0)
-            # A very slow field decides which stretches of border actually
-            # leak, so it is not a uniform vignette.
-            # Cell well under a frame width, or there is only ever one leak
-            # -- and one leak cannot look non-uniform against anything. At
-            # 700px on a 1200px frame this produced a single region, which is
-            # the same trap the hair gate fell into. ~240 gives three or four
-            # along a border, which is what a leaky back actually looks like.
-            # Two washes, each varying only *along* its border and constant
-            # going inward, picked by whichever border a pixel is nearest.
-            #
-            # A single isotropic field cannot do this job: it varies with depth
-            # as well as along the edge, so it shut the leak off a little way
-            # in no matter how much reach it had. That is what made leaks look
-            # small -- the size control was fighting the gate, not the falloff.
-            wcell = max(40.0, 240.0 * scale)
-            long_cell = max(4000.0, 40000.0 * scale)
-            wash_h = _value_noise(
-                h, w, y0, x0, wcell, seed + 8101, 1, dev, cell_y=long_cell
-            )
-            wash_v = _value_noise(
-                h, w, y0, x0, long_cell, seed + 8103, 1, dev, cell_y=wcell
-            )
-            near_horizontal = (
-                torch.minimum(Y, 1.0 - Y) < torch.minimum(X, 1.0 - X)
-            ).unsqueeze(0).unsqueeze(0)
-            wash = torch.where(near_horizontal, wash_h, wash_v)
+            fh = max(float(full_hw[0]), 1.0)
+            fw = max(float(full_hw[1]), 1.0)
+            Ypx = (torch.arange(h, device=dev, dtype=torch.float32)
+                   + float(y0)).view(1, 1, h, 1)
+            Xpx = (torch.arange(w, device=dev, dtype=torch.float32)
+                   + float(x0)).view(1, 1, 1, w)
 
-            # Three decorrelated fields, addressed at leak scale so each is
-            # near-constant across one leak and differs between leaks. Without
-            # them every leak reached the same distance, fell off at the same
-            # rate and arrived at the same strength -- which is what made a
-            # frame of them look stamped rather than accidental.
-            #
-            # `var` scales all three away to nothing, so 0 reproduces the old
-            # uniform behaviour exactly rather than being merely close to it.
             var = p["leak_variation"]
-            # Slightly coarser than the wash so a variation value spans a
-            # whole leak rather than shifting across one.
-            vy = _value_noise(
-                h, w, y0, x0, max(56.0, 340.0 * scale), seed + 8102, 3, dev
-            )
-            v_reach = _spread(vy[:, 0:1])
-            v_halo = _spread(vy[:, 1:2])
-            v_op = _spread(vy[:, 2:3])
+            # Swapped if given the wrong way round, so dragging either slider
+            # past the other never makes the leaks vanish.
+            s_lo = min(p["leak_size_min"], p["leak_size_max"]) * scale
+            s_hi = max(p["leak_size_min"], p["leak_size_max"]) * scale
+            # Cap at half the frame's short side over the warp's headroom:
+            # that is the depth at which the falloff dies exactly in the
+            # middle of the frame, and past it a leak leaves a floor over the
+            # whole picture -- centre fog, which reads as a bad exposure
+            # rather than as a leak. Geometric, not a taste constant.
+            reach_cap = 0.5 * min(fh, fw) / _LEAK_REACH_SAFETY
+            # The along-border edges want a softness as a 0..1, and the honest
+            # 0..1 is the feather measured against the sizes asked for -- a
+            # 50px feather is a rim on a 400px leak and a wash on an 80px one.
+            # Derived from the parameters alone, never from the field, so it
+            # is a constant per render and tiles cannot disagree about it.
+            soft = min(1.0, p["leak_feather"] / max(
+                0.5 * (p["leak_size_min"] + p["leak_size_max"]), 1.0))
+            bw_soft = 0.12 + 0.75 * soft
 
-            # How far into the frame each leak pushes. `edge_d` runs 0 at the
-            # border to 0.5 at the centre, so a size of 1.0 reaches the middle
-            # of the frame and beyond -- which is what a bad light seal does.
-            size = p["leak_size"]
-            # Inward reach is deliberately capped low and saturates by size 1.
-            # `edge_d` runs 0 at the border to 0.5 at the centre, so even at
-            # the cap a leak dies well before the middle of the frame. Light
-            # gets in at the edges; a leak that washes the centre reads as a
-            # bad exposure rather than a leak.
-            reach = (_LEAK_REACH_MAX * min(size, 1.0)
-                     * (1.0 + var * 0.80 * (v_reach * 2.0 - 1.0)))
-            reach = reach.clamp_min(0.015)
-            # Corners bloom further in than edge midpoints -- that is where the
-            # cassette mouth and the film gate actually let light past, and it
-            # is most of what makes a leak read as a leak.
-            corner_d = torch.sqrt(
-                torch.minimum(X, 1.0 - X) ** 2 + torch.minimum(Y, 1.0 - Y) ** 2
-            ).unsqueeze(0).unsqueeze(0)
-            corner = 1.0 - (corner_d / 0.5).clamp(0.0, 1.0)
-            reach = reach * (1.0 + _LEAK_CORNER * corner)
-            # The exponent is the feather, and it matters more than the reach:
-            # a high exponent drops the leak away immediately past the border,
-            # so a leak with plenty of reach still reads as a thin bright rim.
-            # Feather 0 is that tight rim (exponent 4), feather 1 is a broad
-            # wash that barely falls off at all (exponent 0.5).
-            feather = p["leak_feather"]
-            base_expo = 4.0 - 3.5 * feather
-            expo = (base_expo * (1.0 + var * 0.45 * (v_halo * 2.0 - 1.0)))
-            expo = expo.clamp_min(0.25)
-            falloff = (1.0 - (edge_d / reach).clamp(0.0, 1.0)).clamp_min(1e-4) ** expo
-            # Size past 1 spreads the leak *along* the border rather than
-            # deeper into the frame -- it used to lift a floor under the whole
-            # leak, which is exactly the centre-invading wash this must not do.
-            # Handled below by widening the gate.
+            expo_lin = _srgb_to_linear(out)
+            # Per-channel exposure, accumulated over the beams. Light adds, so
+            # two leaks overlapping is brighter than either -- and it has to be
+            # per channel rather than a scalar times one tint, because each
+            # leak carries its own hue.
+            expos = torch.zeros(1, 3, h, w, device=dev, dtype=torch.float32)
 
-            # Per-leak edge hardness. Inlined rather than using _smoothstep
-            # because the thresholds are fields here, not constants.
-            # Leaks live on the border, so they are counted against the
-            # perimeter rather than the area: a frame holds perimeter/cell of
-            # them, not area/cell^2.
-            perim = 2.0 * (fh + fw)
-            cells = max(perim / wcell, 1.0)
-            # Both ends of the gate from the count, with a floor on the band's
-            # width. Deriving `hi` as a fraction of the remaining headroom made
-            # the band collapse at low counts -- the threshold sits high, so
-            # there was almost no headroom left -- and a collapsed band is a
-            # hard edge. Leaks came out as solid shapes with no falloff at all,
-            # which is the one thing a light leak must never look like.
-            lk_a = _threshold_for(min(0.30, max(ll, 0.0) * 2.5 / cells))
-            lk_b = _threshold_for(min(0.30, max(ll, 0.0) * 0.4 / cells))
-            # Feather widens the along-border transition too. The radial
-            # falloff and this gate are the leak's two visible edges, and
-            # softening only one of them still reads as hard.
-            lk_b = max(lk_b, lk_a + _LEAK_MIN_BAND * (0.5 + 2.5 * feather))
-            # Size above 1 opens more of the border instead of reaching in.
-            if size > 1.0:
-                grow = min((size - 1.0) / 9.0, 1.0)
-                lk_a = max(0.0, lk_a - 0.30 * grow)
-            # Vary the band's *centre* and *width* rather than its two ends
-            # independently. Moving the ends separately let the variation push
-            # `hi` below `lo` for some leaks -- an inverted band, which
-            # _smoothstep resolves as a hard step, so those leaks came out as
-            # solid shapes with a one-pixel cliff at the border. Width is
-            # clamped positive, so a leak can be crisper or softer but never
-            # switch to a step.
-            centre = 0.5 * (lk_a + lk_b) - var * 0.10 * (v_halo * 2.0 - 1.0)
-            half = (0.5 * (lk_b - lk_a)) * (1.0 + var * 0.9 * (v_halo * 2.0 - 1.0))
-            half = half.clamp_min(_LEAK_MIN_BAND * 0.5)
-            lo, hi = centre - half, centre + half
-            tt = ((wash - lo) / (hi - lo).clamp_min(1e-3)).clamp(0.0, 1.0)
-            gate = tt * tt * (3.0 - 2.0 * tt)
+            for k, st in enumerate(_leak_sites(ll, seed, var)):
+                border, s0 = _leak_anchor(st["pos"], fh, fw)
+                # `u` is the perpendicular depth from this leak's own border
+                # and `s` runs along it. Keeping the obliquity in a shear on
+                # `s` rather than rotating the whole frame is what lets a leak
+                # lean hard across the picture while `reach` stays exactly the
+                # depth the slider promises.
+                if border == 0:
+                    u, s, blen = Ypx, Xpx, fw
+                elif border == 1:
+                    u, s, blen = fh - Ypx, Xpx, fw
+                elif border == 2:
+                    u, s, blen = Xpx, Ypx, fh
+                else:
+                    u, s, blen = fw - Xpx, Ypx, fh
 
-            leak = falloff * gate * (1.0 - var * 0.65 * (1.0 - v_op))
-            hue = p["leak_hue"]
-            tint = torch.tensor(
-                [1.0, 0.30 + 0.50 * hue, 0.10 + 0.30 * hue],
-                device=dev, dtype=out.dtype,
-            ).view(1, 3, 1, 1)
-            out = _linear_to_srgb(_srgb_to_linear(out) + leak * tint * 0.55)
+                reach = min(s_lo + (s_hi - s_lo) * st["reach_t"], reach_cap)
+                # How far the leak runs *along* its border. Measured against
+                # the border, not against the reach -- and that is the second
+                # thing the old shape got wrong. A seal fails along a seam, so
+                # the leak is a band that runs a long way sideways and comes in
+                # a modest depth; sizing its length off its depth instead makes
+                # every leak roughly as long as it is deep, which is a blob.
+                # Floored against the reach because light through a slot cannot
+                # be much narrower than it is deep.
+                hw0 = max(blen * st["width"], 0.55 * reach)
+
+                # Two octaves of domain warp. The coarse one wanders the whole
+                # beam, the fine one frays its edge; between them the outline is
+                # organic while still being an outline -- which is the inversion
+                # that matters here. Noise used to *be* the shape and the result
+                # was fog; now it perturbs a shape that has a definite edge.
+                # The depth amplitudes sum to exactly `_LEAK_WARP * reach`,
+                # which is what the reach cap was sized against.
+                wn = _value_noise(h, w, y0, x0, max(16.0, 0.80 * reach),
+                                  seed + 9137 + k * 37, 3, dev)
+                wf = _value_noise(h, w, y0, x0, max(6.0, 0.25 * reach),
+                                  seed + 9701 + k * 37, 2, dev)
+                warp = (wn[:, 0:1] - 0.5) * 1.5 + (wf[:, 0:1] - 0.5) * 0.5
+                # Clamped at zero: the warp may pull the beam *inward*, and
+                # the falloff below has to stay defined at the border.
+                du = (u + warp * _LEAK_WARP * reach).clamp_min(0.0)
+                lat = (wn[:, 1:2] - 0.5) * 1.5 + (wf[:, 1:2] - 0.5) * 0.5
+                dv = (s - s0) - st["shear"] * du + lat * 0.18 * hw0
+
+                # Along the beam: the same feather-to-exponent mapping the
+                # pixel sizes have always used. Solving (1 - hl/reach)^e = 0.5
+                # gives e = ln(0.5) / ln(1 - hl/reach), so the feather is a
+                # visible distance -- short is a tight bright rim on the
+                # border, half the reach is a straight ramp, most of the reach
+                # is a broad wash. Scalars per leak now rather than fields,
+                # since a beam has one of each.
+                hl = (p["leak_feather"] * scale) * (
+                    1.0 + var * 0.45 * (2.0 * st["halo"] - 1.0))
+                hl = min(max(hl, 0.5), reach * 0.95)
+                expo = math.log(0.5) / math.log1p(-min(hl / reach, 0.95))
+                # Floored at *zero*, not at an epsilon: raising a 1e-4 floor
+                # to a small exponent gives 0.12, not something small, and
+                # that is a fog over the whole beam's footprint.
+                along = (1.0 - (du / reach).clamp(0.0, 1.0)).clamp_min(0.0) ** expo
+
+                # Across the beam: narrow at the source and fanning inward,
+                # which is what a shaft through a gap does and is most of why
+                # this reads as a beam rather than as a band.
+                hwid = (hw0 * (0.75 + st["flare"] * du / reach)).clamp_min(1.0)
+                q = dv.abs() / hwid
+                # One edge is the obstruction's shadow and is much harder than
+                # the other. Both soft is haze; both hard is a painted shape.
+                bw_hard = max(0.03, bw_soft * (1.0 - 0.95 * st["hard"]))
+                on_hard = (dv * st["hard_side"] >= 0.0).to(dv.dtype)
+                bw = bw_soft + (bw_hard - bw_soft) * on_hard
+                tt = ((1.0 + bw - q) / (2.0 * bw)).clamp(0.0, 1.0)
+                across = tt * tt * (3.0 - 2.0 * tt)
+
+                # A beam is not uniform inside itself either -- dust in the
+                # chamber, an uneven gap. Mean 1.0, so it modulates without
+                # changing the strength the leak was drawn with.
+                dens = 0.72 + 0.56 * wn[:, 2:3]
+
+                hue = min(max(p["leak_hue"] + st["hue"], 0.0), 1.0)
+                tint = torch.tensor(
+                    [1.0, 0.16 + 0.46 * hue, 0.04 + 0.18 * hue],
+                    device=dev, dtype=torch.float32,
+                ).view(1, 3, 1, 1)
+                expos = expos + (along * across * dens * st["strength"]) * tint
+
+            # Saturating response, per channel and per dye layer. A leak's core
+            # is *white* with the colour only in its falloff, and no amount of
+            # adding a fixed warm ratio can do that -- a fixed ratio stays the
+            # same colour at every strength, which is exactly why the old wash
+            # read as flat tan everywhere. Each layer saturating separately
+            # gives the real progression: deep red where only the red-sensitive
+            # layer caught enough light, through orange and yellow, to white
+            # where all three are at the top. It also self-limits at 1.0 in
+            # linear light, so a hot leak cannot drive a channel past white.
+            added = -torch.expm1(-expos * (p["leak_strength"] * _LEAK_GAIN))
+            out = _linear_to_srgb(expo_lin + added.to(out.dtype))
 
         # -- scratches ----------------------------------------------------
         # A gouge through the emulsion lets the light straight through, so on

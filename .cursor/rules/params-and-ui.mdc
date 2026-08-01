@@ -1,0 +1,49 @@
+---
+description: Parameter schema as single source of truth and schema-driven React UI
+globs: server/params.py,web/src/App.tsx,web/src/api.ts
+alwaysApply: false
+---
+
+# Parameters & UI
+
+`server/params.py` is the **single source of truth**. The engine reads defaults
+from it and the client builds its slider panel from `GET /api/params`, so the UI
+cannot drift from what the renderer accepts.
+
+## Adding a parameter
+
+Add **one `Param`** to `PARAMS` in `params.py` and read `p["key"]` in the
+engine. The UI picks it up automatically — **never hand-add a slider** in
+`App.tsx`. `sanitize()` is the only entry point into the engine: unknown keys
+dropped, values clamped, missing keys filled from defaults.
+
+- Set `spatial=True` if the value is a **length in full-res pixels** (it will be
+  rescaled across image sizes). Not for amounts, blend weights, counts, indices.
+- Set `choices=(...)` for genuine either/or menus (e.g. scatter stencil). The
+  value stays a number; nothing else needs to know it's discrete.
+
+## NEUTRAL_ZERO / Original button
+
+`NEUTRAL_ZERO` lists every parameter that makes a stage **run** (amounts), so
+zeroing them makes `render()` a pass-through. Sizes/radii/seeds are excluded on
+purpose so switching a section back on restores what was dialled in. It is an
+explicit list, not inferred — a stage missing from it leaves "Original" showing
+a not-quite-original image. `is_neutral(p)` short-circuits the render because
+the supersample round-trip is **not** itself identity (softens ~1e-1 at 2×).
+
+## Client bugs to not reintroduce (all were in App.tsx, not the engine)
+
+- The file `<input type=file>` must **clear `value`** or re-picking the same
+  file fires no change event.
+- On open, clear `previewUrl`/`sourceUrl` **on success only** — a rejected file
+  must not wipe the session, and stale `meta` stretches the old photo.
+- The source object URL has its **own lifecycle**, not the 4-entry preview LRU,
+  or it gets revoked mid-session while an `<img>` still references it.
+
+## Preview model
+
+`/api/preview` renders the **whole frame** (never a crop); the browser does all
+scaling, so zoom/pan are free and never hit the network. `full=false` is the
+2400px proxy (fast, behind sliders); `full=true` is source at scale 1.0 (the
+"Render 1:1" button — the preview *is* the export). Show the `proxy` badge when
+enlarged past proxy resolution; a soft preview otherwise reads as a soft result.

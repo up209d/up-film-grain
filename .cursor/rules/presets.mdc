@@ -1,0 +1,36 @@
+---
+description: Presets are files on disk and rescale across image sizes
+globs: presets/**,server/params.py
+alwaysApply: false
+---
+
+# Presets
+
+There are **no presets in source** — `load_presets()` reads `presets/*.json` on
+every `schema()` call, so adding one is dropping in a file. A preset is named by
+its **filename**, not the `name` inside. Values run through `sanitize()`, so
+partial/legacy files still load (missing keys fill from defaults).
+
+- `DEFAULT_PRESET` (env `FILM_GRAIN_DEFAULT_PRESET`, default `Stock`) is what the
+  client opens on and what **Reset** returns to — Boot and Reset share one
+  `startingValues()` in `App.tsx` on purpose. A missing file degrades to
+  parameter defaults rather than erroring.
+- `build.sh` copies `presets/` into the distribution; without it a build has no
+  presets.
+
+## Size rescaling (spatial params only)
+
+A preset is locked to the photo size it was authored at, because spatial params
+are lengths in full-res pixels. Preset files carry `reference_mp`; the client
+sends it and `_params_for` rescales before the engine sees anything.
+
+- **The ratio is linear, not area:** multiply spatial params by
+  `sqrt(current_mp / reference_mp)` (`params.scale_factor`). A 16MP frame is
+  0.816× the *width* of a 24MP one, not 0.667×.
+- **Not** rescaled: amounts, blend weights, mark counts (resolved against frame
+  area in-engine), `leak_size` (a frame fraction), and discrete `choices`.
+- Files without `reference_mp` scale by **1.0** — behaviour unchanged, nothing
+  guessed. Populate via **Set from photo** + re-save, or
+  `FILM_GRAIN_DEFAULT_REFERENCE_MP=24` to retrofit all unstamped presets.
+
+Preset dir is overridable with `FILM_GRAIN_PRESETS=/some/dir`.

@@ -80,6 +80,9 @@ export default function App() {
   const [device, setDevice] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Drop-target highlight for the Open image button. A drop is invisible
+  // otherwise -- there is nothing to tell you the button will take the file.
+  const [dropping, setDropping] = useState(false);
 
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [sourceUrl, setSourceUrl] = useState<string | null>(null);
@@ -561,7 +564,24 @@ export default function App() {
           <span className="dot" />
           Film Grain Engine
         </div>
-        <label className="btn">
+        <label
+          className={`btn${dropping ? " dropping" : ""}`}
+          // dragOver has to preventDefault on *every* event, not just the
+          // first: the browser reads the absence of it as "this target does
+          // not accept drops" and falls back to navigating to the file.
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "copy";
+            if (!dropping) setDropping(true);
+          }}
+          onDragLeave={() => setDropping(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDropping(false);
+            const f = e.dataTransfer.files?.[0];
+            if (f) onFile(f);
+          }}
+        >
           Open image
           <input
             type="file"

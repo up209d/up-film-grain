@@ -112,6 +112,110 @@ process without one is broken rather than degraded and should not boot.
   visibly posterises grain in smooth areas, and JPEG's edge ringing compounds
   through another round of processing.
 
+### Light leaks
+
+A leak is a *beam*, not a glow around the border. Each one has a source
+somewhere on the frame's perimeter, a depth it pushes in, a length it runs
+along that border, a lean across the picture, and one hard edge — the shadow of
+whatever the light got past. That hard edge is most of what separates a leak
+from haze, and a real one almost always has it.
+
+**Leak Size Min** and **Leak Size Max** are how far the shallowest and deepest
+leaks reach in from the frame edge, in full-resolution pixels. Every leak draws
+its own reach from between them, so the spread is stated outright rather than
+being a percentage of a hidden maximum — set them equal and every leak comes in
+exactly as far as the next. Given the wrong way round they simply swap. How far
+a leak runs *along* its border is separate and much larger, because a seal
+fails along a seam: it is drawn against the border's own length, so leaks stay
+proportioned the same way on any frame.
+
+**Leak Feather** is a pixel distance too: *how far in the leak has faded to half
+strength*. Small against the size is a tight bright rim hugging the edge; about
+half the size is a straight ramp; most of the way is a broad wash. Measured on a
+300px leak, asking for 20/80/150/285px delivers 20/78/149/270px. Because it is
+absolute, the same feather is a wash on a small leak and a rim on a large one,
+which is what stops a frame of differently-sized leaks reading as one shape at
+several scales. It also softens the leak's long edges.
+
+**Leak Strength** is not just an opacity. The light saturates one dye layer at
+a time, so a faint leak is deep red — only the red-sensitive layer caught
+enough light — and turning it up takes the core through orange and yellow to
+white while the colour stays in the falloff. That is why the feather measures
+slightly deeper on a blown leak than the number says: the core has clipped, so
+the visible half-way point sits further in than the exposure's does. Past about
+1.5 most leaks have a white core, which is the "sun got in the back" look.
+
+Sizes and the feather are lengths, so a preset rescales them onto a
+different-sized photo like every other length — and the defaults (250/850px,
+180px feather) are tuned for a full-resolution photo. On a much smaller image
+they will be proportionally bigger, which is what asking for pixels means.
+**Leak Variation** covers everything *except* size: length, lean, fan, edge
+hardness, halo, strength and hue.
+
+**Leak Count is a count, and anything below 1 renders nothing** — you cannot
+have a third of a leak. It is now an exact count: one beam is placed per leak,
+so asking for two gives you two rather than washing most of the border. Raising
+it adds leaks without moving the ones already there. Three shipped presets used
+to carry `0.05` here (and
+similar for dust, scratches and hair), left over from when these were 0–1
+amounts, so their whole Film Texture section was silently doing nothing. They
+now read 0; set a real count to turn them on.
+
+A leak still cannot fog the middle of the frame — reach is capped at half the
+short side, which is exactly the distance at which a leak dies in the centre.
+Below that the pixel numbers are honoured exactly; the centre measures a flat
+0.00e+00 at every size from 60 to 3000px and every feather from 2 to 1500px.
+
+### When halation greys the sky
+
+Halation adds warm light, and **adding light desaturates whatever it lands on**
+— that is what addition does, not a flaw to tune out. A red bloom lifts a blue
+sky's red channel by the full glow and its blue channel by a tenth of it, so
+the sky drains toward grey and drifts toward purple. Measured on an ordinary
+sky: **16% of the saturation gone and a +5.8° hue swing**.
+
+**First, check `Halation Threshold` against the sky itself.** An ordinary blue
+sky has a luma around 0.37. If the threshold is under that — `Organic` ships at
+0.30 — the sky is over the threshold and **blooms onto itself**, so the wash is
+global instead of a rim around bright things. Raising it above the sky's luma
+fixes the symptom outright: 0.30 → 0.45 measures sat 0.660 → 0.778 and hue
+225.3 → 219.7, against an untouched 0.769 / 220.0.
+
+**Then, if you want the low threshold for the look, compensate for it.** Four
+controls in **Halation**, applied to the image *before* the bloom lands:
+
+* **Blue Compensation** strengthens blue so it survives the wash rather than
+  being greyed by it — putting the colour into the exposure, which is what a
+  punchier blue-sensitive stock or a polariser does, instead of repainting the
+  result. It is **self-limiting**: the wash eats the same share of whatever you
+  add, so 0.5 lands within 1% of the untouched sky and everything from 1.0 to
+  3.0 sits at 3% past it.
+* **Blue Level** — how light a blue has to be before it is worth saving, on the
+  picture's own brightness scale. Halation only reaches what is near the light:
+  measured up a sky gradient, the loss is **23% at the bright end and flat 0%
+  below about half brightness**. Compensating a deep blue anyway is all
+  overshoot, and it is what makes one go lurid — ungated at amount 2.0 an
+  untouched deep sky went from 0.872 saturation to 1.000, a channel clamped to
+  black. Raise this until only the blues that actually got washed are being
+  saved.
+* **Blue Level Falloff** — the width of the fade below it, so the boundary is a
+  ramp rather than a line across the sky. Separate from the level on purpose:
+  deriving the width from the knee would mean moving one changed the other.
+* **Blue Hue Shift** — because saturation alone *cannot* fix hue: scaling
+  chroma about the luma axis rotates nothing. Measured, the amount slider
+  leaves +7.1° of error and −8° of shift takes it to +0.1°.
+
+The mask is also weighted by existing saturation, so it strengthens blue that
+is there and never invents it in grey — grey and red are left **bit-exact** at
+maximum settings.
+
+Doing this before the wash rather than after is the whole design. The same
+correction applied afterwards has no brake — it is 9% past target by 0.5, and
+by 1.0 it has driven a channel to black and pinned the sky at fully saturated.
+It also cannot tell blue that was unfairly greyed from blue the bloom is
+*supposed* to sit on, so it fights the glow you paid for. Dialling blue never
+moves the bloom (0.00e+00) and costs no tile overlap.
+
 ### Softening without blurring
 
 Two controls in **Optical** do the same physical job from opposite ends, and
@@ -246,7 +350,8 @@ pipenv run python tests/verify.py
 ```
 
 Checks tile independence, crop fidelity, colour pass-through, luminance
-response, edge bias, scatter and 16-bit PNG validity — 94 checks. Run it after
+response, edge bias, scatter, blue compensation and 16-bit PNG validity — 116
+checks. Run it after
 touching `server/engine.py`; it exits non-zero on failure.
 
 ## Invariants worth not breaking

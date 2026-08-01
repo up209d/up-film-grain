@@ -1,0 +1,55 @@
+---
+description: Hard invariants, pipeline order, and calibrated constants for the grain engine
+globs: server/engine.py,tests/verify.py,tests/scene.py
+alwaysApply: false
+---
+
+# Engine invariants (silent killers)
+
+Break either and previews look fine while **exports are wrong**. `verify.py`
+pins both — run `pipenv run python tests/verify.py` after touching `engine.py`.
+
+1. **Tile independence.** No stage may depend on a statistic of the region
+   being rendered — no per-tile normalisation, no global mean, no `arr.max()`.
+   Edge strength normalises against the fixed `EDGE_REF`; the noise lattice is
+   addressed by **absolute global coordinates**. Break it and exports grow
+   seams no preview shows.
+2. **Scale invariance.** Every spatial quantity is in **full-resolution pixels**
+   multiplied by the working `scale`. Supersampling renders at `scale * ss`, and
+   every `verify.py` check relies on this. Break it and 2× and 1× stop agreeing.
+
+Any new blur/displacement kernel MUST be added to `pad_for`, or tiled exports
+seam along exactly its radius. Both warps and `scatter` are displacements (they
+read pixels up to peak travel away), so they contribute to the additive pad
+term, not the ×3 kernel sum.
+
+## Pipeline order is load-bearing (placed by position, not by what they compute)
+
+- `global_*` (step 13) runs **after every mask** so it reaches masked regions.
+  Move it earlier and it becomes just more masked grain.
+- `sharpen` (step 14) is **dead last, after grain**, so it amplifies the grain.
+  It is distinct from `acutance` (extracted from the *pre-grain* base). Two
+  sharpeners, opposite intents; the difference is entirely where they sit.
+- Film texture (step 15) is drawn as **thresholds on globally-addressed noise
+  fields**, never scattered sprites — a sprite list is a per-region statistic
+  and would split a scratch across tiles. `render()` takes `full_hw` so light
+  leaks key off the whole frame, not the read window.
+
+## Calibrated constants (all measured; don't eyeball-change)
+
+`EDGE_REF=0.06` (must stay constant), `_GNORM=0.55`, `_AMP_SCALE=0.38`,
+`_MIN_CELL=0.8` (Nyquist floor), `_JITTER_MAX=3.0`, `_SAND_TAPS` ±2σ/5 taps.
+
+## Traps that cost rebuilds (see CLAUDE.md for the full list)
+
+- fBm must cascade **coarse (double upward)**, not fine — the base cell is
+  already at the pixel grid, so fine subdivision floors instantly and Octaves
+  becomes a no-op.
+- `total/wsum` normalising an fBm holds the mean but **loses variance**; rescale
+  deviation by `sum(w)/sqrt(sum(w²))` so Octaves changes structure, not amount.
+- "Softer" ≠ "blurrier": `micro_blur` kills texture; `edge_soften` keys on edge
+  *amplitude* (`_STEP_LO/_HI`), not the `edge` micro-edge mask.
+- Halation must be computed in **linear light**.
+- Read thresholds off the **field's real distribution** (value noise is
+  centre-weighted: 0.88 selects ~10% of the frame), and keep gating cells well
+  **under a frame** or a coarse field is a constant, not a mask.
