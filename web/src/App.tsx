@@ -38,8 +38,29 @@ const DEBOUNCE_MS = 140;
  *  These used to be constrained to clean fractions because the server cropped
  *  and resampled at the requested zoom, and an awkward factor put the read
  *  origin on a half pixel. Zooming is a pure browser transform now, so the
- *  list is free -- it is only about how the steps feel. */
+ *  list is free -- it is only about how the steps feel. The wheel does not
+ *  step through them; it only borrows the two ends as its limits. */
 const ZOOM_STEPS = [0.05, 0.1, 0.17, 0.25, 0.33, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8];
+
+/** Wheel zoom rate, as an exponent on the scroll delta. A mouse notch is 100
+ *  units in most browsers, so 0.0025 is about 2.8 notches per doubling --
+ *  fast enough to cross the range without hunting, slow enough to land on a
+ *  value. A trackpad pinch arrives as ctrl+wheel with a far smaller delta,
+ *  hence its own rate. */
+const WHEEL_RATE = 0.0025;
+const PINCH_RATE = 0.01;
+
+/** How close to Fit a wheel step has to land before it becomes Fit.
+ *
+ *  Fit is a *mode*, not a number: it follows the container, so a window resize
+ *  keeps the whole frame visible. Landing on 0.1997 when fit is 0.2 would look
+ *  identical and quietly lose that, so the bottom of the wheel's range is Fit
+ *  itself and anything within this of it becomes Fit outright. Scrolling out
+ *  therefore stops there rather than sailing past to 5% -- a continuous
+ *  control almost never *lands* on a snap point, it crosses it, so a snap that
+ *  only fires on a near-miss is a snap that fires at random. Below Fit is
+ *  still reachable, deliberately, from the - button. */
+const FIT_SNAP = 0.02;
 
 /** Marker written into saved preset files. Only used to make a hand-inspected
  *  file self-describing -- loading deliberately does not require it, so a bare
@@ -300,6 +321,21 @@ export default function App() {
    *  moved. */
   const commit = useCallback(() => setApplied(valuesRef.current), []);
 
+  /** Set a value *and* render it, in one gesture.
+   *
+   *  `setValue` followed by `commit()` does not work and looks like it should:
+   *  `commit` reads `valuesRef`, which is only refreshed during render, so
+   *  called synchronously it applies the value from *before* the change.
+   *  Sliders never noticed because their `pointerup` arrives a render later
+   *  and commits the right thing; a menu has no second event, so a selection
+   *  did nothing until the control lost focus. Building the next object here
+   *  and handing it to both setters keeps them in step. */
+  const setValueNow = (k: string, v: number) => {
+    const next = { ...valuesRef.current, [k]: v };
+    setValues(next);
+    setApplied(next);
+  };
+
   // A drag that ends outside the slider -- release the mouse over the image,
   // or flick past the panel edge -- never delivers `pointerup` to the input,
   // so the release is caught on the window instead.
@@ -559,7 +595,11 @@ export default function App() {
           previewUrl={previewUrl}
           sourceUrl={sourceUrl}
           compare={compare}
-          split={showBefore ? 0 : split}
+          onCompare={setCompare}
+          split={split}
+          onSplit={setSplit}
+          showBefore={showBefore}
+          onShowBefore={setShowBefore}
           previewFull={previewFull}
           onFile={onFile}
         />
@@ -567,43 +607,10 @@ export default function App() {
         <aside className="panel">
           {error && <div className="err">{error}</div>}
 
-          <Field label="Compare">
-            <div className="row">
-              <button
-                className={compare === "overlay" ? "seg on" : "seg"}
-                onClick={() => setCompare("overlay")}
-              >
-                Overlay
-              </button>
-              <button
-                className={compare === "side" ? "seg on" : "seg"}
-                onClick={() => setCompare("side")}
-              >
-                Side by side
-              </button>
-            </div>
-          </Field>
-          {compare === "overlay" && (
-            <Field label="Wipe">
-              <button
-                className={showBefore ? "swap on" : "swap"}
-                onClick={() => setShowBefore((v) => !v)}
-                disabled={!meta}
-                title="Swap before/after — or hold B"
-              >
-                {showBefore ? "Before" : "After"}
-              </button>
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.001}
-                value={split}
-                disabled={showBefore}
-                onChange={(e) => setSplit(Number(e.target.value))}
-              />
-            </Field>
-          )}
+          {/* Compare and Wipe used to live here. They are on the preview's own
+              bar now: they are things you do *to the view*, like zoom, and
+              having them in the panel meant looking away from the photo to
+              drive a wipe across it. */}
           {meta && (
             <Field label="Size scaling">
               <button
@@ -695,7 +702,8 @@ export default function App() {
             drops back to the proxy.
           </p>
           <p className="hint">
-            Zoom and pan live on the preview itself and never re-render.
+            Scroll over the photo to zoom about the pointer, drag to pan.
+            Neither re-renders.
           </p>
 
           <Field label="Quality">
@@ -807,7 +815,30 @@ export default function App() {
                   </button>
                 </h3>
                 {!collapsed[group] &&
-                  params.map((p) => (
+                  params.map((p) =>
+                    // A discrete parameter is a menu, not a slider. It is
+                    // still a plain number everywhere else -- in the schema,
+                    // in the engine and in a preset file -- so this is the
+                    // only place that knows the difference.
+                    p.choices?.length ? (
+                      <div className="slider" key={p.key}>
+                        <div className="slabel">
+                          <Help text={p.help} label={p.label} />
+                        </div>
+                        <select
+                          value={String(values[p.key] ?? p.default)}
+                          onChange={(e) =>
+                            setValueNow(p.key, Number(e.target.value))
+                          }
+                        >
+                          {p.choices.map((c, i) => (
+                            <option key={c} value={i}>
+                              {c}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ) : (
                     <div className="slider" key={p.key}>
                       <div className="slabel">
                         <Help text={p.help} label={p.label} />
@@ -840,7 +871,8 @@ export default function App() {
                         onBlur={commit}
                       />
                     </div>
-                  ))}
+                    ),
+                  )}
               </section>
             ))}
           </div>
@@ -961,11 +993,19 @@ function Stage(props: {
   previewUrl: string | null;
   sourceUrl: string | null;
   compare: Compare;
+  onCompare: (c: Compare) => void;
   split: number;
+  onSplit: (v: number) => void;
+  showBefore: boolean;
+  onShowBefore: (v: boolean) => void;
   previewFull: boolean;
   onFile: (f: File) => void;
 }) {
-  const { meta, previewUrl, sourceUrl, compare, split, previewFull } = props;
+  const { meta, previewUrl, sourceUrl, compare, previewFull } = props;
+  // Holding B peeks at the original outright, which is the wipe pushed all the
+  // way over rather than a separate mode -- so it is resolved here, once,
+  // instead of every consumer remembering to check both.
+  const split = props.showBefore ? 0 : props.split;
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const drag = useRef<{ x: number; y: number; cx: number; cy: number } | null>(null);
   // null = fit: follow the container instead of holding a fixed factor, so
@@ -1005,6 +1045,75 @@ function Stage(props: {
   const dw = iw * eff;
   const dh = ih * eff;
   const canPan = dw > pane.w + 1 || dh > pane.h + 1;
+
+  // Live geometry for the wheel handler below. That listener is attached once
+  // and by hand, so without this it would close over whatever zoom happened to
+  // be current when it was attached and every notch would zoom from the same
+  // starting point.
+  const geom = useRef({ eff: 1, fit: 1, iw: 1, ih: 1, pane: { w: 0, h: 0 } });
+  geom.current = { eff, fit: fitZoom, iw, ih, pane };
+
+  // Scroll to zoom, anchored on the pointer.
+  //
+  // Attached by hand rather than as an `onWheel` prop because React registers
+  // wheel listeners as *passive*, where preventDefault is a no-op -- so the
+  // React version would zoom the photo and scroll the page underneath it at
+  // the same time.
+  //
+  // Anchoring is the part that makes it feel like anything: the image point
+  // under the cursor has to still be under the cursor afterwards, or zooming
+  // in on a detail walks it off the screen and you pan it back every time.
+  // The anchor is read from the frame's own rect rather than recomputed from
+  // `center`, so it accounts for the clamping in place() for free.
+  useEffect(() => {
+    const host = wrapRef.current?.querySelector(".panes");
+    if (!host) return;
+
+    const onWheel = (e: WheelEvent) => {
+      const paneEl = (e.target as Element | null)?.closest?.(".pane");
+      const frame = paneEl?.querySelector(".frame") as HTMLElement | null;
+      if (!paneEl || !frame) return;
+      e.preventDefault();
+
+      const g = geom.current;
+      // deltaY is in pixels, lines or pages depending on the browser and the
+      // device; Firefox reports lines for a mouse wheel.
+      const dy =
+        e.deltaMode === 1
+          ? e.deltaY * 16
+          : e.deltaMode === 2
+            ? e.deltaY * (g.pane.h || 400)
+            : e.deltaY;
+      const rate = e.ctrlKey ? PINCH_RATE : WHEEL_RATE;
+      const hi = ZOOM_STEPS[ZOOM_STEPS.length - 1];
+      // Scrolling out bottoms out at Fit rather than at the button range's 5%.
+      const lo = Math.min(g.fit, hi);
+      const next = Math.min(hi, Math.max(lo, g.eff * Math.exp(-dy * rate)));
+      if (Math.abs(next - g.eff) < 1e-6) return;
+
+      const fr = frame.getBoundingClientRect();
+      const pr = paneEl.getBoundingClientRect();
+      // Where the cursor is on the image, 0..1, and where it is in the pane.
+      const u = (e.clientX - fr.left) / fr.width;
+      const v = (e.clientY - fr.top) / fr.height;
+      const px = e.clientX - pr.left;
+      const py = e.clientY - pr.top;
+      // place() puts the image at left = pane.w/2 - center.x*dw, so holding
+      // `u` at `px` across the zoom means center.x = u + (pane.w/2 - px)/dw.
+      // Clamped to the image; place() clamps the placement again on top.
+      const dw2 = g.iw * next;
+      const dh2 = g.ih * next;
+      setCenter({
+        x: Math.min(1, Math.max(0, u + (g.pane.w / 2 - px) / dw2)),
+        y: Math.min(1, Math.max(0, v + (g.pane.h / 2 - py) / dh2)),
+      });
+      setZoom(next <= g.fit * (1 + FIT_SNAP) ? null : next);
+    };
+
+    host.addEventListener("wheel", onWheel as EventListener, { passive: false });
+    return () =>
+      host.removeEventListener("wheel", onWheel as EventListener);
+  }, [compare, !!meta]);
 
   const stepZoom = (dir: 1 | -1) => {
     const next =
@@ -1082,6 +1191,9 @@ function Stage(props: {
   const proxyLimit = (meta?.proxy_width ?? 0) / iw;
   const softened = !previewFull && eff > proxyLimit * 1.05;
 
+  // One bar for everything that changes the *view* and nothing that changes
+  // the render: compare mode, the wipe, and the zoom. Grouped left to right in
+  // the order you reach for them, with the wipe next to the mode that owns it.
   const bar = (
     <div className="viewbar">
       {softened && (
@@ -1089,6 +1201,43 @@ function Stage(props: {
           proxy
         </span>
       )}
+      <button
+        className={compare === "overlay" ? "seg on" : "seg"}
+        onClick={() => props.onCompare("overlay")}
+        title="Wipe the result over the original"
+      >
+        Overlay
+      </button>
+      <button
+        className={compare === "side" ? "seg on" : "seg"}
+        onClick={() => props.onCompare("side")}
+        title="Original and result side by side, panning and zooming together"
+      >
+        Side
+      </button>
+      {compare === "overlay" && (
+        <>
+          <button
+            className={props.showBefore ? "swap on" : "swap"}
+            onClick={() => props.onShowBefore(!props.showBefore)}
+            title="Swap before/after — or hold B"
+          >
+            {props.showBefore ? "Before" : "After"}
+          </button>
+          <input
+            className="wipe"
+            type="range"
+            min={0}
+            max={1}
+            step={0.001}
+            value={props.split}
+            disabled={props.showBefore}
+            onChange={(e) => props.onSplit(Number(e.target.value))}
+            title="Wipe"
+          />
+        </>
+      )}
+      <span className="vsep" />
       <button
         className={zoom === null ? "seg on" : "seg"}
         onClick={() => setZoom(null)}

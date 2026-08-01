@@ -8,6 +8,10 @@ export interface Param {
   default: number;
   unit: string;
   help: string;
+  /** Names for a discrete parameter, indexed by value. Non-empty means the
+   *  control is a menu rather than a slider -- the value is still a number,
+   *  so nothing else here has to care. */
+  choices: string[];
 }
 
 export interface Preset {

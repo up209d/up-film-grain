@@ -71,7 +71,9 @@ or it ships.
 
 Adding a parameter means adding one `Param` to `server/params.py` and reading
 `p["key"]` in the engine. The UI picks it up automatically — never hand-add a
-slider in `App.tsx`.
+slider in `App.tsx`. Give it `choices=(...)` and it renders as a menu instead;
+the value is still a number everywhere else, so nothing but the one branch in
+`App.tsx` knows the difference.
 
 ## Two invariants that must not break
 
@@ -92,16 +94,17 @@ exports are wrong.
 `pipenv run python tests/verify.py` checks both, plus zoom fidelity, colour
 pass-through, luminance response, edge bias, the smooth-area guard, 16-bit PNG
 validity, the global-grain overlay, edge softening, edge jitter and its
-direction bias, edge sanding, output sharpening and the film-texture
-section — 58 checks. It exits non-zero on failure.
+direction bias, edge sanding, scatter, output sharpening and the film-texture
+section — 94 checks. It exits non-zero on failure.
 
-The global-grain, edge-softening, edge-sanding and sharpening checks exist
-because those stages ship at 0, so the default-parameter checks render straight
-past them. Each re-runs tile independence with its stage switched on: they all
-add work `pad_for` has to cover, and a kernel missing from `pad_for` seams
-tiled exports along exactly its radius while every preview looks fine. Both
-warps are in `pad_for` too — they displace rather than blur, so they read
-pixels up to their peak travel away.
+The global-grain, edge-softening, edge-sanding, scatter and sharpening checks
+exist because those stages ship at 0, so the default-parameter checks render
+straight past them. Each re-runs tile independence with its stage switched on:
+they all add work `pad_for` has to cover, and a kernel missing from `pad_for`
+seams tiled exports along exactly its radius while every preview looks fine.
+All three displacement stages — both warps and scatter — are in `pad_for` too;
+they displace rather than blur, so they read pixels up to their peak travel
+away and contribute to the additive term rather than the ×3 kernel sum.
 
 One trap when adding a check here: `sanitize(None)` fills in *defaults*, not
 zeros, so an override dict has to zero every other stage that could contribute
@@ -127,7 +130,18 @@ that every time a drag settles burns it on frames you are about to change.
 
 What the client-side scaling bought:
 
-* Zoom and pan are free. They never re-render and never hit the network.
+* Zoom and pan are free. They never re-render and never hit the network. The
+  wheel zooms, and two details in it are not optional: it is attached with
+  `addEventListener(..., {passive: false})` rather than as React's `onWheel`,
+  because **React registers wheel listeners as passive** and `preventDefault`
+  is a no-op there — the React version zooms the photo and scrolls the page
+  under it at once. And it is **anchored on the pointer**: the image point
+  under the cursor has to still be under it afterwards, or zooming into a
+  detail walks it off screen. The anchor is read from the frame's own
+  `getBoundingClientRect` rather than recomputed from `center`, so it inherits
+  `place()`'s clamping instead of duplicating it. Fit is a *mode*, not a
+  number — it tracks the container so a resize keeps the frame visible — so
+  the wheel snaps back to it within `FIT_SNAP`.
 * The server-side crop grid-phase problem is gone. It used to be that below 1:1
   the read origin had to be **snapped** so `origin * scale` landed on a whole
   working pixel, because a crop starting mid-pixel resolves on a different grid
@@ -159,6 +173,95 @@ breaks their whole purpose:
 `ENGINE.render_view` / `render_crop` are no longer called by `main.py` but are
 still exercised by `verify.py`, which is the only place the crop and zoom
 invariants are checked at all now. Do not delete them.
+
+## Scatter: diffusion without the average (added 2026-08-01)
+
+Step 1b, in linear light beside `micro_blur`, because it is the same physical
+event. A blur is diffusion as an *expectation* — average over enough photons
+and deflection becomes a convolution. `scatter` resolves the deflections
+individually instead: a share of the pixels are displaced onto a neighbour and
+nothing anywhere is averaged. That difference is the whole feature, and it is
+what the user asked for — detail destroyed, harshness kept.
+
+Measured against a blur of the same 3px reach, on a fine-texture plate:
+
+| | texture sigma | local contrast |
+|---|---|---|
+| `micro_blur 3.0` | 9% | 2% |
+| `scatter 1.0` | 100% | 96% |
+
+**Three rules, and breaking any one of them turns it back into a blur:**
+
+* **Nearest-neighbour sampling on whole-pixel offsets.** `_warp` grew a `mode`
+  argument for this. Bilinear at a fractional offset *is* a 2×2 average — the
+  stage would still look like it worked and would quietly be a filter again.
+  Displacements are rounded before the gather so the nearest choice is
+  unambiguous rather than resting on which side of a half-pixel the float
+  arithmetic lands. Verified: every output pixel is a copy of a real neighbour
+  to **1.2e-07**, where the same-reach blur deviates by 6.3e-02.
+* **Amount is coverage, not opacity.** It moves a threshold on a uniform
+  field, so it sets *how many* pixels travel. Cross-fading a displaced pixel
+  with the one it left is an average by another name, and at 0.5 it would be
+  precisely the blur this replaces.
+* **No mask, ever.** It masks itself: displacing a pixel whose neighbours
+  already match it cannot change it. A smooth ramp comes through at its own
+  slope × the travel (0.003 at a 3px reach) while detail is the only thing
+  that comes apart. That is the exact inverse of `micro_blur`'s failure mode,
+  which takes texture down *first* and edges second.
+
+`_cell_noise` exists only for this, and the reason is the `_spread` trap in a
+new place. The choice field is **quantised**, not thresholded — `floor(n·4)`
+picks one of four stencil directions — and quintic value noise spans only
+0.41–0.71 at p10–p90, so quantising it would fire two of the four directions
+and give the scatter a diagonal bias nobody asked for. Reading the lattice
+*without interpolating* gives back the hash's own uniform distribution. Its
+blockiness is the other half of the point: every pixel in a cell reads the same
+value, so a whole cell travels intact. That is what `scatter_cell` means —
+lag-1 correlation of the displacement field runs **0.00 at 1px to 0.87 at 8px**.
+
+The nine stencils are `Any`, `Cross`, `Diagonal`, `Box`, `Diamond`, `Donut`,
+`Star`, `Horizontal`, `Vertical`. A stencil is the *set of places a pixel may
+land*, which takes more than a direction count to say: `Diamond` keeps every
+angle but holds `|dx|+|dy|` constant, so it reaches 12.0px on the axes and
+8.5px on the diagonals where a disc reaches 12 both ways; `Donut` holds a hole
+open (nearest landing 7.2px of a 12px reach even at Reach Spread 1, where every
+other stencil fills solid to 0); `Star` runs alternate spokes short, measured at
+a 0.35 diagonal/axis ratio against `Box`'s 0.94 on the same eight directions.
+Each is verified by enumerating `_scatter_offsets` over its two uniform inputs
+— a *rendered* probe cannot see the shape, because the choice field gives each
+cell one direction and a sparse stencil is then sampled a few points at a time.
+
+Two things bit here. `_SCATTER_STENCILS` is indexed by the parameter's value
+and a preset file stores that index, so **renumbering silently changes the look
+of every preset that used one** — the order there and the `choices` tuple in
+`params.py` are one list in two places, and `verify.py` now pins them together
+name-for-name and looks every check's pattern up by name. It caught exactly
+that drift immediately: a hard-coded `scatter_pattern: 4` in the shell/disc
+check quietly became `Diamond` when the three new stencils were inserted.
+
+And **peak travel is the reach plus one pixel, not the reach.** `dx` and `dy`
+are rounded to whole pixels *independently*, so two half-pixel roundings the
+same way lengthen the vector by up to √2/2 — measured 12.5px on a 12px reach.
+`pad_for` carries the same +1. It would have fitted inside the trailing `+ 4`
+either way, but a stage that silently depends on another term's slack is a seam
+waiting for somebody to tighten it.
+
+`Param.choices` is new and generic: non-empty turns the control into a menu in
+the client. The value stays a plain number, so the schema, the engine, `rescale`
+and preset files are all unchanged — `App.tsx` is the only place that knows.
+It is only for genuine either/or choices; there is no midpoint between "cross"
+and "diagonal", and a slider that pretends otherwise invites you to leave it
+at 2.5. `rescale` must never touch one: it is an index, not a length.
+
+Cost is 0.69s → **0.80s** on a 6MP render at 2× (+16%), and `pad_for` grows by
+the reach alone (108 → 112px at reach 4).
+
+One honest limitation: at supersample 2 the `avg_pool` back down averages the
+sub-pixel scatter events, so texture retention on a per-pixel-white-noise plate
+falls from 100% to 73%. That is mostly the supersample round trip itself, which
+costs 21% on that plate before scatter does anything — the same bicubic-up /
+box-down softening `is_neutral` documents. Raising `scatter_cell` does not
+recover it, and it is anti-aliasing doing its job, so it is left alone.
 
 ## Film texture is drawn, never scattered (added 2026-07-31)
 
@@ -282,6 +385,26 @@ passes the whole source's size, not the read window, or the leak would slide
 around as you panned. `verify.py` pins that: a crop of a leaked frame matches
 the same region of the full render to 2e-05.
 
+## Two client traps worth knowing (2026-08-01)
+
+* **`commit()` after `setValue()` applies the *previous* value.** `commit`
+  reads `valuesRef`, and that ref is only refreshed during render, so calling
+  the pair synchronously renders what was there before the change. Sliders
+  never showed it because their `pointerup` arrives a render later and commits
+  the right thing — but the `choices` menu has no second event, so picking an
+  option did nothing until the control lost focus. `setValueNow` builds the
+  next object and hands it to both setters. Any control that changes a value
+  and expects a render in the same gesture needs it.
+* **React registers wheel listeners as passive**, so `preventDefault` inside an
+  `onWheel` prop is a no-op — the scroll-to-zoom handler is attached by hand
+  with `{passive: false}` or the photo zooms and the page scrolls underneath it
+  at the same time.
+
+Compare and Wipe moved out of the panel onto the preview's `viewbar` alongside
+the zoom controls, on the same reasoning that put zoom there: they change the
+*view*, not the render, and driving a wipe across the photo from a panel on the
+other side of the screen means looking away from the thing you are judging.
+
 ## Presets rescale across image sizes (added 2026-08-01)
 
 A preset dialled in on one photo is locked to that photo's size: every spatial
@@ -335,6 +458,7 @@ Two ways to populate it instead:
 | `_AMP_SCALE` | 0.38 | Maps the 0–100 intensity slider to amplitude; default 32 lands near 3.5% luminance sigma. Was 0.5 — recalibrated when `_fbm` started preserving variance, since the old value was silently compensating for a field running at 43% strength. |
 | `_MIN_CELL` | 0.8 | Floor on lattice cell size in working pixels. Below Nyquist it is pure aliasing. |
 | `_SAND_TAPS` | ±2σ, 5 taps | Tangential sanding filter. Reaches ±2σ, not ±1 — contour roughness sits at longer wavelengths than it appears to, and a ±1σ filter removed only 2% of it. Weights are normalised at use: the table sums to 0.991. |
+| `_SCATTER_STENCILS` | 9 entries | Scatter footprints: (name, first angle, count, locus, inner, alt). **Indexed by the parameter value, which is what a preset file stores** — renumbering silently changes every preset that used one, so append rather than insert. `verify.py` pins it against `choices` in params.py name-for-name. Every entry must keep peak travel ≤ reach, which is what `pad_for` reserves for; an L∞ "square" locus would reach 1.41× and would have to be paid for. |
 | `_JITTER_MAX` | 3.0 | Peak edge displacement in full-res px at `edge_jitter` 1. Was an inline 0.6, whose *typical* displacement was 0.227px — invisible. |
 | `_STEP_LO` / `_STEP_HI` | 0.030 / 0.110 | Luma-step bounds separating a real transition from fine texture, for the edge-softening mask. Fine texture measures an order of magnitude under a hard border, which is the gap that lets softening take the snap off a border and leave fabric alone. |
 | `_TEX_LO` / `_TEX_HI` | 0.002 / 0.015 | Local mean-abs-deviation bounds separating "smooth" from "textured" for the smooth-area guard. Skin and clear sky sit at or below `_TEX_LO`; fabric, foliage and hair sit above `_TEX_HI`. |
@@ -401,6 +525,22 @@ says so and points at 5–20 as the usable range.
   netting roughly nothing. Rescaling the deviation by `sum(w)/sqrt(sum(w²))`
   preserves variance, so Octaves changes structure at constant strength and
   Intensity stays the only amplitude control.
+* **A frequency split on top of `scatter` is redundant, and I built one before
+  working that out.** The idea was a "Detail Only" control: split the image at
+  the reach, scatter the fine half, put the broad half back untouched, so
+  shapes hold their ground while texture comes apart. Because a
+  nearest-neighbour gather is linear the maths is exact and elegant — and it
+  delivers nothing, because **the stage is already frequency-selective by
+  construction**. A displacement can only change a pixel by as much as the
+  picture varies over the distance travelled, so structure coarser than the
+  reach survives for free; that is the same self-masking that keeps skies
+  clean. Worse, it does not do what the name promises even where it bites: a
+  hard border is *high* frequency, so splitting at the reach puts the border in
+  the scattered half and the control cannot protect it. Measured, it changed
+  52% of the residual and only made the scatter weaker overall (0.0607 →
+  0.0544), i.e. a second unpredictable strength knob dressed up as a
+  structural one — while widening `pad_for` to 4× the reach. Cut. `scatter_radius`
+  is the frequency control.
 * **"Softer" is not "blurrier", and a blur is the wrong tool for it.**
   `micro_blur` diffuses the whole frame, so it takes texture down with the
   edges: measured on a half-border/half-texture frame, `micro_blur 3.0` left

@@ -80,9 +80,14 @@ process without one is broken rather than degraded and should not boot.
 * **Open image** or drop a file on the canvas. JPEG or PNG, up to 30MB.
   Multi-frame camera JPEGs (MPO — burst and 3D captures) are read as their
   primary frame.
-* **Zoom lives on the preview itself** — the `Fit / − / % / +` bar in the top
-  right, and drag to pan once the image is larger than its pane. None of it
-  re-renders, so navigating is instant.
+* **Zoom lives on the preview itself** — **scroll over the photo** to zoom, or
+  the `Fit / − / % / +` bar in the top right; drag to pan once the image is
+  larger than its pane. Scroll zooming is anchored on the pointer, so the
+  detail under the cursor stays under the cursor instead of walking off screen.
+  It is continuous rather than stepping through the bar's stops, and it snaps
+  back to `Fit` within 2% of it so a window resize still keeps the whole frame
+  visible. A trackpad pinch (ctrl+wheel) works too. None of it re-renders, so
+  navigating is instant.
 * **Editing renders a 2400px proxy** (~1.25s on a 24MP source) so sliders stay
   responsive. **Render 1:1** re-renders the whole frame at full resolution
   (~9.5s on 24MP); at that point the preview *is* the export, same pixels, same
@@ -90,9 +95,11 @@ process without one is broken rather than degraded and should not boot.
 * Judge grain at 100% zoom **after** Render 1:1. Enlarged past its own
   resolution the proxy is soft — a `proxy` badge appears on the preview to say
   so, because a soft preview otherwise reads as a soft result.
-* **Compare** has two modes. *Overlay* stacks them under a wipe (hold **B** to
-  peek at the original outright); *Side by side* puts the source and the result
-  in two panes that zoom and pan together — one drag moves both.
+* **Compare** lives on the preview's own bar, beside the zoom controls — it
+  changes the view, not the render, so it belongs with the rest of the view.
+  *Overlay* stacks the two under a wipe (hold **B** to peek at the original
+  outright); *Side* puts the source and the result in two panes that zoom and
+  pan together — one drag moves both.
 * **Quality** selects supersampling. 2× is the default; 1× is faster but gives
   grain a hard, aliased pixel footprint.
 * **Export full size** runs a tiled background render with progress. **JPEG 95
@@ -104,6 +111,61 @@ process without one is broken rather than degraded and should not boot.
 * Choose **PNG 16-bit** when the file is going on for further grading — 8-bit
   visibly posterises grain in smooth areas, and JPEG's edge ringing compounds
   through another round of processing.
+
+### Softening without blurring
+
+Two controls in **Optical** do the same physical job from opposite ends, and
+which one you want depends entirely on whether you mind losing texture.
+
+* **Micro-Blur** averages each pixel with its neighbours. That is diffusion as
+  an expectation, and it is smooth — which is the problem. Measured on a fine
+  texture plate, a 3px micro-blur leaves **9%** of the texture's sigma and
+  **2%** of its local contrast. The picture goes soft because everything went
+  soft, and it reads as out of focus.
+* **Scatter** displaces a share of the pixels onto their neighbours and
+  averages nothing at all. Same reach, same physics resolved photon by photon
+  instead of in bulk: **100%** of the texture sigma and **96%** of the local
+  contrast survive. The frame loses its digital exactness and keeps its bite.
+
+Every displaced pixel is a bit-exact copy of a real pixel nearby — verified to
+1.2e-07, where a blur of the same reach deviates by 6.3e-02 — so no in-between
+values are invented and the grit, noise and contrast come through whole.
+
+It masks itself, with no mask in the code: shuffling pixels that already match
+their neighbours cannot change them, so a smooth ramp comes through at its own
+slope times the travel (0.003 at a 3px reach) while detail is the only thing
+that comes apart.
+
+* **Scatter** is *coverage*, not opacity — the fraction of the frame that
+  travels. Cross-fading a moved pixel with the one it left would be an average
+  by another name, and at 0.5 it would be exactly the blur this replaces.
+* **Scatter Reach** is how far, and so also *what* moves: displacing a pixel
+  only changes anything where the picture varies over the distance travelled.
+* **Scatter Pattern** is the stencil — the set of places a pixel may land.
+  Restricting it is what makes the result read as structure rather than as
+  noise. `Any` is isotropic; `Cross`, `Diagonal` and `Box` are the 4-, 45- and
+  8-neighbour stencils; `Horizontal` and `Vertical` are a one-axis slip that
+  leaves an edge running along that axis untouched to the float floor. Three
+  are shapes rather than direction sets:
+  * `Diamond` keeps every angle but holds `|dx| + |dy|` constant, so it reaches
+    the full 12.0px on the axes and 8.5px on the diagonals where a disc reaches
+    12 both ways — detail spreads as a rhombus.
+  * `Donut` holds a hole open in the middle: nothing lands near where it
+    started, so detail is thrown outward and hollowed out. Measured, the
+    nearest landing is 7.2px of a 12px reach even at Reach Spread 1, where
+    every other stencil fills solid to 0.
+  * `Star` runs alternate spokes short — a 0.35 diagonal/axis reach ratio
+    against `Box`'s 0.94 on the same eight directions, which is the shape a
+    cross filter flares into.
+* **Reach Spread** — 0 is a shell (everything lands on the shape's edge,
+  measured 6.0 ± 0.00px), 1 fills it inward (3.3 ± 1.60px). `Donut` ignores it
+  to the extent of keeping its hole.
+* **Scatter Clump** is how big a piece moves as one, from per-pixel dissolve to
+  whole tiles travelling intact — lag-1 correlation of the displacement field
+  runs 0.00 at 1px to 0.87 at 8px. Past ~4px the tiles start reading as tiles.
+
+Costs about 16% on a render (0.69s → 0.80s on 6MP at 2×) and widens the tile
+overlap by its reach.
 
 Sliders only render on release, not during the drag — a fit preview is seconds
 of work, so rendering every intermediate position just queues frames that are
@@ -184,8 +246,8 @@ pipenv run python tests/verify.py
 ```
 
 Checks tile independence, crop fidelity, colour pass-through, luminance
-response, edge bias and 16-bit PNG validity. Run it after touching
-`server/engine.py`; it exits non-zero on failure.
+response, edge bias, scatter and 16-bit PNG validity — 94 checks. Run it after
+touching `server/engine.py`; it exits non-zero on failure.
 
 ## Invariants worth not breaking
 

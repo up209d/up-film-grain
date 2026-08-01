@@ -16,6 +16,15 @@ Design notes that matter for correctness:
   sampling the same global position get bit-identical values, so tiles composite
   without seams given enough overlap to cover the blur kernels.
 
+* **Not every softening stage is a filter.** ``scatter`` displaces a share of
+  the pixels onto their neighbours and averages nothing at all, so it takes the
+  image's exactness without taking its micro-contrast. It samples nearest-
+  neighbour on whole-pixel offsets precisely so each output pixel stays a copy
+  of a real one; measured against a blur of the same reach it keeps 100% of
+  fine-texture sigma where the blur keeps 14%. Anything that turns it into an
+  average -- bilinear resampling, cross-fading the moved pixel with the
+  original -- destroys the only reason it exists.
+
 * **Grain is structural.** Alongside the weighted additive term, the grain field
   multiplies the image's own micro-detail (``edge_erosion``). That term is zero
   in flat areas and grows on edges, so grain erodes existing edge structure
@@ -312,11 +321,21 @@ def _hsv_to_rgb(h_deg: float, sat: float, val: float = 1.0) -> tuple[float, floa
     return (r + m, g + m, b + m)
 
 
-def _warp(x: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+def _warp(
+    x: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor, mode: str = "bilinear",
+) -> torch.Tensor:
     """Resample ``x`` displaced by ``(dx, dy)``, both given in working pixels.
 
-    Shared by edge jitter and edge sanding -- they differ only in the spatial
-    frequency of the field they hand in, not in how it is applied.
+    Shared by edge jitter, edge sanding and scatter -- they differ only in the
+    spatial frequency of the field they hand in, not in how it is applied.
+
+    ``mode="nearest"`` makes the result an exact *copy* of a source pixel
+    rather than a blend of four, which is the whole point of the scatter
+    stage: bilinear resampling at a fractional offset is a 2x2 average, and an
+    average is precisely the thing that stage exists not to do. Callers using
+    it hand in whole-pixel displacements, so the choice of nearest neighbour
+    is unambiguous rather than resting on which side of a half-pixel the
+    floating-point arithmetic lands.
     """
     h, w = x.shape[-2:]
     ys = torch.linspace(-1.0, 1.0, h, device=x.device)
@@ -327,7 +346,7 @@ def _warp(x: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
     gy = Y.unsqueeze(0).unsqueeze(0) + dy * (2.0 / max(h - 1, 1))
     grid = torch.stack([gx[:, 0], gy[:, 0]], dim=-1)
     return F.grid_sample(
-        x, grid, mode="bilinear", align_corners=True, padding_mode="border"
+        x, grid, mode=mode, align_corners=True, padding_mode="border"
     )
 
 
@@ -454,6 +473,133 @@ def _value_noise(
     )
 
 
+def _cell_noise(
+    h: int, w: int, y0: float, x0: float, cell: float, seed: int, nfields: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """One constant hash value per lattice cell -- blocky, and *uniform*.
+
+    The counterpart to ``_value_noise``, and it exists for one reason:
+    interpolation destroys the distribution. Quintic value noise is heavily
+    centre-weighted -- p10-p90 spans only 0.41-0.71 -- which is fine for a
+    field you are going to threshold or spread, and useless for one you are
+    going to *quantise*. ``floor(n * 4)`` over an interpolated field returns 1
+    or 2 almost every time, so a four-way stencil would fire two of its four
+    directions and the scatter would come out with a diagonal bias nobody
+    asked for. Reading the lattice without interpolating gives back the hash's
+    own uniform distribution, so every direction is equally likely.
+
+    Blockiness is the other half of the point. Every pixel inside one cell
+    reads the same value, so a whole cell of image is displaced as a unit --
+    that is what ``scatter_cell`` means, and it is why detail can survive the
+    trip instead of dissolving. Addressed by global coordinates like every
+    other field here, so two tiles asking about the same pixel agree.
+    """
+    ys = (torch.arange(h, device=device, dtype=torch.float32) + float(y0)) / cell
+    xs = (torch.arange(w, device=device, dtype=torch.float32) + float(x0)) / cell
+    iy0 = int(math.floor(float(ys[0])))
+    ix0 = int(math.floor(float(xs[0])))
+    hl = int(math.floor(float(ys[-1]))) - iy0 + 1
+    wl = int(math.floor(float(xs[-1]))) - ix0 + 1
+
+    lat = torch.from_numpy(_lattice_np(iy0, ix0, hl, wl, seed, nfields)).to(device)
+    iy = (torch.floor(ys).long() - iy0).clamp(0, hl - 1)
+    ix = (torch.floor(xs).long() - ix0).clamp(0, wl - 1)
+    return lat[:, iy][:, :, ix].unsqueeze(0)
+
+
+# Scatter stencils, indexed by the ``scatter_pattern`` parameter. A stencil is
+# the *set of places a displaced pixel may land*, and it takes three
+# independent things to describe one -- which is why this is a table and not
+# just a direction count:
+#
+#   name    matches the parameter's ``choices`` tuple in params.py, entry for
+#           entry. The two are one list in two places.
+#   first   angle of the first direction, in degrees.
+#   count   how many directions, evenly spaced from ``first``. 0 is the
+#           continuous case: any angle at all.
+#   locus   how travel varies with angle -- "circle" is the same distance
+#           every way; "diamond" is |dx|+|dy| = reach, so the shape reaches
+#           furthest along the axes and pulls in on the diagonals.
+#   inner   the hole, as a fraction of the reach. 0 fills the shape solid;
+#           a donut keeps every pixel out past this however Reach Spread is
+#           set, so nothing lands near where it started.
+#   alt     length multiplier on every other direction, which is what makes a
+#           star a star: long spokes on the axes, short ones between them. 1
+#           is uniform.
+#
+# **Every stencil must keep peak travel at or under the reach**, because that
+# is the figure `pad_for` reserves overlap for. "circle" and "diamond" both do
+# (diamond is shorter off-axis, never longer); an L-infinity "square" locus
+# would reach 1.41x on the diagonals and would have to be paid for there.
+#
+# The value stored in a preset file is the *index*, so renumbering these
+# silently changes the look of every preset that used one. Append, do not
+# insert. (Diamond, Donut and Star were inserted mid-list on 2026-08-01, while
+# the feature was still unreleased and no preset had ever stored a pattern.)
+_SCATTER_STENCILS: tuple[tuple[str, float, int, str, float, float], ...] = (
+    # name          first  count  locus      inner  alt
+    ("Any",           0.0,     0, "circle",   0.0,  1.00),
+    ("Cross",         0.0,     4, "circle",   0.0,  1.00),
+    ("Diagonal",     45.0,     4, "circle",   0.0,  1.00),
+    ("Box",           0.0,     8, "circle",   0.0,  1.00),
+    ("Diamond",       0.0,     0, "diamond",  0.0,  1.00),
+    ("Donut",         0.0,     0, "circle",  0.65,  1.00),
+    ("Star",          0.0,     8, "circle",   0.0,  0.40),
+    ("Horizontal",    0.0,     2, "circle",   0.0,  1.00),
+    ("Vertical",     90.0,     2, "circle",   0.0,  1.00),
+)
+
+# How far out a donut's hole pushes the *shortest* journey, and how far a
+# star's short spokes fall behind its long ones. Both live in the table above;
+# these names exist so the numbers there read as something.
+_SCATTER_NAMES: tuple[str, ...] = tuple(s[0] for s in _SCATTER_STENCILS)
+
+
+def _scatter_offsets(
+    sel: torch.Tensor, mag_n: torch.Tensor, reach: float, spread: float,
+    pattern: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-pixel travel in whole working pixels, on the chosen stencil.
+
+    ``sel`` and ``mag_n`` must be uniform on 0..1, which is why they come from
+    ``_cell_noise`` and not from ``_value_noise``: a quantised direction reads
+    the distribution directly, and value noise does not have one worth reading.
+
+    Rounded to whole pixels here and nowhere else. That is what keeps the
+    gather a copy rather than an interpolation, so it has to happen after every
+    shaping term rather than to the reach up front.
+    """
+    _, first, count, locus, inner, alt = _SCATTER_STENCILS[pattern]
+
+    if count == 0:
+        th = sel * (2.0 * math.pi)
+        spoke: torch.Tensor | float = 1.0
+    else:
+        bin_ = torch.floor(sel * count).clamp(0.0, count - 1.0)
+        th = math.radians(first) + bin_ * (2.0 * math.pi / count)
+        # Alternate directions run short. With eight directions starting on
+        # the axes that puts the long spokes N/E/S/W and the short ones on the
+        # diagonals, which is the shape a cross filter actually flares into.
+        spoke = 1.0 if alt == 1.0 else torch.where(
+            (bin_ % 2.0) < 0.5, 1.0, alt
+        )
+
+    c, s = torch.cos(th), torch.sin(th)
+    # Angular shaping. A diamond's vertices sit on the axes, so travel is the
+    # full reach there and 1/sqrt(2) of it on the diagonals -- the locus is
+    # |dx| + |dy| = reach.
+    shape: torch.Tensor | float = (
+        1.0 / (c.abs() + s.abs()).clamp_min(1e-4) if locus == "diamond" else 1.0
+    )
+    # Reach Spread fills the shape inward from its edge; `inner` holds a hole
+    # open in the middle of it whatever Spread says. At inner = 0 this is
+    # exactly reach * (1 - spread * u).
+    radial = inner + (1.0 - inner) * (1.0 - spread * mag_n)
+    r = reach * radial * shape * spoke
+    return torch.round(r * c), torch.round(r * s)
+
+
 def _fbm(
     h: int, w: int, y0: float, x0: float, cell: float, seed: int, nfields: int,
     octaves: int, roughness: float, device: torch.device,
@@ -553,6 +699,78 @@ class GrainEngine:
         return t
 
     # ------------------------------------------------------------------ #
+    def _scatter(
+        self, x: torch.Tensor, h: int, w: int, y0: float, x0: float,
+        p: dict, scale: float,
+    ) -> torch.Tensor:
+        """Displace a share of the pixels onto their neighbours, without averaging.
+
+        A blur and this stage model the same physics from opposite ends. Light
+        diffusing through the emulsion is a stochastic process: a photon either
+        goes straight or is deflected onto a neighbouring grain. Average over
+        infinitely many photons and you get a convolution -- ``micro_blur``,
+        which is smooth because it is an expectation. Resolve the deflections
+        individually and you get this: detail lands somewhere it was not,
+        every value survives intact, and the result is *disordered* rather
+        than smoothed. That is the whole reason the stage exists. A digital
+        frame softened with a blur reads as out of focus because the blur
+        removes the micro-contrast along with the edge; scatter removes
+        neither, and takes the exactness instead.
+
+        Three properties follow from never averaging, and all three are why
+        this is not just another kernel:
+
+        * **No value is invented.** Every output pixel is a bit-exact copy of
+          some input pixel, so the frame's histogram, its grit and its noise
+          come through untouched. Sampling is nearest-neighbour on whole-pixel
+          offsets specifically to keep that true -- bilinear at a fractional
+          offset would quietly turn each sample into a 2x2 average.
+        * **Amount is coverage, not opacity.** ``scatter`` moves the threshold
+          on a uniform field, so it sets *how many* pixels travel. Cross-fading
+          a displaced pixel with the one it left would be an average by
+          another name, and at 0.5 it would read as exactly the blur this
+          replaces.
+        * **It masks itself.** Displacing a pixel whose neighbours already
+          match it changes nothing, so smooth sky, skin and studio backdrops
+          come out untouched with no mask anywhere in the code. The stage acts
+          only where there is detail to disorder, which is the inverse of
+          ``micro_blur``'s failure mode -- that one takes texture down first
+          and edges second.
+
+        There is deliberately no frequency split here, and I built one before
+        working out why it was pointless -- see the note in CLAUDE.md. The
+        stage is already frequency-selective by construction: a displacement
+        can only change a pixel by as much as the picture varies over the
+        distance travelled, so structure coarser than the reach survives for
+        free and ``scatter_radius`` is the frequency control.
+        """
+        amt = p["scatter"]
+        reach = max(0.5, p["scatter_radius"] * scale)
+        # Cells finer than a working pixel cannot be resolved; below that the
+        # nearest-neighbour read just aliases between them.
+        cell = max(1.0, p["scatter_cell"] * scale)
+        pattern = int(round(p["scatter_pattern"])) % len(_SCATTER_STENCILS)
+
+        n = _cell_noise(h, w, y0, x0, cell, int(p["seed"]) + 3301, 3, self.device)
+        sel, mag_n, gate = n[:, 0:1], n[:, 1:2], n[:, 2:3]
+
+        # Direction and distance, on the stencil, in whole pixels -- whole so
+        # the gather stays a copy rather than an interpolation. Reach Spread:
+        # 0 puts every displaced pixel on the shape's edge (detail hollows
+        # out), 1 fills it inward.
+        dx, dy = _scatter_offsets(
+            sel, mag_n, reach, p["scatter_spread"], pattern
+        )
+        # Coverage: a uniform field thresholded at the amount, so `amt` is
+        # literally the fraction of the frame that moves. Applied after the
+        # rounding so a pixel that is not travelling gets a displacement of
+        # exactly zero and reads itself back.
+        move = (gate < amt).to(x.dtype)
+        dx, dy = dx * move, dy * move
+
+        return _warp(x, dx, dy, mode="nearest")
+
+    # ------------------------------------------------------------------ #
     def render(
         self, img: torch.Tensor, p: dict, scale: float = 1.0,
         y0: float = 0.0, x0: float = 0.0,
@@ -588,8 +806,22 @@ class GrainEngine:
         # looks like a painted-on glow rather than light.
         lin = _srgb_to_linear(img)
 
-        # 1. Light diffusing sideways through the gel layers.
+        # 1. Light diffusing sideways through the gel layers, as an average.
         lin = _blur(lin, mb)
+
+        # 1b. The same diffusion resolved as discrete deflections instead of
+        #     as an average -- see _scatter for why that is a different
+        #     operation and not a slower blur. Here beside micro-blur because
+        #     it is the same physical event, and in linear light for the same
+        #     reason: it happens to the light, before the emulsion records
+        #     anything.
+        #
+        #     Note the masks below are measured from the *untouched* tile
+        #     input, so scattering the frame does not talk the edge mask or
+        #     the smooth-area guard into turning grain down -- the same
+        #     independence micro-blur has, and for the same reason.
+        if p["scatter"] > 0.001:
+            lin = self._scatter(lin, h, w, y0, x0, p, scale)
 
         # 2. Halation: light reaching the film base reflects and re-exposes the
         #    emulsion from behind, blooming warm around bright highlights.
@@ -1351,9 +1583,11 @@ class GrainEngine:
 
         Must cover every blur kernel in the pipeline: the high-pass chain, the
         acutance blur (the widest at 1.5x), the micro-blur, the edge-softening
-        blur, the output sharpening blur and halation, plus the jitter warp's
-        displacement. Miss one and tiled exports seam along its radius -- which
-        no preview will ever show.
+        blur, the output sharpening blur and halation, plus the displacement
+        of every stage that *reads* a pixel from somewhere else rather than
+        blurring in place -- the jitter warp, the sanding taps and scatter.
+        Miss one and tiled exports seam along its radius -- which no preview
+        will ever show.
         """
         hp_r = max(0.3, p["highpass_radius"] * scale)
         mb = p["micro_blur"] * scale
@@ -1375,13 +1609,26 @@ class GrainEngine:
         if p["hair"] >= 1.0:
             tex_r = max(tex_r, p["hair_soften"] * 3.0 * max(scale, 0.25))
         mask_r = max(1.0, 3.0 * scale)
+        # Scatter reads a pixel up to its full reach away. It displaces rather
+        # than blurring, so it belongs with the warps below and not in the
+        # kernel sum.
+        #
+        # Reach *plus one pixel*: dx and dy are rounded to whole pixels
+        # independently, so two half-pixel roundings the same way lengthen the
+        # vector by up to sqrt(2)/2. It would fit inside the +4 at the end of
+        # this function either way, but a stage that silently depends on
+        # another term's slack is a seam waiting for somebody to tighten it.
+        sca = (
+            max(0.5, p["scatter_radius"] * scale) + 1.0
+            if p["scatter"] > 0.001 else 0.0
+        )
         # Jitter warps the image rather than blurring it, so it reads pixels
         # displaced by up to its peak -- which at _JITTER_MAX is no longer the
         # sub-pixel rounding error it was at 0.6.
         # Both the jitter warp and the sanding filter read displaced pixels
         # rather than blurring in place, so the overlap has to cover how far
         # each of them travels.
-        jit = _JITTER_MAX * p["edge_jitter"] * max(scale, 0.25)
+        jit = _JITTER_MAX * p["edge_jitter"] * max(scale, 0.25) + sca
         if p["edge_sand"] > 0.01:
             # Sanding compounds in two ways at once, and both have to be
             # counted or a tiled export seams while every preview looks fine.
@@ -1398,7 +1645,10 @@ class GrainEngine:
             dir_reach = 3.0 * max(0.6, _SAND_DIR_K * sr)
             jit += _SAND_PASSES * (2.0 * sr + dir_reach)
         return int(
-            math.ceil(3.0 * (hp_r * 3.3 + mb + halo + soft + shr + tex_r + mask_r) + jit)
+            math.ceil(
+                3.0 * (hp_r * 3.3 + mb + halo + soft + shr + tex_r + mask_r)
+                + jit
+            )
         ) + 4
 
     def render_view(

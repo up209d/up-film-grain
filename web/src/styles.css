@@ -97,6 +97,18 @@ body {
   backdrop-filter: blur(6px);
 }
 .viewbar .seg { padding: 4px 9px; font-size: 11.5px; }
+/* The bar carries compare, wipe and zoom now, so it can outgrow a narrow
+   stage. Wrapping keeps it usable there instead of pushing controls off the
+   edge; `justify-content: flex-end` keeps it hugging the right as it does. */
+.viewbar { flex-wrap: wrap; justify-content: flex-end; max-width: calc(100% - 20px); }
+/* Thin rule between the view-comparison group and the zoom group. */
+.viewbar .vsep {
+  width: 1px; align-self: stretch; margin: 1px 3px;
+  background: var(--line);
+}
+.viewbar .swap { flex: 0 0 auto; padding: 4px 9px; font-size: 11.5px; border-radius: 6px; }
+.viewbar .wipe { width: 96px; align-self: center; }
+.viewbar .wipe:disabled { opacity: .4; }
 /* Shown only while the view is enlarged past what the proxy can resolve. */
 .viewbar .fid {
   display: inline-flex; align-items: center;
@@ -224,6 +236,9 @@ button:disabled { opacity: .45; cursor: default; }
 .chev.open { transform: rotate(90deg); }
 
 .slider { margin-bottom: 9px; }
+/* Discrete parameters render as a menu instead of a track (see the params
+   map in App.tsx). Full width so the row still reads as one control. */
+.slider select { width: 100%; padding: 4px 8px; }
 .slabel {
   display: flex; align-items: center; gap: 6px;
   margin-bottom: 3px; font-size: 12px;

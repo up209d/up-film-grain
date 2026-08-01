@@ -30,6 +30,13 @@ class Param:
     #: to be rescaled when a preset authored on one image size is applied to
     #: another. See ``rescale``.
     spatial: bool = False
+    #: Names for a *discrete* parameter, indexed by the value. Non-empty turns
+    #: the control into a menu instead of a slider -- the value is still a
+    #: number, so nothing else in the schema, the engine or a preset file has
+    #: to know the difference. Only for genuine either/or choices: a stencil
+    #: shape has no midpoint between "cross" and "diagonal", and a slider that
+    #: pretends otherwise invites you to leave it at 2.5.
+    choices: tuple[str, ...] = ()
 
 
 # Groups are rendered in this order by the client.
@@ -332,8 +339,84 @@ PARAMS: list[Param] = [
     Param(
         "micro_blur", "Micro-Blur", "Optical",
         0.0, 3.0, 0.01, 0.45, "px",
-        "Light diffusion through the gel layers. Applied to the base image "
-        "before grain injection so grain stays sharp against a soft base.",
+        "Light diffusion through the gel layers, as an average: every pixel "
+        "is mixed with its neighbours. That is the smooth half of diffusion, "
+        "and it costs texture along with the edges -- Scatter below is the "
+        "same physics without the averaging. Applied to the base image before "
+        "grain injection so grain stays sharp against a soft base.",
+        spatial=True,
+    ),
+    # Scatter: diffusion resolved as discrete deflections instead of as an
+    # average. See step 1b in engine.render() for why that is not a blur.
+    Param(
+        "scatter", "Scatter", "Optical",
+        0.0, 1.0, 0.01, 0.0, "",
+        "Spreads detail into the neighbouring pixels *without* averaging "
+        "anything, so the picture loses its digital exactness while keeping "
+        "its bite. Every displaced pixel is an exact copy of a real pixel "
+        "nearby -- no in-between values are invented, so contrast, grit and "
+        "texture come through at full strength where a blur of the same reach "
+        "would have flattened them. The number is the fraction of the frame "
+        "that moves: 0.3 relocates three pixels in ten and leaves the rest "
+        "exactly where they were. It is deliberately a coverage, not a blend "
+        "-- blending a moved pixel with its original *is* averaging, and that "
+        "is the one thing this stage must never do. Smooth regions are "
+        "untouched for free: shuffling pixels that already match their "
+        "neighbours changes nothing, so skies and skin stay clean while "
+        "detail is the only thing that comes apart. 0 = off.",
+    ),
+    Param(
+        "scatter_radius", "Scatter Reach", "Optical",
+        0.5, 24.0, 0.1, 3.0, "px",
+        "How far a displaced pixel travels, at full resolution. Small reads "
+        "as an emulsion that will not quite resolve; large tears detail into "
+        "streaks and crumbs. It is also what decides *which* structure comes "
+        "apart, because moving a pixel only changes anything where the "
+        "picture varies over the distance travelled: a short reach disorders "
+        "fine texture and leaves shapes standing, a long one starts taking "
+        "the shapes with it.",
+        spatial=True,
+    ),
+    Param(
+        "scatter_pattern", "Scatter Pattern", "Optical",
+        0.0, 8.0, 1.0, 0.0, "",
+        "Where a displaced pixel is allowed to land -- the stencil. Restricting "
+        "the choice is what makes the result read as a *structure* rather than "
+        "as noise: detail smears the way the shape says and nowhere else.\n"
+        "\n"
+        "Any is isotropic and reads as plain diffusion. Cross, Diagonal and Box "
+        "are the 4-, 45- and 8-neighbour stencils. Diamond keeps every angle "
+        "but reaches furthest along the axes and pulls in on the diagonals, so "
+        "detail spreads as a rhombus rather than a disc. Donut holds a hole "
+        "open in the middle -- nothing lands near where it started, so detail "
+        "is thrown outward and hollowed out, and it stays hollow whatever Reach "
+        "Spread is set to. Star is eight spokes with every other one running "
+        "short, which is the shape a cross filter flares into. Horizontal and "
+        "Vertical are the extreme case, a one-axis slip that leaves edges "
+        "running along that axis completely untouched.",
+        choices=("Any", "Cross", "Diagonal", "Box", "Diamond", "Donut",
+                 "Star", "Horizontal", "Vertical"),
+    ),
+    Param(
+        "scatter_spread", "Reach Spread", "Optical",
+        0.0, 1.0, 0.01, 1.0, "",
+        "Whether every displaced pixel travels the full reach or a share of "
+        "it. 0 is a shell -- everything lands on the edge of the pattern's "
+        "shape, which hollows detail out into an outline and is the harshest "
+        "setting here. 1 fills the shape inward, with distances spread evenly "
+        "from nothing up to the reach, which reads as diffusion rather than as "
+        "an outline. Donut is the exception by design: it holds its hole open "
+        "at any setting, so this only decides how thick its ring is.",
+    ),
+    Param(
+        "scatter_cell", "Scatter Clump", "Optical",
+        1.0, 16.0, 0.1, 1.0, "px",
+        "How big a piece of the picture moves as one. At 1 every pixel "
+        "chooses for itself and the image crumbles; larger values move whole "
+        "tiles of detail intact, so structure survives the trip and lands "
+        "somewhere else. Past about 4px the tiles start reading as tiles -- "
+        "which is a look, a shattered plate rather than a soft one, but it is "
+        "no longer subtle. Held in full-res pixels like every other length.",
         spatial=True,
     ),
     # ---------------------------------------------------------------- color
@@ -592,7 +675,7 @@ NEUTRAL_ZERO: tuple[str, ...] = (
     "intensity",
     "edge_erosion", "acutance", "edge_soften", "edge_sand", "edge_jitter",
     "halation",
-    "micro_blur",
+    "micro_blur", "scatter",
     "warm_highlights", "cool_shadows",
     "global_intensity",
     "sharpen",
@@ -629,6 +712,8 @@ def rescale(values: dict[str, float], k: float) -> dict[str, float]:
       the frame's area inside the engine, so 50 specks is 50 specks whatever
       the resolution -- which is what keeps the look constant.
     * ``leak_size``, which is a fraction of the frame rather than a length.
+    * Discrete choices (``scatter_pattern``). It is an index into a list of
+      stencils, not a quantity -- scaling it would silently swap the shape.
 
     Values are clamped back into range afterwards, so a large upscale can
     saturate a parameter rather than escaping its slider.
