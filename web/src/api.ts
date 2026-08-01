@@ -27,6 +27,8 @@ export interface Schema {
   /** Values that switch every stage off. Rendering with these returns the
    *  source untouched, bit for bit. */
   neutral: Record<string, number>;
+  /** Fallback size for presets that do not record one. Null = no scaling. */
+  default_reference_mp: number | null;
 }
 
 export interface ImageMeta {

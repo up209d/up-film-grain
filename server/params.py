@@ -677,6 +677,7 @@ def schema() -> dict:
         "default_preset": DEFAULT_PRESET if DEFAULT_PRESET in names else None,
         # What the client's "Original" button applies.
         "neutral": neutral_values(),
+        "default_reference_mp": DEFAULT_REFERENCE_MP,
     }
 
 
@@ -722,6 +723,20 @@ PRESET_DIR = Path(
 # supported way to start from neutral rather than a way to break startup.
 DEFAULT_PRESET = os.environ.get("FILM_GRAIN_DEFAULT_PRESET", "Stock")
 
+# Fallback size for presets that do not record one. Unset by default: a preset
+# with no `reference_mp` scales by 1.0, which is exactly how it behaved before
+# rescaling existed. Guessing a size here would silently change the look of
+# every legacy preset, and a wrong guess is worse than no scaling.
+#
+# Set it if you know your existing presets were all dialled in on the same
+# camera -- FILM_GRAIN_DEFAULT_REFERENCE_MP=24 retrofits the lot in one go.
+try:
+    DEFAULT_REFERENCE_MP: float | None = (
+        float(os.environ.get("FILM_GRAIN_DEFAULT_REFERENCE_MP", "") or 0) or None
+    )
+except ValueError:
+    DEFAULT_REFERENCE_MP = None
+
 
 def load_presets() -> list[dict]:
     """Read every ``*.json`` in ``PRESET_DIR``, sorted by name.
@@ -762,7 +777,7 @@ def load_presets() -> list[dict]:
         values = raw.get("values")
         if not isinstance(values, dict):
             values = raw
-        ref = raw.get("reference_mp")
+        ref = raw.get("reference_mp") or DEFAULT_REFERENCE_MP
         out.append({
             "name": f.stem,
             "values": sanitize(values),

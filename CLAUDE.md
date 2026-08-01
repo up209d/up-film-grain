@@ -316,7 +316,15 @@ Two traps when measuring this:
   the residual too, which reported 148% instead of 107%.
 
 Files without `reference_mp` -- everything authored before this -- scale by
-1.0, so the behaviour is unchanged rather than guessed at.
+1.0, so the behaviour is unchanged rather than guessed at. There is
+deliberately **no built-in default size**: inventing one would silently change
+the look of every legacy preset, and a wrong guess is worse than no scaling.
+Two ways to populate it instead:
+
+* Per preset: open a photo of the size it was dialled in on, press **Set from
+  photo**, then **Save to file…**.
+* All at once: `FILM_GRAIN_DEFAULT_REFERENCE_MP=24` makes every preset with no
+  recorded size be treated as authored at 24MP.
 
 ## Tuning constants (all in engine.py, all calibrated by measurement)
 

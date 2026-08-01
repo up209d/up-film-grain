@@ -608,6 +608,14 @@ export default function App() {
                   ? `${Math.sqrt(meta.megapixels / referenceMp).toFixed(2)}×`
                   : "1.00×"}
               </span>
+              <button
+                className="seg"
+                onClick={() => setReferenceMp(meta.megapixels)}
+                disabled={referenceMp === meta.megapixels}
+                title="Record this photo's size as the size these settings were dialled in on"
+              >
+                Set from photo
+              </button>
             </Field>
           )}
           {meta && (
@@ -632,8 +640,12 @@ export default function App() {
           {meta && !referenceMp && (
             <p className="hint">
               This preset does not record what size it was dialled in on, so
-              nothing is scaled. <strong>Save to file…</strong> while this photo
-              is open to stamp it at {meta.megapixels}MP.
+              nothing is scaled — it behaves exactly as it did before. If this
+              photo is the size you dialled it in on, press{" "}
+              <strong>Set from photo</strong> then <strong>Save to file…</strong>{" "}
+              to stamp it at {meta.megapixels}MP. To retrofit every old preset at
+              once, start the server with{" "}
+              <code>FILM_GRAIN_DEFAULT_REFERENCE_MP=24</code>.
             </p>
           )}
           {meta && referenceMp && scaleToRef && (

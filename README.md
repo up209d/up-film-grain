@@ -129,6 +129,22 @@ to make it a permanent entry.
 
 Set `FILM_GRAIN_PRESETS=/some/dir` to read them from somewhere else.
 
+### Preset size scaling
+
+Every spatial setting — clump size, radii, jitter, speck and scratch size — is
+a length in full-resolution pixels, so a preset dialled in on a 24MP photo
+gives proportionally finer grain on a 45MP one. Presets can record the size
+they were authored at, and the server then rescales those lengths by the
+**linear** ratio `sqrt(current / reference)` — a 4x-the-pixels photo is only
+2x as wide. Amounts and mark counts are not scaled; they already mean the same
+thing at any size.
+
+The panel shows `preset 24.0MP → photo 45.0MP = 1.369×` and lets you switch it
+off. A preset with no recorded size scales by 1.0 — nothing is guessed. To
+populate it, either press **Set from photo** with the right photo open and
+re-save, or start the server with `FILM_GRAIN_DEFAULT_REFERENCE_MP=24` to
+treat every unstamped preset as 24MP.
+
 ```json
 {
   "format": "film-grain-preset",
