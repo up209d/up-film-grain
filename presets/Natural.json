@@ -2,6 +2,7 @@
   "format": "film-grain-preset",
   "version": 1,
   "name": "Natural",
+  "reference_mp": 24.0,
   "values": {
     "pre_sharpen": 0,
     "pre_sharpen_radius": 1,

@@ -2,6 +2,7 @@
   "format": "film-grain-preset",
   "version": 1,
   "name": "Clean & Smooth",
+  "reference_mp": 24.0,
   "values": {
     "contrast": 0,
     "toe": 0,
