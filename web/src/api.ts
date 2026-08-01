@@ -13,6 +13,8 @@ export interface Param {
 export interface Preset {
   name: string;
   values: Record<string, number>;
+  /** Megapixels the preset was dialled in on, if it says. */
+  reference_mp: number | null;
 }
 
 export interface Schema {
@@ -45,6 +47,10 @@ export interface ViewRequest {
   params: Record<string, number>;
   supersample: number;
   full?: boolean;
+  /** Megapixels of the image these values were dialled in on. The server
+   *  rescales every length by the *linear* ratio to the current image, so a
+   *  preset keeps its look on a bigger or smaller photo. Omit for no scaling. */
+  reference_mp?: number | null;
 }
 
 export interface RenderResult {
@@ -134,6 +140,7 @@ export async function startExport(body: {
   format: string;
   supersample: number;
   quality: number;
+  reference_mp?: number | null;
 }): Promise<string> {
   const r = await fetch("/api/export", {
     method: "POST",

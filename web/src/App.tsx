@@ -76,6 +76,12 @@ export default function App() {
   const [showBefore, setShowBefore] = useState(false);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
+  /** Megapixels of the image the current values were dialled in on. Sent with
+   *  every render so the server rescales lengths to whatever photo is loaded;
+   *  null means "these values are for this photo" and nothing is scaled. */
+  const [referenceMp, setReferenceMp] = useState<number | null>(null);
+  const [scaleToRef, setScaleToRef] = useState(true);
+
   const [format, setFormat] = useState("jpeg");
   const [job, setJob] = useState<ExportJob | null>(null);
 
@@ -142,8 +148,13 @@ export default function App() {
    *  navigating the preview never re-renders and never touches the network. */
   const viewBody = useCallback((): ViewRequest | null => {
     if (!meta) return null;
-    return { id: meta.id, params: applied, supersample };
-  }, [meta, applied, supersample]);
+    return {
+      id: meta.id,
+      params: applied,
+      supersample,
+      reference_mp: scaleToRef ? referenceMp : null,
+    };
+  }, [meta, applied, supersample, referenceMp, scaleToRef]);
 
   // The untouched image is the same bytes for the life of an upload, and it is
   // now a full-resolution PNG -- so it is fetched once here rather than riding
@@ -243,6 +254,7 @@ export default function App() {
         format,
         supersample,
         quality: 95,
+        reference_mp: scaleToRef ? referenceMp : null,
       });
       const poll = async () => {
         const s = await exportStatus(id);
@@ -315,6 +327,10 @@ export default function App() {
   const applyPreset = (name: string) => {
     const p = schema?.presets.find((x) => x.name === name);
     if (!p) return;
+    // A preset dialled in on a 24MP frame means something different on a 45MP
+    // one; the server rescales lengths by the linear ratio, but only if it is
+    // told what size the values were authored at.
+    setReferenceMp(p.reference_mp ?? null);
     const v = { ...values, ...p.values };
     setValues(v);
     setApplied(v);
@@ -439,6 +455,10 @@ export default function App() {
       format: PRESET_FORMAT,
       version: 1,
       name,
+      // Stamped so the preset can be rescaled onto a different-sized photo.
+      // Falls back to whatever it was loaded with, so re-saving a preset you
+      // did not author here does not silently re-base it onto this image.
+      reference_mp: referenceMp ?? meta?.megapixels ?? null,
       values: Object.fromEntries(
         // Written in schema order, not insertion order, so a hand-edited file
         // stays readable and two saves diff cleanly.
@@ -467,7 +487,9 @@ export default function App() {
 
   const loadPreset = async (file: File) => {
     try {
-      const { values: v, dropped } = coerce(JSON.parse(await file.text()));
+      const raw = JSON.parse(await file.text());
+      const { values: v, dropped } = coerce(raw);
+      if (typeof raw?.reference_mp === "number") setReferenceMp(raw.reference_mp);
       setValues(v);
       setApplied(v); // discrete action -- render straight away
         setError(null);
@@ -571,6 +593,62 @@ export default function App() {
               />
             </Field>
           )}
+          {meta && (
+            <Field label="Size scaling">
+              <button
+                className={scaleToRef && referenceMp ? "seg on" : "seg"}
+                onClick={() => setScaleToRef((v) => !v)}
+                disabled={!referenceMp}
+                title="Rescale every length for this photo's size"
+              >
+                {!referenceMp ? "n/a" : scaleToRef ? "On" : "Off"}
+              </button>
+              <span className="val">
+                {referenceMp && scaleToRef
+                  ? `${Math.sqrt(meta.megapixels / referenceMp).toFixed(2)}×`
+                  : "1.00×"}
+              </span>
+            </Field>
+          )}
+          {meta && (
+            <p className="hint scalebox">
+              <span>
+                preset&nbsp;<strong>{referenceMp ? `${referenceMp}MP` : "—"}</strong>
+              </span>
+              <span>→</span>
+              <span>
+                photo&nbsp;<strong>{meta.megapixels}MP</strong>
+              </span>
+              <span>=</span>
+              <span>
+                <strong>
+                  {referenceMp && scaleToRef
+                    ? `${Math.sqrt(meta.megapixels / referenceMp).toFixed(3)}×`
+                    : "1.000×"}
+                </strong>
+              </span>
+            </p>
+          )}
+          {meta && !referenceMp && (
+            <p className="hint">
+              This preset does not record what size it was dialled in on, so
+              nothing is scaled. <strong>Save to file…</strong> while this photo
+              is open to stamp it at {meta.megapixels}MP.
+            </p>
+          )}
+          {meta && referenceMp && scaleToRef && (
+            <p className="hint">
+              Lengths — clump size, every radius, jitter, speck and scratch size
+              — are multiplied by the <strong>linear</strong> ratio{" "}
+              {Math.sqrt(meta.megapixels / referenceMp).toFixed(3)}×, not the
+              megapixel ratio {(meta.megapixels / referenceMp).toFixed(2)}×: a
+              photo with {(meta.megapixels / referenceMp).toFixed(2)}× the pixels
+              is only {Math.sqrt(meta.megapixels / referenceMp).toFixed(2)}× as
+              wide. Amounts and mark counts are not scaled — they already mean
+              the same thing at any size.
+            </p>
+          )}
+
           <Field label="Preview fidelity">
             <button
               className="btn"

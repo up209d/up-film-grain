@@ -155,6 +155,44 @@ def main() -> int:
         f"sat {b0[0]:.2f}->{dn[0]:.2f} muted, {b0[-1]:.2f}->{dn[-1]:.2f} vivid",
     )
 
+    # -- 3c. preset rescaling across image sizes -------------------------------
+    # A preset dialled in on one size has to hold its look on another. The
+    # scale is the ratio of *linear* dimensions, not of pixel counts -- a 24MP
+    # frame is 1.29x the width of a 16MP one, not 1.5x -- and only lengths move.
+    print("\npreset rescaling (same look on a different-sized photo)")
+    check(
+        "linear, not area", abs(P.scale_factor(24.0, 96.0) - 2.0) < 1e-6,
+        f"24MP -> 96MP is 4x the pixels, {P.scale_factor(24.0, 96.0):.2f}x the width",
+    )
+    src = P.sanitize({"grain_size": 2.0, "halation_radius": 20.0,
+                      "intensity": 45.0, "dust": 50.0, "leak_size": 0.5})
+    got = P.rescale(src, 1.6)
+    check(
+        "lengths scale", abs(got["grain_size"] - 3.2) < 1e-4
+        and abs(got["halation_radius"] - 32.0) < 1e-4,
+        f"grain_size {src['grain_size']} -> {got['grain_size']:.2f}, "
+        f"halation_radius {src['halation_radius']} -> {got['halation_radius']:.1f}",
+    )
+    check(
+        "amounts and counts do not",
+        got["intensity"] == src["intensity"] and got["dust"] == src["dust"]
+        and got["leak_size"] == src["leak_size"],
+        "intensity, dust count and leak_size all unchanged",
+    )
+    check(
+        "every spatial param is marked",
+        {x.key for x in P.PARAMS if x.spatial} == {
+            "dust_size", "edge_jitter", "edge_sand_grit", "edge_soften_radius",
+            "global_size", "grain_size", "hair_length", "halation_radius",
+            "highpass_radius", "micro_blur", "pre_sharpen_radius",
+            "scratch_width", "sharpen_radius"},
+        f"{sum(1 for x in P.PARAMS if x.spatial)} marked spatial",
+    )
+    check(
+        "no reference means no change", P.rescale(src, 1.0) == src,
+        "scale_factor(None, x) = " f"{P.scale_factor(None, 40.0):.1f}",
+    )
+
     # -- 4. luminance response peaks in the 15-65% band ----------------------
     print("\nluminance response (grain must peak in midtones/shadows)")
     grad = np.zeros((256, 1024, 3), np.float32)

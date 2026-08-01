@@ -26,6 +26,10 @@ class Param:
     default: float
     unit: str = ""
     help: str = ""
+    #: True when the value is a *length* in full-resolution pixels, so it has
+    #: to be rescaled when a preset authored on one image size is applied to
+    #: another. See ``rescale``.
+    spatial: bool = False
 
 
 # Groups are rendered in this order by the client.
@@ -62,6 +66,7 @@ PARAMS: list[Param] = [
         "pre_sharpen_radius", "Pre Sharpen Radius", "Pre Sharpen",
         0.3, 8.0, 0.05, 1.0, "px",
         "Radius of the pre-sharpen unsharp mask, at full resolution.",
+        spatial=True,
     ),
     # ----------------------------------------------------------------- tone
     Param(
@@ -124,6 +129,7 @@ PARAMS: list[Param] = [
         "Silver-halide clump diameter, measured at full resolution -- the "
         "finest structure in the grain. Octaves stack coarser scales on top of "
         "it. Held in full-res units, so it means the same thing at any zoom.",
+        spatial=True,
     ),
     Param(
         "shadow_size", "Shadow Clumping", "Grain Structure",
@@ -208,6 +214,7 @@ PARAMS: list[Param] = [
         "highpass_radius", "High-Pass Radius", "Edge Destruction",
         0.5, 5.0, 0.05, 2.0, "px",
         "Radius used to isolate micro-edges, at full resolution.",
+        spatial=True,
     ),
     Param(
         "edge_erosion", "Edge Erosion", "Edge Destruction",
@@ -237,6 +244,7 @@ PARAMS: list[Param] = [
         0.3, 8.0, 0.05, 1.5, "px",
         "How far a softened edge spreads, at full resolution. Kept separate "
         "from the amount so you can set how soft independently of how wide.",
+        spatial=True,
     ),
     Param(
         "edge_jitter", "Edge Jitter", "Edge Destruction",
@@ -246,6 +254,7 @@ PARAMS: list[Param] = [
         "reading as vector art. Displacement is in full-resolution pixels and "
         "peaks at 3px; the default 0.3 makes a straight border wander about "
         "±0.4px. Flat areas are untouched — it is weighted by the edge mask.",
+        spatial=True,
     ),
     Param(
         "jitter_aniso", "Jitter Direction", "Edge Destruction",
@@ -281,6 +290,7 @@ PARAMS: list[Param] = [
         "is a fine grit: it takes off pixel-scale jaggies and leaves the "
         "border's shape alone. Large flattens broader undulations too, so the "
         "wander Edge Jitter added starts going with them.",
+        spatial=True,
     ),
     # ------------------------------------------------------------- halation
     Param(
@@ -293,6 +303,7 @@ PARAMS: list[Param] = [
         "halation_radius", "Halation Spread", "Halation",
         2.0, 80.0, 0.5, 24.0, "px",
         "How far the bloom spreads, at full resolution.",
+        spatial=True,
     ),
     Param(
         "halation_threshold", "Halation Threshold", "Halation",
@@ -323,6 +334,7 @@ PARAMS: list[Param] = [
         0.0, 3.0, 0.01, 0.45, "px",
         "Light diffusion through the gel layers. Applied to the base image "
         "before grain injection so grain stays sharp against a soft base.",
+        spatial=True,
     ),
     # ---------------------------------------------------------------- color
     Param(
@@ -375,6 +387,7 @@ PARAMS: list[Param] = [
         "Clump diameter of the global layer, at full resolution. Set it apart "
         "from Clump Size and the two layers read as separate structures; match "
         "them and it just thickens the main grain.",
+        spatial=True,
     ),
     Param(
         "global_opacity", "Global Opacity", "Global Grain",
@@ -404,6 +417,7 @@ PARAMS: list[Param] = [
         "Radius of the unsharp mask, at full resolution. Keep it near the "
         "clump size to bite on grain; widen it to work on image structure "
         "instead, which fattens halos as it goes.",
+        spatial=True,
     ),
     # ---------------------------------------------------------- film texture
     # Physical damage to the film, not emulsion behaviour -- applied dead last
@@ -422,6 +436,7 @@ PARAMS: list[Param] = [
         0.5, 120.0, 0.05, 2.0, "px",
         "Speck diameter at full resolution. Small is scanner dust; large is "
         "lint and debris on the negative.",
+        spatial=True,
     ),
     Param(
         "dust_opacity", "Dust Opacity", "Film Texture",
@@ -467,6 +482,7 @@ PARAMS: list[Param] = [
         0.3, 20.0, 0.05, 1.0, "px",
         "Width of a scratch at full resolution. Hairline values are the "
         "convincing ones; wide reads as damage rather than wear.",
+        spatial=True,
     ),
     Param(
         "scratch_soften", "Scratch Softness", "Film Texture",
@@ -491,6 +507,7 @@ PARAMS: list[Param] = [
         "How long each hair is, at full resolution -- independent of how many "
         "there are. It also sets how much a hair wanders over that length, "
         "because a longer filament follows a broader contour.",
+        spatial=True,
     ),
     Param(
         "hair_soften", "Hair Softness", "Film Texture",
@@ -590,6 +607,47 @@ def neutral_values() -> dict[str, float]:
         if k in out:
             out[k] = 0.0
     return out
+
+
+def rescale(values: dict[str, float], k: float) -> dict[str, float]:
+    """Rescale a value set authored at one image size for another.
+
+    ``k`` is the ratio of *linear* dimensions, not of pixel counts. That
+    distinction is the whole thing: every parameter marked ``spatial`` is a
+    length in full-resolution pixels, and a 16MP frame is 0.816x the width of a
+    24MP one, not 0.667x. Scaling lengths by the megapixel ratio overshoots by
+    the square root -- a 2px clump would come out at 1.33px instead of 1.63px,
+    and at the other end a 40MP frame would get 3.3px clumps where it wants
+    2.6px.
+
+    Deliberately *not* rescaled:
+
+    * Amounts and blend weights (intensity, halation, sharpen, vibrance...).
+      They are per-pixel and dimensionless, so the same number means the same
+      thing at any size.
+    * Mark counts (dust, scratches, hair, leaks). Those already resolve against
+      the frame's area inside the engine, so 50 specks is 50 specks whatever
+      the resolution -- which is what keeps the look constant.
+    * ``leak_size``, which is a fraction of the frame rather than a length.
+
+    Values are clamped back into range afterwards, so a large upscale can
+    saturate a parameter rather than escaping its slider.
+    """
+    if abs(k - 1.0) < 1e-6:
+        return dict(values)
+    out = dict(values)
+    for prm in PARAMS:
+        if not prm.spatial or prm.key not in out:
+            continue
+        out[prm.key] = max(prm.min, min(prm.max, out[prm.key] * k))
+    return out
+
+
+def scale_factor(reference_mp: float | None, current_mp: float) -> float:
+    """Linear scale between a preset's authored size and the current image."""
+    if not reference_mp or reference_mp <= 0 or current_mp <= 0:
+        return 1.0
+    return float((current_mp / reference_mp) ** 0.5)
 
 
 def is_neutral(p: dict) -> bool:
@@ -704,5 +762,13 @@ def load_presets() -> list[dict]:
         values = raw.get("values")
         if not isinstance(values, dict):
             values = raw
-        out.append({"name": f.stem, "values": sanitize(values)})
+        ref = raw.get("reference_mp")
+        out.append({
+            "name": f.stem,
+            "values": sanitize(values),
+            # Size the preset was dialled in on, so it can be rescaled onto a
+            # different photo. Absent in older files -> no scaling, which is
+            # the pre-existing behaviour rather than a guess.
+            "reference_mp": float(ref) if isinstance(ref, (int, float)) and ref else None,
+        })
     return out

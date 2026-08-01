@@ -282,6 +282,42 @@ passes the whole source's size, not the read window, or the leak would slide
 around as you panned. `verify.py` pins that: a crop of a leaked frame matches
 the same region of the full render to 2e-05.
 
+## Presets rescale across image sizes (added 2026-08-01)
+
+A preset dialled in on one photo is locked to that photo's size: every spatial
+parameter is a length in full-resolution pixels, so the same numbers on a
+bigger frame give proportionally finer grain and tighter halation. Preset files
+now carry `reference_mp`, the size they were authored at, and the client sends
+it with every render; `_params_for` rescales before the engine sees anything.
+
+**The ratio is linear, not area.** Thirteen parameters are marked
+`spatial=True` and multiplied by `sqrt(current_mp / reference_mp)`. A 16MP
+frame is 0.816x the *width* of a 24MP one, not 0.667x -- scaling lengths by the
+megapixel ratio overshoots by the square root. `edge_jitter` is in that list
+despite having no `px` unit: `_JITTER_MAX` makes it a length multiplier.
+
+Not rescaled, on purpose: amounts and blend weights (dimensionless, per-pixel),
+mark counts (already resolved against frame area inside the engine, so 50
+specks is 50 specks at any size), and `leak_size` (a fraction of the frame).
+
+Measured on the same scene at 6MP and 15.4MP, both resampled to a common 900px
+display width and grain isolated against a same-parameter grain-off render:
+without scaling the larger frame carries **57%** of the authored grain sigma;
+with it, **107%**. The residual 7% is the clump curve and the `_MIN_CELL` floor,
+not a systematic error.
+
+Two traps when measuring this:
+
+* Resample both renders to the *same* display width. Downsampling by integer
+  factors lands them at different sizes (1000px vs 1200px) and the comparison
+  is meaningless.
+* Isolate grain against a grain-off render using the **same rescaled**
+  parameters. Using the unscaled ones puts the halation and blur rescaling into
+  the residual too, which reported 148% instead of 107%.
+
+Files without `reference_mp` -- everything authored before this -- scale by
+1.0, so the behaviour is unchanged rather than guessed at.
+
 ## Tuning constants (all in engine.py, all calibrated by measurement)
 
 | Constant | Value | Why |

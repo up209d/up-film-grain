@@ -101,6 +101,22 @@ def _get(uid: str) -> Upload:
     return up
 
 
+def _params_for(up: Upload, body: dict) -> dict[str, float]:
+    """Sanitised parameters, rescaled if they were authored at another size.
+
+    ``reference_mp`` is the megapixel count of the image a preset was dialled
+    in on. Resolved per request rather than baked into the values when a preset
+    loads, so switching to a different photo re-scales on its own instead of
+    leaving the last photo's numbers behind.
+    """
+    p = P.sanitize(body.get("params"))
+    ref = body.get("reference_mp")
+    if ref:
+        k = P.scale_factor(float(ref), up.w * up.h / 1e6)
+        p = P.rescale(p, k)
+    return p
+
+
 # --------------------------------------------------------------------------- #
 
 @app.get("/api/health")
@@ -166,7 +182,7 @@ def preview(body: dict = Body(...)) -> Response:
     structure, it just cannot resolve its finest detail.
     """
     up = _get(body.get("id", ""))
-    p = P.sanitize(body.get("params"))
+    p = _params_for(up, body)
     ss = max(1, min(3, int(body.get("supersample", 2))))
     full = bool(body.get("full", False))
 
@@ -243,7 +259,7 @@ def _run_export(job_id: str, up: Upload, p: dict, fmt: str, ss: int, quality: in
 @app.post("/api/export")
 def export(body: dict = Body(...)) -> dict:
     up = _get(body.get("id", ""))
-    p = P.sanitize(body.get("params"))
+    p = _params_for(up, body)
     fmt = body.get("format", "jpeg")
     if fmt not in iio.FORMATS:
         raise HTTPException(400, f"Unknown format {fmt!r}.")
