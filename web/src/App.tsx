@@ -96,21 +96,31 @@ export default function App() {
    *  exists, otherwise the raw parameter defaults. Shared by boot and Reset so
    *  the two cannot drift -- "reset" meaning something different from "how it
    *  opened" is its own small bug. */
-  const startingValues = useCallback((s: Schema): Values => {
-    const v: Values = {};
-    for (const p of s.params) v[p.key] = p.default;
-    const preset = s.presets.find((x) => x.name === s.default_preset);
-    return preset ? { ...v, ...preset.values } : v;
-  }, []);
+  const startingValues = useCallback(
+    (s: Schema): { values: Values; referenceMp: number | null } => {
+      const v: Values = {};
+      for (const p of s.params) v[p.key] = p.default;
+      const preset = s.presets.find((x) => x.name === s.default_preset);
+      // The reference size travels with the values. Returning it here rather
+      // than only in applyPreset is the point: boot and Reset go through this
+      // path, so without it the app opened on Stock with size scaling inert
+      // until you re-picked Stock from the dropdown by hand.
+      return preset
+        ? { values: { ...v, ...preset.values }, referenceMp: preset.reference_mp }
+        : { values: v, referenceMp: null };
+    },
+    [],
+  );
 
   // ---------------------------------------------------------------- boot --
   useEffect(() => {
     getSchema()
       .then((s) => {
         setSchema(s);
-        const v = startingValues(s);
-        setValues(v);
-        setApplied(v);
+        const start = startingValues(s);
+        setValues(start.values);
+        setApplied(start.values);
+        setReferenceMp(start.referenceMp);
       })
       .catch((e) => setError(String(e.message ?? e)));
     getHealth()
@@ -338,9 +348,10 @@ export default function App() {
 
   const resetAll = () => {
     if (!schema) return;
-    const v = startingValues(schema);
-    setValues(v);
-    setApplied(v);
+    const start = startingValues(schema);
+    setValues(start.values);
+    setApplied(start.values);
+    setReferenceMp(start.referenceMp);
   };
 
   /** Switch the whole pipeline off, so the preview is the untouched photo.
@@ -388,7 +399,7 @@ export default function App() {
    *  just been given real values is not muted any more. */
   const resetGroup = (group: string) => {
     if (!schema) return;
-    const start = startingValues(schema);
+    const start = startingValues(schema).values;
     const keys = schema.params.filter((x) => x.group === group).map((x) => x.key);
     const v = { ...values };
     for (const k of keys) v[k] = start[k];
