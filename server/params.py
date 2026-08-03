@@ -41,24 +41,44 @@ class Param:
 
 # Groups are rendered in this order by the client.
 GROUPS: list[str] = [
+    "Pre Blur",
     "Pre Sharpen",
     "Grain Structure",
     "Luminance Response",
     "Edge Destruction",
     "Halation",
     "Optical",
-    "Color",
+    "Anti Aliasing",
     "Tone Response",
     "Global Grain",
     "Sharpening",
     "Film Texture",
+    "Output",
 ]
 
 
 PARAMS: list[Param] = [
+    # ------------------------------------------------------------- pre blur
+    # The very first thing that touches the image -- ahead of pre-sharpen and
+    # of every film stage. See step 0 in engine.render().
+    Param(
+        "pre_blur", "Pre Blur", "Pre Blur",
+        0.0, 10.0, 0.05, 0.0, "px",
+        "Gaussian blur on the source, at the top of the pipeline: before "
+        "pre-sharpen and before anything films it. Radius at full resolution. "
+        "It is not a second Micro-Blur despite being the same kernel -- this "
+        "one runs before the masks are measured, so it also tells the grain "
+        "where the detail went: edges read as softer, the smooth-area guard "
+        "sees more smooth frame, and grain backs off with them. Micro-Blur is "
+        "deliberately invisible to those masks. Use this to take a "
+        "digital-sharp source down before the emulsion goes on, and pair it "
+        "with Pre Sharpen at a tighter radius to put the bite back only where "
+        "you want it. 0 = off.",
+        spatial=True,
+    ),
     # ---------------------------------------------------------- pre sharpen
-    # Runs before everything, on the untouched input -- see step 0 in
-    # engine.render().
+    # Runs before every film stage, on the (optionally pre-blurred) input --
+    # see step 0b in engine.render().
     Param(
         "pre_sharpen", "Pre Sharpen", "Pre Sharpen",
         0.0, 30.0, 0.01, 0.0, "",
@@ -124,6 +144,18 @@ PARAMS: list[Param] = [
         0.0, 0.08, 0.002, 0.0, "",
         "Minimum density of the film base. There is no true black on film.",
     ),
+    Param(
+        "warm_highlights", "Warm Highlights", "Tone Response",
+        0.0, 1.0, 0.01, 0.0, "",
+        "Cross-channel bias pushing highlights warm, as the three dye layers "
+        "reach saturation at different rates.",
+    ),
+    Param(
+        "cool_shadows", "Cool Shadows", "Tone Response",
+        0.0, 1.0, 0.01, 0.0, "",
+        "Complementary cool cast in the shadows. Together with warm "
+        "highlights this is most of what reads as a film colour palette.",
+    ),
     # ---------------------------------------------------------------- grain
     Param(
         "intensity", "Intensity", "Grain Structure",
@@ -167,6 +199,20 @@ PARAMS: list[Param] = [
         "nothing; 1 = every octave weighs the same and the grain goes visibly "
         "clumpy and mottled. Total grain strength stays put either way -- this "
         "moves structure around, Intensity sets how much of it there is.",
+    ),
+    Param(
+        "chroma_grain", "Chroma Grain", "Grain Structure",
+        0.0, 1.0, 0.01, 0.35, "",
+        "0 = monochrome grain shared across channels. 1 = independent dye "
+        "cloud noise per layer.",
+    ),
+    Param(
+        "seed", "Seed", "Grain Structure",
+        0.0, 9999.0, 1.0, 1234.0, "",
+        "Deterministic seed for the grain lattice. Every other noise field in "
+        "the pipeline -- the global layer, the edge envelope, the jitter "
+        "displacement, the film-texture marks -- is offset from this one, so "
+        "moving it rerolls the whole frame without changing any look.",
     ),
     # ------------------------------------------------------------ luminance
     Param(
@@ -228,6 +274,13 @@ PARAMS: list[Param] = [
         0.0, 1.0, 0.01, 0.5, "",
         "Modulates existing micro-detail by the grain field so grain erodes "
         "edge structure rather than sitting on top of it.",
+    ),
+    Param(
+        "edge_chroma", "Edge Colour Fringing", "Edge Destruction",
+        0.0, 1.0, 0.01, 0.5, "",
+        "Runs edge erosion independently per colour layer, so eroded edges "
+        "pick up coloured speckle. 0 = neutral erosion, 1 = full dye-layer "
+        "fringing. It modulates the slider above and does nothing without it.",
     ),
     Param(
         "acutance", "Acutance", "Edge Destruction",
@@ -394,18 +447,13 @@ PARAMS: list[Param] = [
         "colour cast rather than as light.",
     ),
     # -------------------------------------------------------------- optical
-    Param(
-        "micro_blur", "Micro-Blur", "Optical",
-        0.0, 3.0, 0.01, 0.45, "px",
-        "Light diffusion through the gel layers, as an average: every pixel "
-        "is mixed with its neighbours. That is the smooth half of diffusion, "
-        "and it costs texture along with the edges -- Scatter below is the "
-        "same physics without the averaging. Applied to the base image before "
-        "grain injection so grain stays sharp against a soft base.",
-        spatial=True,
-    ),
+    # Scatter first, micro-blur last, in the panel and in the pipeline alike --
+    # see step 1 in engine.render(). The order is the point: scatter gets the
+    # source's own detail to take apart, and the blur then averages what is
+    # left rather than handing scatter a frame that is already smooth.
+    #
     # Scatter: diffusion resolved as discrete deflections instead of as an
-    # average. See step 1b in engine.render() for why that is not a blur.
+    # average. See _scatter for why that is not a blur.
     Param(
         "scatter", "Scatter", "Optical",
         0.0, 1.0, 0.01, 0.0, "",
@@ -468,45 +516,91 @@ PARAMS: list[Param] = [
     ),
     Param(
         "scatter_cell", "Scatter Clump", "Optical",
-        1.0, 16.0, 0.1, 1.0, "px",
+        0.1, 5.0, 0.1, 1.0, "px",
         "How big a piece of the picture moves as one. At 1 every pixel "
         "chooses for itself and the image crumbles; larger values move whole "
         "tiles of detail intact, so structure survives the trip and lands "
         "somewhere else. Past about 4px the tiles start reading as tiles -- "
         "which is a look, a shattered plate rather than a soft one, but it is "
-        "no longer subtle. Held in full-res pixels like every other length.",
+        "no longer subtle. Held in full-res pixels like every other length.\n"
+        "\n"
+        "Below one *working* pixel there is nothing left to resolve -- one "
+        "choice per pixel is already the finest this can be -- so the bottom "
+        "of the range is only reachable through supersampling, which is what "
+        "makes a working pixel smaller than a real one. At supersample 2 that "
+        "puts the floor at 0.5; below it every setting renders identically.",
         spatial=True,
     ),
-    # ---------------------------------------------------------------- color
     Param(
-        "chroma_grain", "Chroma Grain", "Color",
-        0.0, 1.0, 0.01, 0.35, "",
-        "0 = monochrome grain shared across channels. 1 = independent dye "
-        "cloud noise per layer.",
+        "micro_blur", "Micro-Blur", "Optical",
+        0.0, 3.0, 0.01, 0.45, "px",
+        "Light diffusion through the gel layers, as an average: every pixel "
+        "is mixed with its neighbours. That is the smooth half of diffusion, "
+        "and it costs texture along with the edges -- Scatter above is the "
+        "same physics without the averaging. Last in the light path, so it "
+        "averages whatever scatter has already pulled apart rather than "
+        "handing scatter a frame that is smooth before it starts. Applied to "
+        "the base image before grain injection so grain stays sharp against a "
+        "soft base.",
+        spatial=True,
+    ),
+    # -------------------------------------------------------- anti aliasing
+    # Step 1c, in the optical block -- an anti-alias filter is a plate in the
+    # light path, not a retouch. Ships at 0 like every other optional stage.
+    Param(
+        "aa_strength", "AA Strength", "Anti Aliasing",
+        0.0, 3.0, 0.01, 0.0, "",
+        "Removes stair-stepping from hard edges in the source -- the ragged "
+        "diagonal you get from an upscaled JPEG, a screenshot or a CG render. "
+        "It filters *along* each edge rather than across it, so the jaggies "
+        "average out while the edge stays as sharp as it was. That is what "
+        "separates it from Micro-Blur and Edge Softening, which both work "
+        "across the edge and cost sharpness. 0 = off.\n"
+        "\n"
+        "Past 1 it runs the filter again, re-aiming along the contour each "
+        "time, which is what makes it bite on aliasing a single pass barely "
+        "touches: measured on a deliberately-aliased diagonal, 1 removes 34% "
+        "of the contour's raggedness, 2 removes 52% and 3 removes 64%, while "
+        "across-edge sharpness falls only from 86% to 70% over that whole "
+        "range. Repeating is the right lever rather than a longer AA Radius -- "
+        "a stair-step is one pixel wide by definition, so reaching further "
+        "averages away the shape the contour actually has instead of the "
+        "wobble on it. Whole numbers are whole passes and anything between "
+        "fades the last one in.",
     ),
     Param(
-        "edge_chroma", "Edge Colour Fringing", "Color",
-        0.0, 1.0, 0.01, 0.5, "",
-        "Runs edge erosion independently per colour layer, so eroded edges "
-        "pick up coloured speckle. 0 = neutral erosion, 1 = full dye-layer "
-        "fringing.",
+        "aa_radius", "AA Radius", "Anti Aliasing",
+        0.2, 4.0, 0.05, 1.0, "px",
+        "How far along the edge each pixel is averaged, at full resolution. "
+        "A stair-step is one pixel by definition, so around 1 is the honest "
+        "setting and the default. Larger values start rounding off genuine "
+        "corners and small detail along with the jaggies -- useful if the "
+        "source was upscaled and its steps are several pixels wide, wrong "
+        "otherwise.",
+        spatial=True,
     ),
     Param(
-        "warm_highlights", "Warm Highlights", "Color",
+        "aa_edge_only", "Edge Only", "Anti Aliasing",
+        0.0, 1.0, 0.01, 0.7, "",
+        "How strictly the filter is held to hard edges. At 1 it only touches "
+        "borders that step a long way in brightness, so fabric, foliage and "
+        "grain are untouched -- fine texture measures an order of magnitude "
+        "below a real border, which is the gap this keys on. At 0 it runs "
+        "everywhere, which suits a CG render that aliases on gentle steps and "
+        "will visibly soften a photograph's texture.",
+    ),
+    Param(
+        "global_smooth", "Global Smoothness", "Anti Aliasing",
         0.0, 1.0, 0.01, 0.0, "",
-        "Cross-channel bias pushing highlights warm, as the three dye layers "
-        "reach saturation at different rates.",
-    ),
-    Param(
-        "cool_shadows", "Cool Shadows", "Color",
-        0.0, 1.0, 0.01, 0.0, "",
-        "Complementary cool cast in the shadows. Together with warm "
-        "highlights this is most of what reads as a film colour palette.",
-    ),
-    Param(
-        "seed", "Seed", "Color",
-        0.0, 9999.0, 1.0, 1234.0, "",
-        "Deterministic seed for the grain lattice.",
+        "Softens the blockiness of the Global Grain layer. That noise is "
+        "built on an axis-aligned lattice, so at large Global Sizes its cells "
+        "read as rectangles; this blurs the layer by up to half a clump, "
+        "which measurably removes 82% of that grid and leaves rounded clumps. "
+        "Strength is held constant as you raise it -- it changes the shape of "
+        "the grain, not how much there is -- so it is free to use. Scaled to "
+        "Global Size, so one setting stays right as you resize the clumps. "
+        "Here rather than under Global Grain because it is the same job as "
+        "the sliders above it: taking the pixel grid back out.",
     ),
     # --------------------------------------------------------- global grain
     # Applied last and masked by nothing -- see step 13 in engine.render().
@@ -524,11 +618,29 @@ PARAMS: list[Param] = [
     ),
     Param(
         "global_size", "Global Size", "Global Grain",
-        0.1, 10.0, 0.05, 1.6, "px",
+        0.1, 20.0, 0.05, 1.6, "px",
         "Clump diameter of the global layer, at full resolution. Set it apart "
         "from Clump Size and the two layers read as separate structures; match "
-        "them and it just thickens the main grain.",
+        "them and it just thickens the main grain. Past about 8px the noise "
+        "lattice starts to show as rectangular blocks -- that is the field, "
+        "not the setting, and Global Smoothness is the cure.",
         spatial=True,
+    ),
+    Param(
+        "global_chroma", "Global Chroma Grain", "Global Grain",
+        0.0, 1.0, 0.01, 0.0, "",
+        "The same job as Chroma Grain under Grain Structure, for this layer: "
+        "0 = one monochrome field shared by all three channels, 1 = an "
+        "independent field per channel so the layer carries colour speckle "
+        "rather than pure luminance noise. Unlike that slider this one holds "
+        "the layer's amplitude to within 3% across its whole range, so it "
+        "changes colour without changing loudness. Its own slider because the "
+        "two "
+        "layers model different things -- the main grain is the negative's "
+        "emulsion, where the dye layers are genuinely separate, while this one "
+        "stands in for print stock and scanner noise and is often wanted "
+        "neutral over a chromatic main grain. Ships at 0, which is what this "
+        "layer has always been.",
     ),
     Param(
         "global_opacity", "Global Opacity", "Global Grain",
@@ -740,6 +852,24 @@ PARAMS: list[Param] = [
         "purpose: you will want to reshuffle the damage without disturbing "
         "grain you have already dialled in.",
     ),
+    # --------------------------------------------------------------- output
+    # The master blend, applied after literally everything -- and after the
+    # supersample pool, which is the only place it can be bit-exact at 0.
+    # Defaults to 1.0, so it is the one parameter whose neutral value is not
+    # zero and the one that must stay out of NEUTRAL_ZERO.
+    Param(
+        "master_opacity", "Overall Opacity", "Output",
+        0.0, 1.0, 0.01, 1.0, "",
+        "How much of the finished result is laid over the untouched photo. "
+        "1 = the full effect, 0 = the original returned bit for bit, and "
+        "anything between is a straight cross-fade -- so it dials back "
+        "everything at once: grain, halation, softening, marks, the lot. "
+        "Reach for it when a preset is right in character but too strong, "
+        "instead of walking a dozen sliders down together.\n"
+        "\n"
+        "Not to be confused with Global Opacity under Global Grain, which "
+        "only mixes that one noise layer. This one is the whole pipeline.",
+    ),
 ]
 
 
@@ -760,13 +890,13 @@ DEFAULTS: dict[str, float] = {p.key: p.default for p in PARAMS}
 # a worse failure than any of them being over-zealous. `verify.py` renders with
 # these and asserts the output is the input.
 NEUTRAL_ZERO: tuple[str, ...] = (
-    "pre_sharpen",
+    "pre_blur", "pre_sharpen",
     "contrast", "toe", "shoulder", "highlight_desat", "brightness",
     "vibrance", "base_fog",
     "intensity",
     "edge_erosion", "acutance", "edge_soften", "edge_sand", "edge_jitter",
     "halation", "halation_blue",
-    "micro_blur", "scatter",
+    "micro_blur", "scatter", "aa_strength",
     "warm_highlights", "cool_shadows",
     "global_intensity",
     "sharpen",

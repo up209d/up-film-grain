@@ -93,13 +93,14 @@ exports are wrong.
 
 `pipenv run python tests/verify.py` checks both, plus zoom fidelity, colour
 pass-through, luminance response, edge bias, the smooth-area guard, 16-bit PNG
-validity, the global-grain overlay, edge softening, edge jitter and its
-direction bias, edge sanding, scatter, output sharpening and the film-texture
-section — 119 checks. It exits non-zero on failure.
+validity, the global-grain overlay with its smoothing and its chroma,
+anti-aliasing, the pre-blur, edge softening, edge jitter and its direction bias,
+edge sanding, scatter, output sharpening, the master opacity cross-fade and the
+film-texture section — 158 checks. It exits non-zero on failure.
 
-The global-grain, edge-softening, edge-sanding, scatter and sharpening checks
-exist because those stages ship at 0, so the default-parameter checks render
-straight past them. Each re-runs tile independence with its stage switched on:
+The global-grain, anti-aliasing, pre-blur, edge-softening, edge-sanding,
+scatter and sharpening checks exist because those stages ship at 0, so the
+default-parameter checks render straight past them. Each re-runs tile independence with its stage switched on:
 they all add work `pad_for` has to cover, and a kernel missing from `pad_for`
 seams tiled exports along exactly its radius while every preview looks fine.
 All three displacement stages — both warps and scatter — are in `pad_for` too;
@@ -127,6 +128,47 @@ browser does all the scaling.
 
 Deliberately not automatic after an idle delay: it is ~8s of work, and spending
 that every time a drag settles burns it on frames you are about to change.
+
+### Export can write either tier (added 2026-08-02)
+
+`/api/export` takes `scale`: `"full"` (default, unchanged — the source at 1.0,
+tile 1024) or `"preview"`, which renders `up.proxy` at `up.proxy_scale` with
+`tile=1536`, i.e. the *identical call* `/api/preview` makes. Verified end to
+end: a preview render and a preview-scale png8 export of the same parameters
+are **bit-identical, max abs diff 0**. Keep it that way — if the two calls ever
+drift apart, "export what I am looking at" quietly stops being true and there
+is nothing on screen to show it.
+
+The user asked for this because the 1:1 render is *unpredictable from the
+preview*, and that is not a bug to fix — it is invariant 2 working. Every
+spatial parameter is a length in full-resolution pixels times the working
+`scale`, so scale invariance promises the two tiers agree about *the picture*
+and promises nothing about grain per output pixel. Two places they diverge, and
+both bite hardest exactly where the user is looking:
+
+* **The proxy cannot resolve its own finest structure.** The default 1.6px
+  clump is 0.64px on a 24MP frame's 0.4x proxy — sub-pixel, so it renders as
+  something smoother than the 1:1 version of the same numbers.
+* **`_MIN_CELL` floors what is left.** At 0.4x that same clump asks for a
+  0.64px lattice and gets 0.8px, so the proxy's finest grain is 25% coarser
+  *relative to the picture* than the export's. Finer `grain_size` settings
+  diverge further; the floor does not move.
+
+So this is a **look**, not a resolution. Downscaling a full export to 2400px
+does not reproduce it — that grain was drawn on the source's grid and then
+averaged away, which is a different operation from drawing it on the proxy's.
+
+Two details in the implementation:
+
+* Preview-scale filenames carry the long edge (`plate_grain_2400px.jpg`), and
+  only when `proxy_scale < 0.999`. Two files from one photo differing only in
+  resolution are indistinguishable in a folder, and the small one is the
+  surprising one. On a sub-2400px source `up.proxy is up.arr`, so both options
+  render the same pixels and the tag would be a lie.
+* `_params_for` still rescales against the **full** image's megapixels, not the
+  proxy's. A preset's `reference_mp` is about the photograph, not about which
+  tier is being written, and doing it the other way would make a preview-scale
+  export disagree with the preview it is meant to reproduce.
 
 What the client-side scaling bought:
 
@@ -156,9 +198,18 @@ the panel says to Render 1:1 before judging grain. Do not remove those.
 
 ## Pipeline order matters at both ends
 
-Two stages are placed by *position*, not by what they compute, and moving them
+Five stages are placed by *position*, not by what they compute, and moving them
 breaks their whole purpose:
 
+* `pre_blur` (step 0) is before `lum_ref` is taken, which is the only thing
+  separating it from `micro_blur` — same kernel, same linear light. See the
+  section below.
+* `scatter` (step 1) is before `micro_blur` (step 1b), and swapping the two makes
+  the pair come out *harder* on borders than the blur alone — scatter drops a
+  hard step back into a blurred gradient. See the scatter section for the table.
+* `aa_strength` (step 1c) is in the optical block and, crucially, *before the
+  masks are measured* — otherwise the grain keeps keying on the jaggies the
+  stage just removed. See the anti-aliasing section.
 * `global_*` (step 13) is after every mask, so it reaches the regions the masks
   protect. Fold it in earlier and it becomes just more masked grain.
 * `sharpen` (step 14) is dead last, **after** the grain stages, because the
@@ -170,9 +221,61 @@ breaks their whole purpose:
   sit. Measured: `sharpen 0.8` takes grain to 140% and image acutance to 133%;
   on a flat field it is a no-op to 6e-08, so it genuinely invents nothing.
 
+`master_opacity` is later still and is not on that list, because it is not in
+`render()` at all — it is applied in `render_supersampled` after the pool, and
+it has to be. See its own section for why blending one level down would make
+"no effect" cost sharpness.
+
 `ENGINE.render_view` / `render_crop` are no longer called by `main.py` but are
 still exercised by `verify.py`, which is the only place the crop and zoom
 invariants are checked at all now. Do not delete them.
+
+## `pre_blur` is the same kernel as `micro_blur` and a different stage (added 2026-08-02)
+
+Step 0, ahead of `pre_sharpen` and of everything else, in linear light. It is a
+plain separable gaussian on the source, one radius in full-resolution pixels,
+shipping at 0. Asking "why not just raise `micro_blur`?" is the right question,
+and the answer is entirely positional — **`pre_blur` runs before `lum_ref`**:
+
+* Every mask downstream is measured from `lum_ref`, so the edge mask, the
+  hard-edge step mask and the smooth-area guard all read the *softened* frame.
+  `micro_blur` is deliberately excluded from that (`verify.py` pins it at 100%
+  of unblurred grain) so that dialling in diffusion cannot quietly cost noise
+  you never asked to lose. Here the coupling is the feature: soften the source
+  and the grain follows the softer edges and backs off where detail has gone.
+  Measured on the half-border/half-texture plate, at 3px: `micro_blur` holds
+  grain at 100%, `pre_blur` takes it to **20%**.
+* It runs before `pre_sharpen`, so a broad radius here against a tight one
+  there is a detail-killing pair the pipeline could not otherwise express —
+  soften everything, then put the bite back at one chosen scale. The other
+  order would just throw the sharpening away, which is what the ordering check
+  tests: `pre_sharpen 8 @ 3px` on top of the pre-blur measures **482%** of the
+  pre-blur's own edge slope, so the sharpen demonstrably sees the blurred
+  image rather than being wiped by it.
+
+**In linear light, and that is not a formality here.** Averaging gamma-encoded
+values holds the *encoded* mean, which is a fraction of the light it stands for,
+so every edge the kernel crosses comes out darker than the light that made it.
+Measured on a black/white border with a 4px radius, mean linear luminance in the
+transition band: **0.500 in linear, ~0.21 encoded.** `verify.py` asserts the
+0.500. The transfer round trip is gated on the radius so it costs nothing when
+the stage is off.
+
+It is **not** `edge_soften` and does not pretend to be: `edge_soften` exists
+because a global blur takes texture down with the edges (2% of fine texture
+survives at 3px against 93% for softening). `pre_blur` keeps 3% of the texture,
+by design — the whole point is destroying detail, and the user has asked for
+detail destruction as an in-scope goal. Reach for `edge_soften` to take the snap
+off borders and leave fabric; reach for this to take a digital-sharp source down
+before the emulsion goes on.
+
+`pad_for` adds `pre_blur + micro_blur`, **summed rather than the widest
+winning**: micro-blur reads pixels the pre-blur has already spread, so the two
+are kernels in series and their reaches genuinely add.
+
+Cost on a 6MP render at 2×: **0.69s off, 0.75s at 2px, 0.80s at 8px**, with
+`pad_for` 108 → 114 → 132px. A separable gaussian plus one transfer round trip
+is cheap; the padding is what you actually pay for at 8px.
 
 ## Halation blue compensation, and why it runs *before* the wash (2026-08-01)
 
@@ -290,12 +393,47 @@ control would just be a blue grade, which is deferred — `verify.py` pins it at
 
 ## Scatter: diffusion without the average (added 2026-08-01)
 
-Step 1b, in linear light beside `micro_blur`, because it is the same physical
-event. A blur is diffusion as an *expectation* — average over enough photons
-and deflection becomes a convolution. `scatter` resolves the deflections
+Step 1, in linear light and **ahead of `micro_blur`**, because it is the same
+physical event. A blur is diffusion as an *expectation* — average over enough
+photons and deflection becomes a convolution. `scatter` resolves the deflections
 individually instead: a share of the pixels are displaced onto a neighbour and
 nothing anywhere is averaged. That difference is the whole feature, and it is
 what the user asked for — detail destroyed, harshness kept.
+
+### The two run scatter-first, and the old order was undoing itself (2026-08-03)
+
+Changed on request, along with moving `micro_blur` to the bottom of the Optical
+panel so the panel and the pipeline read the same way. It is **not** a cosmetic
+reorder — measured on separate plates at scatter 0.85 / reach 3 / blur 1px:
+
+| | fine texture | hard edge |
+|---|---|---|
+| scatter alone | 100% | 100% |
+| micro-blur alone | 28% | 34% |
+| blur then scatter (old) | 28% | **60%** |
+| scatter then blur (new) | 32% | **28%** |
+
+The edge column is the whole story, and the old order's number is the surprising
+one: **scatter was undoing the blur.** Displacing a blurred gradient by whole
+pixels drops a hard step back into it, so the pair came out *harder* on borders
+than the blur alone — 60% against 34% — which is not something either stage
+claims to do. Scatter-first, each does its own job: scatter shreds the border
+into raggedness and the blur averages that into a genuinely soft transition,
+landing *below* blur-alone at 28%. Fine texture barely notices the swap
+(28% → 32%), because scatter does not touch texture sigma either way. It is also
+the physical order — light deflects off a grain and then goes on diffusing.
+
+**This changes the look of every preset with both stages on**, which is `Stock`,
+`ExtraGrain` and `Dramatic` (all carry scatter 0.85 with micro-blur 1.0–1.25).
+They are softer on borders than they were. Nothing was migrated: the request was
+to change the order, and re-tuning three presets to hide it would defeat that.
+
+`verify.py` pins the order rather than trusting a comment, because a swap back
+would look perfectly reasonable in a diff. The check is that blur + scatter must
+measure *below* blur alone on a hard edge — which is only true one way round.
+
+`pad_for` is unchanged: blur-then-displace and displace-then-blur need the same
+total reach, and the terms were already summed rather than maxed.
 
 Measured against a blur of the same 3px reach, on a fine-texture plate:
 
@@ -332,6 +470,19 @@ and give the scatter a diagonal bias nobody asked for. Reading the lattice
 blockiness is the other half of the point: every pixel in a cell reads the same
 value, so a whole cell travels intact. That is what `scatter_cell` means —
 lag-1 correlation of the displacement field runs **0.00 at 1px to 0.87 at 8px**.
+
+`scatter_cell`'s range is **0.1–5px** (was 1–16, changed 2026-08-03 on request).
+Worth knowing about both ends. The top drops range that existed: any file
+holding a value above 5 gets clamped by `sanitize`, and none of the shipped
+presets do — they are all at 1.2. The bottom is subtler, because the engine
+floors the working cell at 1.0px and **that floor does not move**: one choice per
+pixel is already the finest this can be, so there is nothing below it to resolve.
+That makes the sub-1 part of the slider reachable *only through supersampling*,
+which is what makes a working pixel smaller than a real one — at the default
+supersample 2 the effective floor is 0.5, and every setting below it renders
+identically. Same shape of trap as `grain_size` 0.1 versus 0.4 both flooring to
+`_MIN_CELL`; the help text says so outright rather than leaving a dead zone that
+reads as a working control.
 
 The nine stencils are `Any`, `Cross`, `Diagonal`, `Box`, `Diamond`, `Donut`,
 `Star`, `Horizontal`, `Vertical`. A stencil is the *set of places a pixel may
@@ -376,6 +527,269 @@ falls from 100% to 73%. That is mostly the supersample round trip itself, which
 costs 21% on that plate before scatter does anything — the same bicubic-up /
 box-down softening `is_neutral` documents. Raising `scatter_cell` does not
 recover it, and it is anti-aliasing doing its job, so it is left alone.
+
+## `master_opacity` lives outside `render()`, and it has to (added 2026-08-03)
+
+A master cross-fade of the finished frame back over the untouched source.
+`Output` group, bottom of the panel, default **1.0** — which makes it the one
+parameter whose neutral value is not zero, and therefore the one that must stay
+**out of `NEUTRAL_ZERO`**. Put it in and `is_neutral` could never be true,
+because the list is checked for values at zero.
+
+**It is applied in `render_supersampled`, after the `avg_pool`, and nowhere
+else.** That is not tidiness, it is the only place it can be correct. Inside
+`render()` at ss > 1 there is no untouched input to blend against — what that
+method receives is already a bicubic upsample, so blending there and pooling
+down makes opacity 0 return the up-then-down round trip, which `is_neutral`
+already documents as **1.0e-01 softer** than the source on hard edges. "No
+effect" would quietly cost sharpness. `verify.py` pins 0.00e+00 against the
+source at supersample 1, 2 *and* 3 for exactly this.
+
+Sitting at that seam also means every entry point inherits it — `render_image`
+for the export, `render_view` for the preview — so the two cannot disagree
+about what half strength looks like. And it is per-pixel against the tile's own
+input, so `pad_for` is untouched.
+
+**Blended display-referred, not in linear.** The reasoning that forces
+`pre_blur` and halation into linear light does not carry: this is a
+compositing control — "how much of the edit do I keep" — not a physical average
+of light. The two are genuinely different, and not where you would guess.
+Measured on a grained frame at half strength: mean deviation 5.4e-04 and
+overall brightness within +0.05%, but a **worst case of 0.146** on individual
+pixels, concentrated in the shadows where the transfer curve is steepest.
+
+That concentration is the argument for encoded. Blending in the space the eye
+reads makes the slider linear in *visible* deviation, so 0.5 is half the grain
+everywhere. In linear the same 0.5 takes more than half out of the shadows and
+less out of the highlights — an opacity control that changes the look's balance
+as you dial it back, which is not what an opacity control is for.
+
+Two smaller things:
+
+* **Opacity 0 short-circuits before the render**, so dragging toward zero gets
+  cheaper rather than paying for a full render to discard.
+* **The section's mute button is correct even though it looks inverted.**
+  Muting sets a group to its neutral value, which here is 1.0 — so muting
+  Output removes the *dial-back*, restoring full strength. That reads oddly
+  until you notice the section's contribution *is* the dial-back, and that
+  every other section's mute is likewise a no-op when it is already at its
+  no-op value.
+
+Not to be confused with `global_opacity`, which mixes the Global Grain layer
+alone. The names are close and the help text says so outright.
+
+## Value noise is a quilt, and that is why Global Grain looked pixelated (2026-08-03)
+
+Reported by the user as "global grain is so pixelate especially with high
+global size", and it is a real structural defect rather than a bad setting.
+**Value noise puts its extrema on an axis-aligned lattice** and interpolates
+each cell separably, so the cells read as rectangles. Invisible at the default
+1.6px clump; plainly blocky by 10px; at 20px it is a quilt.
+
+Two things had to be ruled out first, and both were:
+
+* **It is not clipping.** `gg` is clamped to ±1 after `/_GNORM`, which sounded
+  like a plateau generator. Measured on flat grey at intensity 20, the rendered
+  output never reaches a rail — range 0.424–0.576 at every size — so the clamp
+  is not what is showing.
+* **It is not the fBm stack.** Single-octave `_value_noise` and the two-octave
+  field the global layer actually uses score the *same* gridiness. Adding
+  octaves cannot help: every octave is built on the same kind of lattice.
+
+The metric, because "looks blocky" needs a number: bin `|∂I/∂x|` by the
+**phase within a cell** and take (max−min)/mean. Value noise's gradient
+vanishes *at* its lattice points, so a gridded field swings hard between phases
+and an organic one does not care where the boundaries are. A cell-20 field
+scores **1.74**; through a full render the same field smoothed scores **1.72 -> 0.32**.
+
+`global_size` max went 10 → 20px on request. `global_smooth` is the cure, and
+it lives in the new Anti Aliasing section rather than under Global Grain — same
+job as the sliders next to it.
+
+**The blur carries an analytic gain, and that is the whole design.** Blurring
+by half a cell costs 40% of the amplitude, so without a normaliser "smoother"
+and "less" would be the same slider. The gain cannot be `n.std()` — that is a
+statistic of the region, invariant 1, and it would restore a different amount
+in every tile of an export while every preview looked fine. It does not have to
+be: measured, the attenuation depends on **sigma/cell alone** — 8, 16 and 32px
+cells attenuate within 0.5% of each other at every ratio — so one closed form
+covers every size. `1/sqrt(1 + k(σ/c)²)` fits it to 0.6% over the whole 0–0.5
+range the stage can reach.
+
+**Fit the constant against the field it is actually used on.** Calibrated on
+single-octave value noise `k` came out 7.7; the global layer is a two-octave
+fBm whose coarse half survives a blur far better, and 7.7 over-restored enough
+to make full Smoothness **10% louder** than no smoothing — exactly the
+amplitude coupling the gain exists to prevent. It is 5.62. `verify.py` pins
+amplitude drift under 6% across the slider and under 8% at 4px and 12px clumps.
+
+A domain warp was the other candidate and is worth knowing about: it takes
+gridiness 1.74 → 0.39 at the same time as preserving variance *exactly*
+(0.991–0.996×, since re-addressing a field cannot change its marginal
+distribution) and needs no `pad_for` at all. It was not chosen because it does
+not read as **smooth** — it trades squares for a crumpled-foil swirl, which is
+a different look, not a softer one. Reach for it if the ask is ever "organic
+but still harsh".
+
+## The Colour section is gone, and Global Grain grew a chroma slider (2026-08-03)
+
+Both on request. The section merge is pure UI — group names live only in
+`params.py` and the client generates the panel from them, so it is five `group`
+strings and one line off `GROUPS`. Each parameter went to the section that owns
+its *mechanism* rather than all five landing in one place:
+
+| was | now | why |
+|---|---|---|
+| `chroma_grain`, `seed` | Grain Structure | properties of the grain field itself |
+| `edge_chroma` | Edge Destruction | it modulates `edge_erosion`, and does nothing without it |
+| `warm_highlights`, `cool_shadows` | Tone Response | colour grading, deferred, ships at 0 — the same as everything already in there |
+
+That is a judgement call on top of what was asked: "Colour" was a grab-bag of
+three unrelated jobs, and putting the fringing slider directly under the erosion
+slider it modifies is more discoverable than the merge alone would be. One
+`group` string each to move if it reads wrong.
+
+### `global_chroma` is *not* built the way `chroma_grain` is
+
+Same job — decorrelate the three channels so the layer carries colour speckle
+instead of pure luminance noise — and deliberately a different construction. The
+main grain draws three independent fields and blends out from their rescaled
+mean. Copying that here fails twice:
+
+* **It would reroll every existing preset.** The mean of three fields is not the
+  single field this layer has always been built from, so chroma 0 would render a
+  different pattern than the one `Stock` was dialled in against. `verify.py`
+  pins chroma 0 as bit-exactly monochrome (max channel spread **0.00e+00**).
+* **That blend does not hold amplitude.** The mean and the per-channel fields
+  are correlated, so measured pre-clamp it dips to **88.8%** of its own strength
+  at chroma 0.5 and returns to 99.9% by 1.0 — the slider moves loudness as well
+  as colour, which is exactly the coupling `_SMOOTH_GAIN_K` exists to prevent
+  one slider along.
+
+So the mono field is left alone and a **mean-zero** deviation `d` is added on
+top, from its own seed. Because `d` sums to zero across channels its statistics
+are fixed — var `2/3`, covariance `-1/3` of a single field — which makes the
+coefficients solvable rather than a matter of taste:
+
+```
+g_c = A·m + B·d_c,    A = sqrt(1 - 2/3·c),  B = sqrt(c)
+```
+
+giving unit variance and cross-channel correlation **exactly `1 - c`** at every
+setting. Measured 1.000 / 0.497 / -0.003 at chroma 0 / 0.5 / 1, with pre-clamp
+amplitude flat to 0.6%.
+
+**The one thing that does move is the clamp, and it is worth knowing why.**
+Mixing in `d` gaussianises the field, so it reaches the `±1` rails less often —
+clipping falls **25.4% → 22.8%** across the slider. A clipped sample sits at
+exactly ±1 rather than wherever it was headed, so *less* clipping means slightly
+less measured sigma: rendered amplitude drifts 100% → **97.0%**. That is the
+hard tails doing their job rather than the blend leaking, and it is a third of
+the wobble the other construction has. `verify.py` allows 5%.
+
+Gated on `global_chroma > 0.001`, so the second `_fbm` is not paid for at the
+default. No `pad_for` change — the field is addressed in global coordinates on
+the same cell as the mono one and goes through the same smoothing kernel, which
+is already covered.
+
+## Anti-aliasing: filter along the contour, never across it (added 2026-08-03)
+
+Step 1c, in the optical block beside micro-blur and scatter, in linear light.
+Ships at 0. The UI section sits between Optical and Tone Response because the
+user asked for it there (it was Optical/Colour before the merge above); the
+pipeline position is its own decision, and an
+anti-alias filter is an *optical* element — a birefringent plate in front of a
+sensor — so the light path is where it belongs. It also has to run before the
+masks are measured, or the grain keeps keying on the jaggies it just removed.
+
+**A stair-step is a pixel-scale wobble *along* a contour, not a hard transition
+across one.** That single sentence determines the whole design: the filter is
+three 1-2-1 taps along the isophote tangent and never crosses the edge.
+Measured on a deliberately-aliased shallow diagonal, at strength 1 and radius 1:
+contour residual **0.289px → 0.189px** while the across-edge slope keeps
+**86%**.
+
+### One pass is gentle, so strength above 1 repeats it (2026-08-03)
+
+Reported as "does little to none", and fair — one three-tap pass removes 34% of a
+stair-step, which is a correction rather than an effect. `aa_strength` now runs
+to **3.0**, where whole numbers are whole passes and the remainder fades the last
+one in:
+
+| strength | jaggedness removed | across-edge slope kept |
+|---|---|---|
+| 1 | 34% | 86% |
+| 2 | 52% | 77% |
+| 3 | 64% | 70% |
+
+**Repeat, do not lengthen.** Raising `aa_radius` is the obvious lever and the
+wrong one, for exactly the reason `_AA_TAPS` is short in the first place: a
+stair-step is one pixel wide by definition, so a longer filter starts averaging
+away the shape the contour *has* rather than the wobble *on* it. Repeating
+attacks only the wobble, and because each pass re-estimates the tangent from the
+frame it was handed, it re-aims along a curving edge where one wide pass cuts the
+corner. Same idiom and same reasoning as `_SAND_PASSES`, which was built for the
+same problem one stage along.
+
+Two things that had to hold, both pinned:
+
+* **Strength 1 is bit-identical to the old single pass** (`0.00e+00`). Raising a
+  ceiling must not move the values underneath it, or every existing setting
+  quietly means something new.
+* **`pad_for` counts both terms three times over.** Each pass displaces by a
+  radius *and* re-derives its tangent from a fresh blurred luma, so both
+  accumulate — 50px → 99px at strength 3 / radius 4. Pinned at `_AA_PASSES`
+  rather than derived from the strength, because `pad_for` runs at the
+  un-supersampled scale and would otherwise disagree with the renderer about the
+  count. This is the same trap `edge_sand` hit, where counting only the first
+  pass was fine to 4px grit and seamed from 8px up.
+
+The trade stays a trade at the top of the range, which is the thing worth
+watching: 70% of the sharpness for 64% of the jaggedness is still better than
+sanding's 73%-for-32%, so this has not quietly become a blur. `verify.py` asserts
+the ladder is monotonic *and* that the slope stays above 60%.
+
+**It overlaps `edge_sand` in mechanism and is deliberately not the same
+control.** This repo has a standing lesson about building a second thing that
+does the first thing's job (`scatter`'s frequency split, cut after it was
+built), so the three differences are worth stating plainly:
+
+* **Position.** This runs at 1c on the source, where the aliasing that arrived
+  with the file lives. Sanding runs at 8b to polish roughness the *jitter stage
+  just added* and cannot reach back to fix the input.
+* **Scale.** Three taps at about a pixel against sanding's five to ±2σ. The two
+  remove different wavelengths: 92% of a jittered contour's roughness sits
+  above 8px, while a stair-step is one pixel by definition.
+* **The trade is better at this scale, which is the justification.** Sanding
+  keeps 73% of the sharpness for 32% of the jaggedness; this keeps **86% for
+  34%**. Both numbers are pinned in `verify.py` so a regression in either half
+  fails — a filter that removed the jaggies by softening the edge would pass a
+  jaggedness-only test and be worthless.
+
+`_isophote` was factored out of the sanding loop and is now shared. Same vector,
+same reason it must be estimated over a window rather than per-pixel: where the
+gradient is weak the tangent is a ratio of two near-zero numbers, it swings on
+float noise, and a filter reaching along it samples somewhere else — which
+seamed tiled exports. Both callers gate on the returned magnitude.
+
+**`aa_edge_only` reuses `_STEP_LO`/`_STEP_HI` and must measure the step exactly
+the way edge softening measures it.** My first version multiplied the high-pass
+by 2 for no reason I could defend, which put the gate on a different scale from
+the constants it borrows and left it firing on fabric — measured, Edge Only 1
+and Edge Only 0 came out within 0.5% of each other, i.e. the control did
+nothing. With the fudge removed: fabric-scale texture (mad 0.010) keeps
+**100%** at Edge Only 1 against 88% at 0.
+
+Worth knowing when testing this: **per-pixel white noise is not "fine
+texture"**. `_TEX_LO`/`_TEX_HI` put real fabric at 0.002–0.015 mean absolute
+deviation; a ±0.125 noise plate is a hard edge at every pixel, and a gate keyed
+on step size is *right* to fire on it (it keeps 79%, not 100%). My first
+texture-protection test used one and read as a broken gate.
+
+Cost is nil at 6MP — inside MPS run-to-run variance either way. `pad_for` grows
+108 → 113 at radius 1 and 130 at radius 4, and it has to count **both** terms:
+the taps travel a radius (a displacement, added outside the ×3) and the tangent
+and step gate come off blurred luma (a kernel, inside it).
 
 ## Film texture is drawn, never scattered (added 2026-07-31)
 
@@ -649,6 +1063,51 @@ the zoom controls, on the same reasoning that put zoom there: they change the
 *view*, not the render, and driving a wipe across the photo from a panel on the
 other side of the screen means looking away from the thing you are judging.
 
+### The mount is a view control, and its width is in *screen* pixels (2026-08-03)
+
+`Frame` on the `viewbar`: an off-white board around the photo plus a drop
+shadow, with a width slider that appears only when it is on. Requested, and it
+earns its place on the same reasoning as the wipe — a photograph butted straight
+against a dark panel reads darker and flatter than it is, and the edge of the
+frame stops being visible at all where the picture goes to black. It is **not** a
+parameter: nothing about it reaches the engine, the schema or an export.
+
+Four things in it are not free choices:
+
+* **Screen pixels, not source pixels.** Every spatial parameter the engine takes
+  is a full-resolution length precisely so it means the same thing at any zoom;
+  this is the opposite kind of quantity. It is furniture around the viewport, so
+  it has to hold its apparent thickness rather than grow to fill the pane at
+  800%.
+* **Fit has to reserve room for it.** `.pane` is `overflow: hidden` and Fit puts
+  the image exactly against the pane edge, so a mount drawn outside the image
+  would be entirely invisible in the one view you would most want it in. The
+  border width plus a shadow allowance comes out of `fitZoom` before the zoom is
+  computed. `place()`'s clamping is left alone — it works in image coordinates,
+  and the mount hangs outside the image box without moving it. The allowance is
+  the blur radius **plus** the vertical offset, not whichever is larger: at a
+  wide frame the mount nearly fills the pane and there is no background left to
+  darken, so an allowance that is merely close reads fine at 18px and has no
+  visible shadow at all by 96px. Caught by screenshotting the widths side by
+  side, which is worth doing again to anything on this bar.
+* **Its own element, drawn as two spread `box-shadow`s.** Not a border on the
+  `<img>`: overlay mode draws the wipe by clipping the result image with
+  `clipPath`, and **clipPath clips a box-shadow with it**, so a ring on that
+  image would lose whichever side was wiped away. And a CSS border would grow
+  the box past the `dw × dh` every coordinate here derives from, putting the
+  pointer-anchored zoom half a border out. A spread shadow occupies no layout at
+  all.
+* **The drop shadow carries the same spread as the border.** Laid down from the
+  image's edge instead, it sits *underneath* the opaque mount rather than around
+  it, and the effect is half missing without ever looking broken.
+
+The board is `#e8e6e0`, not `#fff`: a pure-white surround is brighter than any
+highlight in the picture and drags the eye's white point with it, so highlights
+read duller than they are — which is the one thing you cannot afford to misjudge
+while dialling in halation. The element is also *filled*, not merely ringed,
+because `place()` produces fractional `left`/`top` at most zooms and a ring
+alone leaves a subpixel seam of dark background at the image edge.
+
 ## The mark-count dead zone (found 2026-08-02)
 
 `dust`, `scratches`, `hair` and `light_leak` are **counts**, and the engine
@@ -728,6 +1187,11 @@ Two ways to populate it instead:
 | `_BLUE_HUE` | 230.0 | Centre of the blue-compensation window, **in linear light** where the stage runs — the sRGB number is 220. Skies span 222-236 there; cyan water 194, purple shadow 249. |
 | `_BLUE_SAT_FLOOR` | 0.12 | Below this a pixel is grey and the compensation leaves it alone. Without it every neutral in the frame takes a cast — the failure `vibrance` is also written against. |
 | `_SCATTER_STENCILS` | 9 entries | Scatter footprints: (name, first angle, count, locus, inner, alt). **Indexed by the parameter value, which is what a preset file stores** — renumbering silently changes every preset that used one, so append rather than insert. `verify.py` pins it against `choices` in params.py name-for-name. Every entry must keep peak travel ≤ reach, which is what `pad_for` reserves for; an L∞ "square" locus would reach 1.41× and would have to be paid for. |
+| `_AA_TAPS` | ±1, 3 taps | Anti-aliasing filter along the isophote. Short *on purpose*, and the opposite choice from `_SAND_TAPS` for the same underlying reason: a stair-step is a pixel-scale wobble, so reaching further only averages away the shape the contour has. To make the stage bite harder, raise the pass count — not this. |
+| `_AA_PASSES` | 3 | Maximum anti-aliasing passes, and therefore the top of `aa_strength`. One pass removes 34% of a stair-step, three removes 64% while still keeping 70% of the edge. `pad_for` multiplies **both** AA terms by this and pins it rather than deriving it from the strength, for `_SAND_PASSES`' reason: `pad_for` runs at the un-supersampled scale and must not disagree with the renderer about the count. |
+| `_AA_DIR_K` / `_AA_DIR_MIN` | 0.5 / 0.7 | Tangent-estimate blur for AA, as a fraction of its radius, and a floor. Smaller than `_SAND_DIR_K` against a smaller radius — this filter follows a contour at the pixel scale, and a wide estimate window cuts the corners off small features. The floor is what stops the tangent swinging on single-pixel noise. |
+| `_SMOOTH_MAX` | 0.5 | Peak global-grain smoothing sigma as a fraction of the clump. Half a cell takes measured gridiness 1.74 → 0.27, so the lattice is gone rather than softened, while clump-scale structure survives. |
+| `_SMOOTH_GAIN_K` | 5.62 | Restores the amplitude that smoothing blur costs, as `sqrt(1 + k(σ/cell)²)`. Analytic because a measured `std()` would be a statistic of the region and would seam exports. **Fit against the two-octave field it is used on** — calibrated on single-octave noise it comes out 7.7 and makes full Smoothness 10% louder than none. |
 | `_JITTER_MAX` | 3.0 | Peak edge displacement in full-res px at `edge_jitter` 1. Was an inline 0.6, whose *typical* displacement was 0.227px — invisible. |
 | `_STEP_LO` / `_STEP_HI` | 0.030 / 0.110 | Luma-step bounds separating a real transition from fine texture, for the edge-softening mask. Fine texture measures an order of magnitude under a hard border, which is the gap that lets softening take the snap off a border and leave fabric alone. |
 | `_TEX_LO` / `_TEX_HI` | 0.002 / 0.015 | Local mean-abs-deviation bounds separating "smooth" from "textured" for the smooth-area guard. Skin and clear sky sit at or below `_TEX_LO`; fabric, foliage and hair sit above `_TEX_HI`. |
@@ -833,7 +1297,11 @@ says so and points at 5–20 as the usable range.
   12% of the border but only **2% of the fine texture**. That reads as out of
   focus, not as film, and it is what a user reported as "makes the photo
   blurry". `edge_soften` blends toward a blurred copy weighted by a *hard-edge*
-  mask instead — 43% of the border, **93% of the texture**.
+  mask instead — 43% of the border, **93% of the texture**. `pre_blur`
+  (2026-08-02) is the *wanted* version of that behaviour and does not
+  contradict this: it was asked for as a global blur, it ships at 0, and its
+  help text says outright that it takes texture with it. The lesson stands —
+  do not reach for a blur when the ask is "softer edges".
 * **The softening mask cannot key on `edge`.** That mask asks "is there a
   micro-edge here", and fine texture is made of micro-edges, so weighting by it
   softened fabric almost as much as a border (first attempt: texture fell to

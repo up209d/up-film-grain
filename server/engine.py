@@ -77,6 +77,34 @@ _AMP_SCALE = 0.38
 # lattice is clamped. Below Nyquist it would simply alias.
 _MIN_CELL = 0.8
 
+# Global-grain smoothing. Value noise is a quilt -- its extrema sit on an
+# axis-aligned lattice and each cell is a separable patch -- so past roughly
+# 8px the cells read as rectangles. Measured on a cell-20 field, |gradient|
+# binned by phase within a cell swings by 1.74x its own mean, which is that
+# grid showing up as a number.
+#
+# _SMOOTH_MAX  peak blur sigma as a fraction of the clump, at Smoothness 1.
+#              Half a cell takes that 1.74 to 0.27 on the bare field and
+#              1.72 to 0.32 through a full render (the figure `verify.py`
+#              pins) -- the quilt is gone rather than merely softened -- and
+#              still leaves clump-scale structure behind.
+# _SMOOTH_GAIN_K  restores the amplitude the blur costs. Measured, the loss
+#              depends on sigma/cell *alone*: cells of 8, 16 and 32px attenuate
+#              within 0.5% of each other at every ratio tested, so one closed
+#              form covers every size. sqrt(1 + k(sigma/cell)^2) fits it to
+#              0.6% over the whole 0..0.5 range this stage can reach. Analytic
+#              on purpose -- reading the tile's own std would restore a
+#              different amount per tile and seam the export.
+#
+#              **Fit it against the field it is actually used on.** Calibrated
+#              first on single-octave value noise it came out 7.7, but the
+#              global layer is a two-octave fBm whose coarse half survives a
+#              blur far better, so 7.7 over-restored and made full Smoothness
+#              10% louder than no smoothing -- exactly the amplitude coupling
+#              the gain exists to prevent.
+_SMOOTH_MAX = 0.5
+_SMOOTH_GAIN_K = 5.62
+
 # Local mean-absolute-deviation thresholds, in luma units, separating "smooth"
 # from "textured" over a medium radius. Skin and clear sky sit near or below
 # _TEX_LO; fabric, foliage and hair sit above _TEX_HI. Fixed constants, not
@@ -145,6 +173,32 @@ _SAND_DIR_K = 0.6
 # and the effect faded out. Well under a real edge's gradient, so it only
 # catches genuinely flat ground -- where there is nothing to sand anyway.
 _SAND_MIN_GRAD = 0.012
+
+# Anti-aliasing: a three-tap 1-2-1 along the isophote. Short on purpose -- a
+# stair-step is a *pixel-scale* wobble along the contour, so reaching further
+# only starts averaging away the shape the contour has. That is the whole
+# difference in scale from `edge_sand`, whose taps run to +/-2 sigma because
+# the roughness it removes sits at much longer wavelengths.
+_AA_TAPS = ((-1.0, 0.25), (0.0, 0.5), (1.0, 0.25))
+
+# Maximum anti-aliasing passes, and therefore the top of `aa_strength`. One
+# pass of a three-tap filter is a gentle thing -- measured, 35% of a stair-step
+# -- and the way to make it bite is to run it again rather than to lengthen it:
+# the taps are short *on purpose*, so a longer reach averages away the shape the
+# contour has instead of the wobble on it. Each pass re-estimates the tangent
+# from the image it is given, which re-aims along a curving edge where one wide
+# pass cuts the corner. Same reasoning and same shape as `_SAND_PASSES`, and
+# like that one `pad_for` assumes this count exactly, so the two must not drift.
+_AA_PASSES = 3
+
+# Direction-estimate blur for the AA tangent, as a fraction of its radius, and
+# a floor. Smaller than `_SAND_DIR_K` against a smaller radius: this filter has
+# to follow a contour at the pixel scale, and estimating its direction over a
+# wide window would cut the corners off small features. The floor is what keeps
+# the tangent from swinging on single-pixel noise, which is the same stability
+# problem `_SAND_DIR_K` exists for.
+_AA_DIR_K = 0.5
+_AA_DIR_MIN = 0.7
 
 # Thresholds that turn a value-noise field into sparse marks for the film
 # texture, one band per mark type. These have to be read off the field's actual
@@ -528,6 +582,35 @@ def _warp(
     )
 
 
+def _isophote(
+    lum: torch.Tensor, dir_sigma: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Unit tangent along the contour, plus the gradient magnitude.
+
+    Shared by edge sanding and anti-aliasing, which want the same vector for
+    opposite-scale reasons -- one polishes roughness off a contour, the other
+    takes stair-steps off one -- and differ only in how far they then reach
+    along it and what they gate the result on.
+
+    ``dir_sigma`` is not optional and must not be zero. Taken per-pixel the
+    gradient follows whatever noise is present and the tangent sands in
+    circles; worse, where the gradient is weak the direction is a ratio of two
+    near-zero numbers, so it swings on floating-point alone and a filter
+    reaching along it samples somewhere else entirely. That is not just noisy,
+    it made tiled exports seam: two tilings hand the gradient marginally
+    different values. Callers gate on the returned magnitude for the same
+    reason.
+    """
+    gl = _blur(lum, dir_sigma)
+    px_ = F.pad(gl, (1, 1, 0, 0), mode="replicate")
+    gx_ = (px_[..., 2:] - px_[..., :-2]) * 0.5
+    py_ = F.pad(gl, (0, 0, 1, 1), mode="replicate")
+    gy_ = (py_[..., 2:, :] - py_[..., :-2, :]) * 0.5
+    mag = (gx_ * gx_ + gy_ * gy_).sqrt().clamp_min(1e-6)
+    # The tangent is the gradient turned 90 degrees.
+    return -gy_ / mag, gx_ / mag, mag
+
+
 def _srgb_to_linear(x: torch.Tensor) -> torch.Tensor:
     x = x.clamp_min(0.0)
     return torch.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
@@ -830,6 +913,36 @@ def _fbm(
     return 0.5 + (field - 0.5) * gain if gain != 1.0 else field
 
 
+def _smooth_noise(n: torch.Tensor, cell: float, amount: float) -> torch.Tensor:
+    """Blur a 0..1 noise field and put back the amplitude the blur costs.
+
+    The defect this exists for is structural rather than a bad setting: value
+    noise is a quilt of axis-aligned cells, invisible at a 1.6px clump and
+    plainly rectangular at 20px. No amount of re-seeding or extra octaves moves
+    it, because every octave is built on the same kind of lattice -- measured,
+    the two-octave global field scores the same gridiness as one octave alone.
+    A filter on the field is the cure.
+
+    **Variance is restored, and that is the point.** `_fbm` preserves variance
+    so Octaves changes structure at constant strength; this follows the same
+    rule for the same reason. A smoothing control that quietly turned the layer
+    down would leave Global Intensity fighting it, and "smoother" would be
+    indistinguishable from "less".
+
+    The gain is a closed form in ``sigma/cell`` rather than a measurement of
+    the field in hand. Normalising against ``n.std()`` would be a statistic of
+    the region -- invariant 1 -- and would restore a different amount in every
+    tile of an export while every preview looked fine.
+    """
+    if amount <= 0.001:
+        return n
+    sigma = amount * _SMOOTH_MAX * cell
+    if sigma < 0.05:
+        return n
+    gain = math.sqrt(1.0 + _SMOOTH_GAIN_K * (sigma / cell) ** 2)
+    return 0.5 + _blur(n - 0.5, sigma) * gain
+
+
 # --------------------------------------------------------------------------- #
 # pipeline
 # --------------------------------------------------------------------------- #
@@ -943,6 +1056,114 @@ class GrainEngine:
         return lin.clamp_min(0.0)
 
     # ------------------------------------------------------------------ #
+    def _antialias(
+        self, lin: torch.Tensor, p: dict, scale: float,
+    ) -> torch.Tensor:
+        """Take stair-stepping off hard edges without softening them.
+
+        A stair-step is a *pixel-scale wobble along* a contour, not a hard
+        transition across one -- so the cure is to filter along the isophote
+        tangent and never across it. Averaging across is what a blur does, and
+        it would take the edge with it; that is the whole reason this is a
+        directional filter rather than a soften.
+
+        It overlaps `edge_sand` in mechanism and is deliberately not the same
+        control, on three counts. **Position**: this runs at step 1c on the
+        source, in the optical block, where the aliasing that came in with the
+        file lives; sanding runs at 8b to polish roughness the *jitter stage
+        just added*, and cannot reach back to fix the input. **Scale**: three
+        taps at about a pixel against sanding's five to +/-2 sigma, because
+        the two are removing different wavelengths -- measured, 92% of a
+        jittered contour's roughness sits above 8px, while a stair-step is one
+        pixel by definition. **Gate**: this one fires on the luma *step*, so
+        it finds hard borders and leaves texture alone, where sanding follows
+        wherever the grit is dialled.
+
+        In linear light, with the block it sits in. It averages light, and
+        averaging gamma-encoded values holds the encoded mean rather than the
+        light's -- the same reason `pre_blur` does its transfer round trip.
+
+        Above strength 1 the filter is **repeated** rather than widened, up to
+        ``_AA_PASSES``. One three-tap pass is a gentle thing -- 35% of a
+        stair-step -- and a single pass was reported as doing "little to none".
+        Reaching further is the wrong lever for the reason the taps are short in
+        the first place: a stair-step is one pixel wide by definition, so a
+        longer filter starts averaging away the shape the contour has rather
+        than the wobble on it. Repeating attacks only the wobble, and because
+        each pass re-estimates the tangent from the frame it is handed, it
+        re-aims along a curving edge where one wide pass cuts the corner. Same
+        idiom, and same reasoning, as ``edge_sand``'s ``_SAND_PASSES``.
+        """
+        st = p["aa_strength"]
+        radius = max(0.2, p["aa_radius"] * scale)
+        edge_only = p["aa_edge_only"]
+
+        # Whole passes plus a fractional last one, so the control stays
+        # continuous and strength <= 1 is bit-for-bit the single pass it always
+        # was. Capped: pad_for reserves for _AA_PASSES exactly.
+        passes = min(_AA_PASSES, int(math.ceil(st - 1e-6)))
+
+        for i in range(passes):
+            # The last pass carries the remainder -- strength 2.5 is two full
+            # passes and one at half. Earlier passes are full strength.
+            amt = min(1.0, st - i)
+
+            # Display-referred for the detector, encode-then-luma rather than
+            # the other way round: the transfer curve does not commute with a
+            # weighted sum, and the step thresholds below are shared with edge
+            # softening, which measures the same quantity the same way.
+            #
+            # Re-measured every pass, on the current frame rather than the
+            # original. That is the entire value of iterating: the tangent
+            # follows the contour as the previous pass left it, so a curve gets
+            # followed instead of chorded.
+            lum_d = _luma(_linear_to_srgb(lin))
+            tx, ty, mag = _isophote(lum_d, max(_AA_DIR_MIN, _AA_DIR_K * radius))
+            # Fade out where the tangent is meaningless -- see _isophote.
+            # Without it a flat region's direction swings on float noise and
+            # tiled and untiled renders disagree by a scatter of single pixels.
+            m = _smoothstep(0.0, _SAND_MIN_GRAD, mag)
+
+            # The aliasing gate: how far the luma actually steps across this
+            # neighbourhood. `_STEP_LO`/`_STEP_HI` already separate a real
+            # transition from fine texture -- fine texture measures an order of
+            # magnitude below a hard border -- so a jagged border is found and
+            # fabric is left alone. Reused rather than re-derived: two constants
+            # for one discrimination would be two things to keep in step.
+            if edge_only > 0.001:
+                # Measured exactly as edge softening measures it -- same
+                # high-pass, same radius convention, no scale factor. The
+                # thresholds are calibrated against that quantity, so a fudge
+                # here would silently put this control on a different scale from
+                # the constants it borrows. An earlier ×2 did precisely that and
+                # left the gate firing on fabric.
+                step = (lum_d - _blur(lum_d, radius)).abs()
+                hard = _smoothstep(_STEP_LO, _STEP_HI, step)
+                # Smoothed, or the mask is as ragged as the staircase it is
+                # selecting and the filter switches on and off down the edge.
+                hard = _blur(hard, radius * 0.6)
+                # At 0 the filter runs everywhere, at 1 only on hard edges. A
+                # mix rather than a switch, because a CG render aliases on
+                # gentler steps than a photograph does.
+                m = m * ((1.0 - edge_only) + edge_only * hard)
+
+            out = None
+            wsum = 0.0
+            for offv, wgt in _AA_TAPS:
+                tap = (
+                    lin if offv == 0.0
+                    else _warp(lin, tx * (offv * radius), ty * (offv * radius))
+                )
+                out = tap * wgt if out is None else out + tap * wgt
+                wsum += wgt
+            # Normalised from the weights actually used, not trusted to the
+            # table.
+            out = out / wsum
+            lin = lin + (out - lin) * (amt * m)
+
+        return lin
+
+    # ------------------------------------------------------------------ #
     def _scatter(
         self, x: torch.Tensor, h: int, w: int, y0: float, x0: float,
         p: dict, scale: float,
@@ -1029,9 +1250,34 @@ class GrainEngine:
         hp_r = max(0.3, p["highpass_radius"] * scale)
         mb = p["micro_blur"] * scale
 
-        # 0. Pre-sharpen, on the untouched input.
+        # 0. Pre-blur, on the untouched input, in linear light.
         #
-        #    Placed before everything so it sharpens the *photograph* and
+        #    The same gaussian as `micro_blur` and a different stage, because
+        #    a blur's effect here is not only what it does to the pixels:
+        #
+        #    * It runs before `lum_ref` is taken, so the edge mask, the
+        #      hard-edge step mask and the smooth-area guard all measure the
+        #      *softened* frame. Micro-blur is deliberately excluded from that
+        #      -- the masks read the untouched tile input so diffusing the
+        #      frame cannot quietly talk the grain amount down. Here that
+        #      coupling is the point: soften the source and the grain follows
+        #      the softer edges and backs off where detail has gone.
+        #    * It runs before the pre-sharpen below, so a broad radius here
+        #      against a tight one there is a detail-killing pair the pipeline
+        #      could not otherwise express. The other order would just throw
+        #      the sharpening away.
+        #
+        #    In linear light for micro-blur's reason: a blur is light spreading
+        #    sideways, and averaging gamma-encoded values instead darkens every
+        #    edge it crosses. Gated so the transfer round trip costs nothing
+        #    when the stage is off.
+        pb = p["pre_blur"] * scale
+        if pb >= 0.05:
+            img = _linear_to_srgb(_blur(_srgb_to_linear(img), pb)).clamp(0.0, 1.0)
+
+        # 0b. Pre-sharpen, on the input.
+        #
+        #    Placed before every film stage so it sharpens the *photograph* and
         #    nothing else -- there is no grain yet to amplify. It is not
         #    cosmetic to put it here rather than at the end: every mask
         #    downstream is measured from this image, so sharpening now makes
@@ -1050,22 +1296,61 @@ class GrainEngine:
         # looks like a painted-on glow rather than light.
         lin = _srgb_to_linear(img)
 
-        # 1. Light diffusing sideways through the gel layers, as an average.
-        lin = _blur(lin, mb)
-
-        # 1b. The same diffusion resolved as discrete deflections instead of
-        #     as an average -- see _scatter for why that is a different
-        #     operation and not a slower blur. Here beside micro-blur because
-        #     it is the same physical event, and in linear light for the same
-        #     reason: it happens to the light, before the emulsion records
-        #     anything.
+        # 1. Diffusion resolved as discrete deflections rather than as an
+        #    average -- see _scatter for why that is a different operation and
+        #    not a slower blur. In linear light because it happens to the light,
+        #    before the emulsion records anything.
         #
-        #     Note the masks below are measured from the *untouched* tile
-        #     input, so scattering the frame does not talk the edge mask or
-        #     the smooth-area guard into turning grain down -- the same
-        #     independence micro-blur has, and for the same reason.
+        #    **Ahead of micro-blur, and the order is deliberate** (changed
+        #    2026-08-03, on request). Both model the same physical event from
+        #    opposite ends, and which runs first changes the result a long way --
+        #    measured on separate plates at scatter 0.85 / reach 3 / blur 1px,
+        #    against the same stages alone:
+        #
+        #    | | fine texture | hard edge |
+        #    |---|---|---|
+        #    | scatter alone | 100% | 100% |
+        #    | micro-blur alone | 28% | 34% |
+        #    | blur then scatter (old) | 28% | **60%** |
+        #    | scatter then blur (new) | 32% | **28%** |
+        #
+        #    The edge column is the whole story, and the old order's number is
+        #    the surprising one: **scatter was undoing the blur.** Displacing a
+        #    blurred gradient by whole pixels drops a hard step back into it, so
+        #    the pair came out *harder* on borders than the blur alone -- 60%
+        #    against 34% -- which is not a thing either stage claims to do.
+        #
+        #    This way round each stage does its own job. Scatter gets the
+        #    source's own detail at full contrast and shreds the border into
+        #    raggedness; the blur then averages that raggedness into a genuinely
+        #    soft transition, ending *below* blur-alone at 28%. Fine texture
+        #    barely notices the swap (28% -> 32%) because scatter does not touch
+        #    texture sigma either way. It is also the physical order: light
+        #    deflects off a grain and then goes on diffusing.
+        #
+        #    Note the masks below are measured from the *untouched* tile input,
+        #    so scattering the frame does not talk the edge mask or the
+        #    smooth-area guard into turning grain down -- the same independence
+        #    micro-blur has, and for the same reason.
         if p["scatter"] > 0.001:
             lin = self._scatter(lin, h, w, y0, x0, p, scale)
+
+        # 1b. Light diffusing sideways through the gel layers, as an average.
+        #     Last in the light path -- see above.
+        lin = _blur(lin, mb)
+
+        # 1c. Anti-aliasing -- stair-stepping off the incoming file's hard
+        #     edges, filtered along the contour so the edge itself stays put.
+        #
+        #     Here rather than at the top of the pipeline because an
+        #     anti-alias filter is an *optical* element: on a camera it is a
+        #     birefringent plate in front of the sensor, so it belongs in the
+        #     light path beside the other two optical stages and ahead of
+        #     anything the emulsion does. It also has to run before the masks
+        #     are measured, or the grain would keep keying on the jaggies this
+        #     just removed.
+        if p["aa_strength"] > 0.001:
+            lin = self._antialias(lin, p, scale)
 
         # 2. Halation: light reaching the film base reflects and re-exposes the
         #    emulsion from behind, blooming warm around bright highlights.
@@ -1323,14 +1608,7 @@ class GrainEngine:
                 # two tilings hand the gradient marginally different values.
                 # Estimating direction over a window comparable to the reach
                 # keeps it coherent and the result tile-independent.
-                gl = _blur(lum, max(0.6, _SAND_DIR_K * sr))
-                px_ = F.pad(gl, (1, 1, 0, 0), mode="replicate")
-                gx_ = (px_[..., 2:] - px_[..., :-2]) * 0.5
-                py_ = F.pad(gl, (0, 0, 1, 1), mode="replicate")
-                gy_ = (py_[..., 2:, :] - py_[..., :-2, :]) * 0.5
-                mag = (gx_ * gx_ + gy_ * gy_).sqrt().clamp_min(1e-6)
-                # Tangent is the gradient turned 90 degrees.
-                tx, ty = -gy_ / mag, gx_ / mag
+                tx, ty, mag = _isophote(lum, max(0.6, _SAND_DIR_K * sr))
                 # Where the gradient vanishes the tangent is a ratio of two
                 # near-zero numbers and its direction is meaningless -- it
                 # will swing on floating-point noise alone, and a filter
@@ -1439,17 +1717,74 @@ class GrainEngine:
         #     the print stock and the scan itself rather than from the
         #     negative -- so it reaches exactly the areas the masks protect.
         #
-        #     Monochrome, and on its own seed offset: sharing the main grain's
-        #     seed would lay it directly on top of the same clumps and read as
-        #     nothing more than a louder version of the same field.
+        #     On its own seed offset: sharing the main grain's seed would lay it
+        #     directly on top of the same clumps and read as nothing more than a
+        #     louder version of the same field. Monochrome unless
+        #     `global_chroma` asks otherwise -- see below for why that is built
+        #     as a separate mean-zero field rather than by the main grain's
+        #     recipe.
         gi = p["global_intensity"]
         go = p["global_opacity"]
         if gi > 0.01 and go > 0.001:
+            gcell = max(_MIN_CELL, p["global_size"] * scale)
             gg = _fbm(
-                h, w, y0, x0, max(_MIN_CELL, p["global_size"] * scale),
+                h, w, y0, x0, gcell,
                 int(p["seed"]) + 7717, 1, 2, 0.5, self.device,
             )
-            gg = ((gg * 2.0 - 1.0) / _GNORM).clamp(-1.0, 1.0)
+            # Before the normalise-and-clamp, not after: the clamp is what
+            # gives the field its hard tails, and smoothing a clamped field
+            # would leave the plateaus it created and merely round their
+            # corners. Smoothed first, the clamp bites on a field that has
+            # already lost its extremes, so the rails are reached less often.
+            gg = _smooth_noise(gg, gcell, p["global_smooth"])
+            gg = gg * 2.0 - 1.0
+
+            # Chroma: decorrelate the three channels without touching the
+            # monochrome field.
+            #
+            # The obvious construction is `_grain_field`'s -- draw three
+            # independent fields, take their rescaled mean as the monochrome
+            # component and blend outward. It is not used here for two reasons.
+            # It would replace the single field this layer has always been built
+            # from, rerolling every existing preset's global grain at chroma 0;
+            # and that blend does not hold amplitude, because the mean and the
+            # per-channel fields are correlated -- measured pre-clamp, it dips
+            # to 88.8% of its own strength at chroma 0.5 and returns to 99.9% by
+            # 1.0, so the slider quietly moves loudness as well as colour.
+            #
+            # Instead the mono field `m` is kept exactly as it was and a
+            # *mean-zero* deviation `d` is added on top, from its own seed.
+            # Because `d` sums to zero across channels its statistics are fixed
+            # -- var 2/3 and covariance -1/3 of a single field -- and the two
+            # coefficients can be solved rather than guessed:
+            #
+            #     g_c = A*m + B*d_c,   A = sqrt(1 - 2/3 c),  B = sqrt(c)
+            #
+            # gives unit variance and cross-channel correlation exactly `1 - c`
+            # at every setting. Measured: correlation 1.000 / 0.501 / 0.001 at
+            # chroma 0 / 0.5 / 1, pre-clamp amplitude flat to 0.6%, and chroma 0
+            # bit-identical to the old layer (max channel spread 0.0).
+            #
+            # The one thing that does move is the clamp below. Mixing in `d`
+            # gaussianises the field, so it reaches the rails less often --
+            # clipping falls 25.4% -> 22.8% across the slider -- and since a
+            # clipped sample sits at exactly +-1 rather than wherever it was
+            # headed, less clipping means slightly less measured sigma. Rendered
+            # amplitude therefore drifts 100% -> 96.8% from chroma 0 to 1. That
+            # is the hard tails doing their job, not the blend, and it is a
+            # third of the wobble the other construction has.
+            gc = p["global_chroma"]
+            if gc > 0.001:
+                gs = _fbm(
+                    h, w, y0, x0, gcell,
+                    int(p["seed"]) + 3391, 3, 2, 0.5, self.device,
+                )
+                gs = _smooth_noise(gs, gcell, p["global_smooth"])
+                gs = gs * 2.0 - 1.0
+                gd = gs - gs.mean(dim=1, keepdim=True)
+                gg = gg * math.sqrt(1.0 - (2.0 / 3.0) * gc) + gd * math.sqrt(gc)
+
+            gg = (gg / _GNORM).clamp(-1.0, 1.0)
             out = out + gg * ((gi / 100.0) * _AMP_SCALE * go)
 
         # 14. Output sharpening -- deliberately the last thing in the pipeline.
@@ -1856,35 +2191,86 @@ class GrainEngine:
         integrating down gives clumps genuine partial pixel coverage. Costs
         ss^2 in time and memory, and it is the single biggest realism win in
         the pipeline.
+
+        **`master_opacity` is applied here, and the position is the whole
+        point.** It cross-fades the finished frame back over the untouched
+        input, so it has to see an input that has been through nothing at all
+        -- and inside ``render`` there is no such thing at ss > 1, because what
+        that method receives is already a bicubic *upsample*. Blending there
+        and pooling down would make opacity 0 return the up-then-down round
+        trip, which is measurably 1.0e-01 softer than the source on hard edges
+        (see ``params.is_neutral``): "no effect" would quietly cost sharpness.
+        Blending after the pool, against ``img``, is bit-exact at both ends at
+        every supersample.
+
+        Sitting here also means every entry point inherits it -- ``render_image``
+        for the export, ``render_view`` for the preview -- so the two cannot
+        disagree about what half strength looks like. It is per-pixel against
+        the tile's own input, so it touches no statistic of the region and
+        ``pad_for`` is unchanged.
         """
+        op = p["master_opacity"]
+        # Nothing of the render survives, so do not pay for it. The early exit
+        # matters most on the slider itself: dragging toward 0 gets cheaper
+        # rather than costing a full render to throw away.
+        if op <= 0.0:
+            return img
+
         if ss <= 1:
-            return self.render(img, p, scale, y0, x0, full_hw)
-        h, w = img.shape[-2:]
-        up = F.interpolate(
-            img, size=(h * ss, w * ss), mode="bicubic", align_corners=False
-        ).clamp(0.0, 1.0)
-        # Working resolution and tile offset both scale, so the noise lattice
-        # still resolves to the same global full-resolution coordinates.
-        # Frame size scales with the working resolution exactly as the tile
-        # offset does, so a normalised frame position resolves the same.
-        fh = None if full_hw is None else (full_hw[0] * ss, full_hw[1] * ss)
-        r = self.render(up, p, scale * ss, y0 * ss, x0 * ss, fh)
-        return F.avg_pool2d(r, ss)
+            r = self.render(img, p, scale, y0, x0, full_hw)
+        else:
+            h, w = img.shape[-2:]
+            up = F.interpolate(
+                img, size=(h * ss, w * ss), mode="bicubic", align_corners=False
+            ).clamp(0.0, 1.0)
+            # Working resolution and tile offset both scale, so the noise
+            # lattice still resolves to the same global full-resolution
+            # coordinates. Frame size scales with the working resolution
+            # exactly as the tile offset does, so a normalised frame position
+            # resolves the same.
+            fh = None if full_hw is None else (full_hw[0] * ss, full_hw[1] * ss)
+            r = self.render(up, p, scale * ss, y0 * ss, x0 * ss, fh)
+            r = F.avg_pool2d(r, ss)
+
+        # Cross-faded display-referred, where both images already live, rather
+        # than round-tripping through linear. This is a compositing control --
+        # "how much of the edit do I keep" -- not a physical average of light,
+        # so the reasoning that puts `pre_blur` and halation in linear does not
+        # carry over.
+        #
+        # The two are not interchangeable and the difference is not where you
+        # would guess. Measured on a grained frame at half strength: mean
+        # deviation 5.4e-04 and overall brightness within +0.05%, but a
+        # worst-case 0.146 on individual pixels -- concentrated in the shadows,
+        # where the transfer curve is steepest. That is exactly why encoded
+        # wins here. Blending in the space the eye reads makes the slider
+        # linear in *visible* deviation, so 0.5 is half the grain everywhere;
+        # in linear the same 0.5 would take more than half out of the shadows
+        # and less out of the highlights, which is an opacity control that
+        # changes the look's balance as you dial it back. It also costs no
+        # transfer round trip.
+        if op < 1.0:
+            r = img + (r - img) * op
+        return r
 
     # ------------------------------------------------------------------ #
     def pad_for(self, p: dict, scale: float) -> int:
         """Overlap needed so a rendered region matches the full-image render.
 
         Must cover every blur kernel in the pipeline: the high-pass chain, the
-        acutance blur (the widest at 1.5x), the micro-blur, the edge-softening
-        blur, the output sharpening blur and halation, plus the displacement
-        of every stage that *reads* a pixel from somewhere else rather than
-        blurring in place -- the jitter warp, the sanding taps and scatter.
-        Miss one and tiled exports seam along its radius -- which no preview
-        will ever show.
+        acutance blur (the widest at 1.5x), the pre-blur and micro-blur, the
+        edge-softening blur, the global-grain smoothing blur, the output
+        sharpening blur and halation, plus the
+        displacement of every stage that *reads* a pixel from somewhere else
+        rather than blurring in place -- the jitter warp, the sanding taps and
+        scatter. Miss one and tiled exports seam along its radius -- which no
+        preview will ever show.
         """
         hp_r = max(0.3, p["highpass_radius"] * scale)
-        mb = p["micro_blur"] * scale
+        # Pre-blur and micro-blur are two kernels in series, not alternatives:
+        # micro-blur reads pixels the pre-blur has already spread, so their
+        # reaches add rather than the widest winning.
+        mb = (p["micro_blur"] + p["pre_blur"]) * scale
         halo = p["halation_radius"] * scale if p["halation"] > 0.01 else 0.0
         soft = p["edge_soften_radius"] * scale if p["edge_soften"] > 0.01 else 0.0
         shr = p["sharpen_radius"] * scale if p["sharpen"] > 0.01 else 0.0
@@ -1902,6 +2288,33 @@ class GrainEngine:
                         * max(0.4 * p["scratch_width"] * scale, 0.6))
         if p["hair"] >= 1.0:
             tex_r = max(tex_r, p["hair_soften"] * 3.0 * max(scale, 0.25))
+        # Anti-aliasing reads two ways at once and both have to be counted:
+        # its taps travel a radius along the tangent (a displacement, like the
+        # warps below), and it derives that tangent -- and its step gate --
+        # from blurred luma, which is a kernel.
+        #
+        # Both terms are multiplied by the pass count, for the reason sanding
+        # documents below: each pass resamples the previous pass's output, so tap
+        # travel accumulates, and each pass re-derives its direction from a fresh
+        # blurred luma, so that reach accumulates too. Pinned at _AA_PASSES
+        # rather than recomputed from the strength, because pad_for is called at
+        # the un-supersampled scale and would otherwise disagree with the
+        # renderer about the count.
+        aa_r = 0.0
+        aa_tap = 0.0
+        if p["aa_strength"] > 0.001:
+            aa_rad = max(0.2, p["aa_radius"] * scale)
+            aa_r = _AA_PASSES * max(
+                max(_AA_DIR_MIN, _AA_DIR_K * aa_rad), aa_rad * 1.5)
+            aa_tap = _AA_PASSES * aa_rad
+        # Global-grain smoothing is a blur on the noise field, so it reaches
+        # like every other kernel here. It is gated on the layer being on --
+        # with intensity or opacity at zero the field is never built.
+        gsm = 0.0
+        if (p["global_intensity"] > 0.01 and p["global_opacity"] > 0.001
+                and p["global_smooth"] > 0.001):
+            gsm = (p["global_smooth"] * _SMOOTH_MAX
+                   * max(_MIN_CELL, p["global_size"] * scale))
         mask_r = max(1.0, 3.0 * scale)
         # Scatter reads a pixel up to its full reach away. It displaces rather
         # than blurring, so it belongs with the warps below and not in the
@@ -1940,8 +2353,9 @@ class GrainEngine:
             jit += _SAND_PASSES * (2.0 * sr + dir_reach)
         return int(
             math.ceil(
-                3.0 * (hp_r * 3.3 + mb + halo + soft + shr + tex_r + mask_r)
-                + jit
+                3.0 * (hp_r * 3.3 + mb + halo + soft + shr + tex_r + mask_r
+                       + gsm + aa_r)
+                + jit + aa_tap
             )
         ) + 4
 

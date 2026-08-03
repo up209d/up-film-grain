@@ -233,7 +233,8 @@ def source(body: dict = Body(...)) -> Response:
 
 # ------------------------------------------------------------------ export --
 
-def _run_export(job_id: str, up: Upload, p: dict, fmt: str, ss: int, quality: int) -> None:
+def _run_export(job_id: str, up: Upload, p: dict, fmt: str, ss: int,
+                quality: int, proxy: bool) -> None:
     job = JOBS[job_id]
     try:
         def progress(f: float) -> None:
@@ -241,9 +242,18 @@ def _run_export(job_id: str, up: Upload, p: dict, fmt: str, ss: int, quality: in
 
         with _RENDER_LOCK:
             job["status"] = "rendering"
-            out = ENGINE.render_image(
-                up.arr, p, 1.0, tile=1024, supersample=ss, progress=progress
-            )
+            if proxy:
+                # Byte-for-byte the live preview's render: same source array,
+                # same working scale, same tile size. Anything different here
+                # and "export what I am looking at" stops being true.
+                out = ENGINE.render_image(
+                    up.proxy, p, up.proxy_scale, tile=1536, supersample=ss,
+                    progress=progress,
+                )
+            else:
+                out = ENGINE.render_image(
+                    up.arr, p, 1.0, tile=1024, supersample=ss, progress=progress
+                )
             job["status"] = "encoding"
             data = iio.encode(out, fmt, quality)
 
@@ -258,6 +268,19 @@ def _run_export(job_id: str, up: Upload, p: dict, fmt: str, ss: int, quality: in
 
 @app.post("/api/export")
 def export(body: dict = Body(...)) -> dict:
+    """Render and encode a download.
+
+    ``scale`` picks which of the two renders is written, and they are the same
+    two the preview offers:
+
+      * ``"full"`` (default) -- the whole source at scale 1.0, the same pixels
+        the Render 1:1 button shows.
+      * ``"preview"`` -- the working proxy, identical to what a slider change
+        renders. Every length is multiplied by ``proxy_scale`` like everything
+        else, so this is not a downscale of the full render: the grain is
+        resolved at the proxy's own pixel grid, which is exactly why it looks
+        like the preview and the full render does not.
+    """
     up = _get(body.get("id", ""))
     p = _params_for(up, body)
     fmt = body.get("format", "jpeg")
@@ -265,16 +288,24 @@ def export(body: dict = Body(...)) -> dict:
         raise HTTPException(400, f"Unknown format {fmt!r}.")
     ss = max(1, min(3, int(body.get("supersample", 2))))
     quality = max(60, min(100, int(body.get("quality", 95))))
+    proxy = str(body.get("scale", "full")).lower() == "preview"
 
+    h, w = (up.proxy.shape[:2] if proxy else (up.h, up.w))
     job_id = uuid.uuid4().hex[:12]
     stem = Path(up.name).stem or "image"
+    # Preview-scale exports carry their long edge in the name. Two files from
+    # one photo that differ only in resolution are otherwise indistinguishable
+    # in a folder, and the smaller one is the surprising one.
+    tag = f"_grain_{max(w, h)}px" if proxy and up.proxy_scale < 0.999 else "_grain"
     JOBS[job_id] = {
         "id": job_id, "status": "queued", "progress": 0.0,
-        "filename": f"{stem}_grain.{iio.FORMATS[fmt][1]}",
+        "filename": f"{stem}{tag}.{iio.FORMATS[fmt][1]}",
         "mime": iio.FORMATS[fmt][0], "created": time.time(),
+        "width": int(w), "height": int(h),
     }
     threading.Thread(
-        target=_run_export, args=(job_id, up, p, fmt, ss, quality), daemon=True
+        target=_run_export, args=(job_id, up, p, fmt, ss, quality, proxy),
+        daemon=True,
     ).start()
     return {"job": job_id}
 

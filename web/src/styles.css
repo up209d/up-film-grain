@@ -7,6 +7,13 @@
   --dim: #8b929e;
   --accent: #d8a05a;
   --accent2: #c46a4a;
+  /* Mount board behind the previewed photo. Off-white rather than #fff on
+     purpose: a pure-white surround is brighter than any highlight in the
+     picture and drags the eye's white point with it, so highlights read as
+     duller than they are -- which is the one thing you cannot afford to
+     misjudge while dialling in halation. Gallery board is never pure white
+     either, for the same reason. */
+  --mount: #e8e6e0;
   color-scheme: dark;
 }
 
@@ -79,6 +86,21 @@ body {
   text-transform: uppercase; pointer-events: none;
 }
 
+/* The mount board and its drop shadow. Both are spread box-shadows drawn from
+   this element's box, which is sized to exactly the same rect as the images --
+   so it occupies no layout and cannot shift the geometry the zoom anchoring is
+   computed from. It sits under the images in DOM order and is pure furniture,
+   so it takes no pointer events and never eats a drag.
+
+   The fill matters despite being covered by the image: `place()` produces
+   fractional left/top at most zooms, and a board drawn only as a ring leaves a
+   subpixel seam of dark background between itself and the image edge. */
+.mount {
+  position: absolute;
+  pointer-events: none;
+  background: var(--mount);
+}
+
 .divider {
   position: absolute; top: 0; bottom: 0; width: 1px;
   background: rgba(255,255,255,.75);
@@ -109,6 +131,7 @@ body {
 .viewbar .swap { flex: 0 0 auto; padding: 4px 9px; font-size: 11.5px; border-radius: 6px; }
 .viewbar .wipe { width: 96px; align-self: center; }
 .viewbar .wipe:disabled { opacity: .4; }
+.viewbar .framew { width: 72px; align-self: center; }
 /* Shown only while the view is enlarged past what the proxy can resolve. */
 .viewbar .fid {
   display: inline-flex; align-items: center;
@@ -277,8 +300,13 @@ input[type="range"]:active::-webkit-slider-thumb { background: var(--accent); }
 
 /* --------------------------------------------------------------- export -- */
 .export { display: flex; gap: 6px; border-top: 1px solid var(--line); padding-top: 10px; }
-.export select { flex: 0 0 130px; }
-.export .btn { flex: 1; }
+/* Two equal selects -- the scale choice matters as much as the format, so it
+   does not get relegated to a narrow one. min-width:0 or a long option label
+   ("As previewed — 2400x1600") forces the flex item past its share. */
+.export select { flex: 1 1 0; min-width: 0; }
+/* The button is a sibling of the row, not in it -- two selects plus a button
+   on one line squeezes all three below a readable width in this panel. */
+.export-go { width: 100%; margin-top: 6px; }
 
 .job { display: flex; align-items: center; gap: 8px; color: var(--dim); font-size: 11.5px; }
 .pbar { flex: 1; height: 4px; background: #2a2e36; border-radius: 2px; overflow: hidden; }

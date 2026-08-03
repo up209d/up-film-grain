@@ -102,8 +102,17 @@ process without one is broken rather than degraded and should not boot.
   pan together — one drag moves both.
 * **Quality** selects supersampling. 2× is the default; 1× is faster but gives
   grain a hard, aliased pixel footprint.
-* **Export full size** runs a tiled background render with progress. **JPEG 95
-  is the default**: measured on a grained frame it keeps 100.2% of the grain
+* **Export** runs a tiled background render with progress, at one of two
+  scales. **Full size** is the source at 1:1 — the same pixels Render 1:1
+  shows. **As previewed** writes the 2400px proxy render instead, bit for bit
+  what the live preview showed. That is a *look*, not a size: every length is
+  in full-resolution pixels, so the same settings resolve finer, denser grain
+  on a bigger frame, and downscaling a 1:1 export to 2400px does not give you
+  the proxy's grain back. If the preview is what you dialled in, this is the
+  file that has it. On a photo already under 2400px the two are the same
+  render, and preview-scale files carry their long edge in the name
+  (`photo_grain_2400px.jpg`) so they are not mistaken for the full one.
+* **JPEG 95 is the default format**: measured on a grained frame it keeps 100.2% of the grain
   sigma at 0.43MB against 9.82MB for 16-bit PNG — 23x smaller for no loss of
   grain *amount*. It is encoded 4:4:4, because chroma subsampling would smear
   the chroma grain away. What it does cost is up to ~1.7% per-pixel deviation,
@@ -270,6 +279,64 @@ that comes apart.
 
 Costs about 16% on a render (0.69s → 0.80s on 6MP at 2×) and widens the tile
 overlap by its reach.
+
+### Overall Opacity
+
+The last slider in the panel, in its own **Output** section, and the only one
+that ships at 1 rather than 0. It cross-fades the finished frame back over the
+untouched photo, so it dials back *everything at once* — grain, halation,
+softening, marks, the lot. Reach for it when a preset is right in character but
+too strong, instead of walking a dozen sliders down together.
+
+0 returns the original bit for bit at any quality setting, 1 is the full
+pipeline unchanged, and the middle is a straight cross-fade — all three
+verified exactly. Dragging toward 0 also gets *faster*, since there is no point
+rendering a frame that will be thrown away.
+
+Not the same control as **Global Opacity** under Global Grain, which only mixes
+that one noise layer.
+
+### Anti Aliasing
+
+A third way to treat an edge, and the only one that does not cost sharpness.
+Both controls above work *across* an edge; these work *along* it.
+
+* **AA Strength** takes stair-stepping off hard edges in the source — the
+  ragged diagonal from an upscaled JPEG, a screenshot or a CG render. It
+  averages each pixel with its neighbours **along** the contour, never across
+  it, so the jaggies cancel while the edge stays where it was. Measured on a
+  deliberately aliased diagonal: the contour's residual falls from 0.289px to
+  0.189px while 86% of the across-edge slope survives. (For scale, Edge Sanding
+  under Edge Destruction keeps 73% for a comparable 32% — it is aimed at much
+  longer-wavelength roughness, so it is the wrong tool for a one-pixel step.)
+* **AA Radius** is how far along the edge, in full-resolution pixels. A
+  stair-step is one pixel by definition, so ~1 is the honest setting and the
+  default. Go larger only if the source was upscaled and its steps are several
+  pixels wide; it starts rounding off genuine corners.
+* **Edge Only** is the texture guard. At 1 it touches only borders that step a
+  long way in brightness — fabric-scale texture measures **100%** intact — and
+  at 0 it runs everywhere, which suits a CG render that aliases on gentle steps
+  and will visibly soften a photograph (88%).
+* **Global Smoothness** belongs to the Global Grain layer and lives here
+  because it is the same job: see below.
+
+Effectively free, and it widens the tile overlap by a few pixels.
+
+### Global Grain goes blocky, and Global Smoothness is why
+
+Past about 8px of **Global Size** the layer stops looking like grain and starts
+looking pixelated. That is the noise itself, not a bad setting: it is built on
+an axis-aligned lattice, so its cells read as rectangles once they are large
+enough to see. Adding octaves or changing the seed cannot help — every octave
+sits on the same kind of lattice.
+
+**Global Smoothness** blurs the layer by up to half a clump, which measurably
+removes 82% of the grid and leaves rounded clumps. It is free to use in the one
+way that matters: the strength is held constant as you raise it (within 2.5%
+across the whole slider), so it changes the *shape* of the grain and not how
+much there is. Global Intensity remains the only amplitude control.
+
+Global Size now runs to 20px.
 
 Sliders only render on release, not during the drag — a fit preview is seconds
 of work, so rendering every intermediate position just queues frames that are

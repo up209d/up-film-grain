@@ -136,9 +136,17 @@ export interface ExportJob {
   status: "queued" | "rendering" | "encoding" | "done" | "error";
   progress: number;
   filename: string;
+  width: number;
+  height: number;
   size?: number;
   error?: string;
 }
+
+/** Which render the export writes. `"full"` is the source at 1:1; `"preview"`
+ *  is the working proxy — the same render a slider change produces, so the
+ *  grain sits on the proxy's pixel grid rather than being a downscale of the
+ *  full-resolution one. They are different looks, not different sizes. */
+export type ExportScale = "full" | "preview";
 
 export async function startExport(body: {
   id: string;
@@ -146,6 +154,7 @@ export async function startExport(body: {
   format: string;
   supersample: number;
   quality: number;
+  scale: ExportScale;
   reference_mp?: number | null;
 }): Promise<string> {
   const r = await fetch("/api/export", {

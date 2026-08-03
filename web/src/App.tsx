@@ -16,6 +16,7 @@ import {
   startExport,
   uploadImage,
   type ExportJob,
+  type ExportScale,
   type ImageMeta,
   type Schema,
   type ViewRequest,
@@ -62,6 +63,27 @@ const PINCH_RATE = 0.01;
  *  still reachable, deliberately, from the - button. */
 const FIT_SNAP = 0.02;
 
+/** Mount border around the previewed photo, in *screen* pixels.
+ *
+ *  Screen pixels rather than source pixels on purpose. Every spatial parameter
+ *  the engine takes is a length in full-resolution pixels precisely so it means
+ *  the same thing at any zoom -- this is the opposite kind of quantity. It is
+ *  furniture around the viewport, not part of the picture, so it must hold its
+ *  apparent thickness as you zoom instead of growing to fill the pane at 800%.
+ *
+ *  The shadow allowance is added to the border when reserving room for Fit.
+ *  Without it the mount lands exactly on the pane's edge and `overflow: hidden`
+ *  eats the shadow, which is the half of the effect that separates the photo
+ *  from the background. It has to cover the blur radius plus the vertical
+ *  offset, not just one of them -- at a wide frame the mount nearly fills the
+ *  pane and there is no background left to darken, so an allowance that is
+ *  merely close leaves the shadow visible at 18px and gone at 96px. */
+const FRAME_MAX = 96;
+const FRAME_DEFAULT = 18;
+const FRAME_SHADOW_BLUR = 24;
+const FRAME_SHADOW_DROP = 8;
+const FRAME_SHADOW_ROOM = FRAME_SHADOW_BLUR + FRAME_SHADOW_DROP;
+
 /** Marker written into saved preset files. Only used to make a hand-inspected
  *  file self-describing -- loading deliberately does not require it, so a bare
  *  `{"intensity": 40}` typed by hand still works. */
@@ -107,6 +129,10 @@ export default function App() {
   const [scaleToRef, setScaleToRef] = useState(true);
 
   const [format, setFormat] = useState("jpeg");
+  /** Full resolution, or the proxy exactly as previewed. Not a size choice:
+   *  the proxy renders every length at proxy scale, so its grain is the grain
+   *  on screen. Downscaling a 1:1 export to the same pixels would not match. */
+  const [exportScale, setExportScale] = useState<ExportScale>("full");
   const [job, setJob] = useState<ExportJob | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
@@ -288,6 +314,7 @@ export default function App() {
         format,
         supersample,
         quality: 95,
+        scale: exportScale,
         reference_mp: scaleToRef ? referenceMp : null,
       });
       const poll = async () => {
@@ -898,15 +925,49 @@ export default function App() {
           </div>
 
           <div className="export">
+            <select
+              value={exportScale}
+              onChange={(e) => setExportScale(e.target.value as ExportScale)}
+            >
+              <option value="full">
+                Full size{meta ? ` — ${meta.width}×${meta.height}` : ""}
+              </option>
+              <option value="preview">
+                As previewed
+                {meta ? ` — ${meta.proxy_width}×${meta.proxy_height}` : ""}
+              </option>
+            </select>
             <select value={format} onChange={(e) => setFormat(e.target.value)}>
               <option value="jpeg">JPEG 95</option>
               <option value="png16">PNG 16-bit</option>
               <option value="png8">PNG 8-bit</option>
             </select>
-            <button className="btn primary" onClick={doExport} disabled={!meta}>
-              Export full size
-            </button>
           </div>
+          <button
+            className="btn primary export-go"
+            onClick={doExport}
+            disabled={!meta}
+          >
+            {exportScale === "preview" ? "Export as previewed" : "Export full size"}
+          </button>
+          {exportScale === "preview" && (
+            <p className="hint">
+              {meta && meta.proxy_width >= meta.width ? (
+                <>
+                  This photo is already smaller than the proxy, so both options
+                  render the same pixels.
+                </>
+              ) : (
+                <>
+                  Writes the proxy render itself — the grain you are looking at,
+                  not a downscale of the 1:1 render. Every length scales with the
+                  frame, so at full size the same settings resolve finer, denser
+                  grain; if the preview is the look you want, this is the file
+                  that has it.
+                </>
+              )}
+            </p>
+          )}
           {job && job.status !== "done" && (
             <div className="job">
               {job.status === "error" ? (
@@ -1033,6 +1094,14 @@ function Stage(props: {
   const [zoom, setZoom] = useState<number | null>(null);
   const [center, setCenter] = useState({ x: 0.5, y: 0.5 });
   const [pane, setPane] = useState({ w: 0, h: 0 });
+  // A mount border and a drop shadow around the photo. Purely a view control,
+  // which is why it lives here and on the viewbar rather than in `params.py`:
+  // it changes nothing about the render and nothing about an export. The point
+  // is judging the picture, not decorating it -- a photograph butted straight
+  // against a dark panel reads darker and flatter than it is, and the edge of
+  // the frame stops being visible at all where the picture goes to black.
+  const [frame, setFrame] = useState(false);
+  const [frameWidth, setFrameWidth] = useState(FRAME_DEFAULT);
 
   // A new image inherits neither the old pan nor the old magnification -- a
   // corner crop of the last photo is never where you want to land.
@@ -1060,7 +1129,17 @@ function Stage(props: {
 
   const iw = meta?.width ?? 1;
   const ih = meta?.height ?? 1;
-  const fitZoom = Math.min(pane.w / iw, pane.h / ih) || 1;
+  // Fit means "the whole thing is visible", and with a mount on, the mount is
+  // part of the whole thing -- so the room it needs comes out of the fit before
+  // the zoom is computed. Reserved on both axes because the border is drawn on
+  // all four sides. Left out of `place()`'s clamping, which works in image
+  // coordinates: the mount hangs outside the image box and never moves it.
+  const inset = frame ? frameWidth + FRAME_SHADOW_ROOM : 0;
+  const fitZoom =
+    Math.min(
+      Math.max(pane.w - 2 * inset, 1) / iw,
+      Math.max(pane.h - 2 * inset, 1) / ih,
+    ) || 1;
   const eff = zoom ?? fitZoom;
   const dw = iw * eff;
   const dh = ih * eff;
@@ -1205,6 +1284,35 @@ function Stage(props: {
     };
   };
 
+  /** The mount border and its shadow, as one element behind the images.
+   *
+   *  Its own element rather than a border on the `<img>`, for two reasons. The
+   *  overlay mode draws the wipe by clipping the result image with `clipPath`,
+   *  and clipPath clips a box-shadow with it -- so a ring on that image would
+   *  lose whichever side was wiped away. And a CSS border would grow the box
+   *  past the `dw x dh` that every coordinate in here is derived from, putting
+   *  the pointer-anchored zoom half a border out and dragging `place()`'s
+   *  clamping with it.
+   *
+   *  Drawn as two spread shadows rather than a border and a filter, so it
+   *  occupies no layout at all: geometry stays exactly `place()`'s. The drop
+   *  shadow carries the same spread as the border, or it would be laid down
+   *  from the image's edge and sit *underneath* the opaque mount instead of
+   *  around it. */
+  const mount = () =>
+    frame ? (
+      <div
+        className="mount"
+        style={{
+          ...place(),
+          boxShadow:
+            `0 0 0 ${frameWidth}px var(--mount), ` +
+            `0 ${FRAME_SHADOW_DROP}px ${FRAME_SHADOW_BLUR}px ` +
+            `${frameWidth}px rgba(0,0,0,.7)`,
+        }}
+      />
+    ) : null;
+
   // The proxy resolves detail only up to its own resolution; past that the
   // browser is enlarging it and grain is not being shown honestly. Say so
   // rather than letting a soft preview read as a soft result.
@@ -1287,6 +1395,30 @@ function Stage(props: {
       >
         +
       </button>
+      <span className="vsep" />
+      {/* Third group: the mount. A view control like everything else on this
+          bar -- it changes nothing that gets rendered or exported. The width
+          slider appears only with the frame on, matching how the wipe follows
+          the mode that owns it, so the bar does not carry a dead control. */}
+      <button
+        className={frame ? "seg on" : "seg"}
+        onClick={() => setFrame(!frame)}
+        title="Show the photo on a mount, with a drop shadow"
+      >
+        Frame
+      </button>
+      {frame && (
+        <input
+          className="framew"
+          type="range"
+          min={0}
+          max={FRAME_MAX}
+          step={1}
+          value={frameWidth}
+          onChange={(e) => setFrameWidth(Number(e.target.value))}
+          title={`Frame width — ${frameWidth}px on screen`}
+        />
+      )}
     </div>
   );
 
@@ -1305,12 +1437,14 @@ function Stage(props: {
         >
           <div className="pane">
             <span className="tag">Before</span>
+            {mount()}
             {sourceUrl && (
               <img className="frame" style={place()} src={sourceUrl} alt="before" draggable={false} />
             )}
           </div>
           <div className="pane">
             <span className="tag">After</span>
+            {mount()}
             {previewUrl && (
               <img className="frame" style={place()} src={previewUrl} alt="after" draggable={false} />
             )}
@@ -1331,6 +1465,7 @@ function Stage(props: {
         onPointerCancel={onPointerUp}
       >
         <div className="pane">
+          {mount()}
           {sourceUrl && (
             <img className="frame" style={place()} src={sourceUrl} alt="before" draggable={false} />
           )}

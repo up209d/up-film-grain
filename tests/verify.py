@@ -184,10 +184,11 @@ def main() -> int:
     check(
         "every spatial param is marked",
         {x.key for x in P.PARAMS if x.spatial} == {
+            "aa_radius",
             "dust_size", "edge_jitter", "edge_sand_grit", "edge_soften_radius",
             "global_size", "grain_size", "hair_length", "halation_radius",
             "highpass_radius", "leak_feather", "leak_size_max", "leak_size_min",
-            "micro_blur", "pre_sharpen_radius",
+            "micro_blur", "pre_blur", "pre_sharpen_radius",
             "scatter_cell", "scatter_radius",
             "scratch_width", "sharpen_radius"},
         f"{sum(1 for x in P.PARAMS if x.spatial)} marked spatial",
@@ -298,6 +299,333 @@ def main() -> int:
     d = float(np.abs(ref[: n[0], : n[1]] - view[: n[0], : n[1]]).max())
     check("scale invariance", d < 6e-3, f"max delta {d:.2e}")
 
+    # -- 5b-i. global chroma: decorrelate the channels, hold the amplitude ----
+    # Built as a mean-zero deviation added to the *existing* mono field rather
+    # than by the main grain's mean-of-three recipe, so that chroma 0 is
+    # bit-identical to the layer every current preset was dialled in against.
+    # Three things to pin, and the first is the one a rewrite would break.
+    print("\nglobal chroma grain")
+    gc_grey = np.full((360, 520, 3), 0.5, dtype=np.float32)
+
+    def gc_render(gc: float, smooth: float = 0.0) -> np.ndarray:
+        over = {k: 0.0 for k in P.NEUTRAL_ZERO}
+        over.update({"global_intensity": 40.0, "global_size": 4.0,
+                     "global_opacity": 1.0, "global_smooth": smooth,
+                     "global_chroma": gc})
+        out = eng.render_image(gc_grey, P.sanitize(over), 1.0, tile=1024,
+                               supersample=1)
+        return out.astype(np.float64) - 0.5
+
+    def gc_corr(d: np.ndarray) -> float:
+        return float(np.corrcoef(d[:, :, 0].ravel(), d[:, :, 1].ravel())[0, 1])
+
+    # At 0 the three channels must be the same field to the bit. Anything else
+    # means the mono component was rebuilt and every shipped preset's global
+    # layer just changed pattern.
+    d0 = gc_render(0.0)
+    spread = float(np.abs(d0[:, :, 0] - d0[:, :, 1]).max())
+    check("chroma 0 is exactly monochrome", spread == 0.0,
+          f"max channel spread {spread:.2e}")
+    # Correlation is `1 - chroma` by construction, not by tuning -- which is the
+    # whole reason the coefficients are solved rather than lerped.
+    for gc, want in ((0.25, 0.75), (0.5, 0.5), (1.0, 0.0)):
+        rho = gc_corr(gc_render(gc))
+        check(f"chroma {gc} decorrelates to {want}", abs(rho - want) < 0.05,
+              f"channel correlation {rho:+.3f}, wanted {want:+.2f}")
+    # Amplitude must not ride along with it, or the slider is a second loudness
+    # control. The residual drift is the +-1 clamp meeting a more gaussian
+    # field, not the blend: pre-clamp the construction is flat to 0.6%.
+    s0 = d0.std()
+    for gc in (0.5, 1.0):
+        r = gc_render(gc).std() / s0
+        check(f"amplitude holds at chroma {gc}", abs(r - 1.0) < 0.05,
+              f"{r * 100:.1f}% of monochrome")
+    # A second noise field is a second thing `pad_for` has to cover, and it is
+    # smoothed by the same kernel -- so re-run tile independence with both on.
+    gcp = P.sanitize({"global_intensity": 40, "global_size": 12.0,
+                      "global_opacity": 1.0, "global_smooth": 1.0,
+                      "global_chroma": 1.0})
+    a = eng.render_image(img, gcp, 1.0, tile=4096, supersample=2)
+    b = eng.render_image(img, gcp, 1.0, tile=128, supersample=2)
+    d = float(np.abs(a - b).max())
+    check("tile independence", d < 2e-3, f"max delta {d:.2e}")
+    # It only exists to colour the global layer, so with that layer off it must
+    # be inert -- otherwise it is a colour grade, which is deferred.
+    off = {k: 0.0 for k in P.NEUTRAL_ZERO}
+    a = eng.render_image(img, P.sanitize({**off, "intensity": 32.0,
+                                         "global_chroma": 0.0}), 1.0, tile=1024)
+    b = eng.render_image(img, P.sanitize({**off, "intensity": 32.0,
+                                         "global_chroma": 1.0}), 1.0, tile=1024)
+    d = float(np.abs(a.astype(float) - b.astype(float)).max())
+    check("inert with the global layer off", d == 0.0, f"max delta {d:.2e}")
+
+    # -- 5b-ii. master opacity: a cross-fade over the untouched source --------
+    # The two ends have to be *bit* exact, not close. Opacity 0 is a second
+    # "show me the original" path and inherits that stage's trap: the
+    # supersample round trip is not the identity, so blending anywhere inside
+    # render() would hand back an image 1e-01 softer than the source and call
+    # it "no effect". Checked at every supersample for exactly that reason.
+    print("\nmaster opacity (cross-fade over the untouched source)")
+    mo_ref = P.sanitize(None)
+    for ss in (1, 2, 3):
+        z = eng.render_image(img, P.sanitize({"master_opacity": 0.0}), 1.0,
+                             supersample=ss)
+        d = float(np.abs(z - img).max())
+        check(f"0 returns the source at {ss}x", d == 0.0, f"max delta {d:.2e}")
+    for ss in (1, 2):
+        a = eng.render_image(img, P.sanitize({"master_opacity": 1.0}), 1.0,
+                             supersample=ss)
+        b = eng.render_image(img, mo_ref, 1.0, supersample=ss)
+        d = float(np.abs(a - b).max())
+        check(f"1 is the untouched pipeline at {ss}x", d == 0.0,
+              f"max delta {d:.2e}")
+    # Linear in between, or it is not a cross-fade. Measured against the two
+    # ends rather than against a formula, so a stage that quietly re-ran at
+    # partial strength would show up.
+    full = eng.render_image(img, mo_ref, 1.0, supersample=2)
+    worst = 0.0
+    for op in (0.25, 0.5, 0.75):
+        got = eng.render_image(img, P.sanitize({"master_opacity": op}), 1.0,
+                               supersample=2)
+        worst = max(worst, float(np.abs(got - (img + (full - img) * op)).max()))
+    check("the middle is a straight cross-fade", worst < 1e-6,
+          f"worst deviation from the exact blend {worst:.2e}")
+    # It dials the *whole* pipeline back, not just the grain, so a stage that
+    # was applied after the blend would keep its full strength here.
+    heavy = P.sanitize({"halation": 0.8, "intensity": 60, "sharpen": 4.0,
+                        "dust": 40, "light_leak": 4})
+    h1 = eng.render_image(img, heavy, 1.0, supersample=2)
+    h5 = eng.render_image(img, {**heavy, "master_opacity": 0.5}, 1.0,
+                          supersample=2)
+    r = float(np.abs(h5 - img).mean()) / float(np.abs(h1 - img).mean())
+    check("everything scales together", abs(r - 0.5) < 0.02,
+          f"mean deviation from the source is {r * 100:.1f}% of full strength "
+          "with halation, grain, sharpening, dust and leaks all on")
+    # Per-pixel against the tile's own input, so this must be free -- but it is
+    # the last thing in the pipeline and a mistake here would seam every export.
+    mop = P.sanitize({"master_opacity": 0.4})
+    a = eng.render_image(img, mop, 1.0, tile=4096, supersample=2)
+    b = eng.render_image(img, mop, 1.0, tile=128, supersample=2)
+    d = float(np.abs(a - b).max())
+    check("tile independence", d < 2e-3, f"max delta {d:.2e}")
+
+    # -- 5c-ii. global smoothness: kill the lattice, keep the amplitude -------
+    # Value noise is a quilt of axis-aligned cells, invisible at a 1.6px clump
+    # and plainly rectangular at 20px. `gridiness` measures exactly that: the
+    # field's |gradient| binned by phase within a cell. A gridded field swings
+    # a long way between phases -- its extrema sit *on* the lattice, so the
+    # gradient vanishes there -- and an organic one does not care where the
+    # cell boundaries are.
+    print("\nglobal grain smoothing (the lattice, not the strength)")
+    gs_grey = np.full((512, 512, 3), 0.5, np.float32)
+    GS_CELL = 20.0
+
+    def gridiness(lum: np.ndarray, cell: float) -> float:
+        gx = np.abs(np.diff(lum, axis=1))
+        xs = (np.arange(lum.shape[1] - 1) + 0.5) / cell
+        ph = np.floor((xs % 1.0) * 8).astype(int)
+        m = np.array([gx[:, ph == b].mean() for b in range(8)])
+        return float((m.max() - m.min()) / m.mean())
+
+    def gs_render(sm: float) -> np.ndarray:
+        over = {k: 0.0 for k in P.NEUTRAL_ZERO}
+        over.update({"global_intensity": 20.0, "global_size": GS_CELL,
+                     "global_opacity": 1.0, "global_smooth": sm})
+        return eng.render_image(
+            gs_grey, P.sanitize(over), 1.0, tile=1024, supersample=1)
+
+    gs_off, gs_on = gs_render(0.0), gs_render(1.0)
+    q0 = gridiness(gs_off.mean(axis=2), GS_CELL)
+    q1 = gridiness(gs_on.mean(axis=2), GS_CELL)
+    check(
+        "the lattice is what gets removed", q0 > 1.2 and q1 < 0.5,
+        f"phase-binned gridiness {q0:.2f} -> {q1:.2f} "
+        f"({(1 - q1 / q0) * 100:.0f}% of the grid gone)",
+    )
+    # The whole reason the blur carries an analytic gain: a structure control
+    # that quietly turns the layer down leaves Global Intensity fighting it,
+    # and "smoother" becomes indistinguishable from "less". Same rule `_fbm`
+    # follows for Octaves.
+    s0 = float(gs_off.mean(axis=2).std())
+    worst = 0.0
+    for sm in (0.25, 0.5, 0.75, 1.0):
+        r = float(gs_render(sm).mean(axis=2).std()) / s0
+        worst = max(worst, abs(r - 1.0))
+    check(
+        "strength is held constant across the slider", worst < 0.06,
+        f"worst amplitude drift {worst * 100:.1f}% over smoothness 0.25-1.0",
+    )
+    # The gain is a closed form in sigma/cell, so it has to hold at every clump
+    # size and not just the one it was fitted at.
+    for cell in (4.0, 12.0):
+        over = {k: 0.0 for k in P.NEUTRAL_ZERO}
+        over.update({"global_intensity": 20.0, "global_size": cell,
+                     "global_opacity": 1.0})
+        a = eng.render_image(gs_grey, P.sanitize({**over, "global_smooth": 0.0}),
+                             1.0, tile=1024, supersample=1)
+        b = eng.render_image(gs_grey, P.sanitize({**over, "global_smooth": 1.0}),
+                             1.0, tile=1024, supersample=1)
+        r = float(b.mean(axis=2).std()) / float(a.mean(axis=2).std())
+        check(f"the gain holds at a {cell:.0f}px clump", abs(r - 1.0) < 0.08,
+              f"amplitude {r * 100:.1f}% of unsmoothed")
+    # It is a blur on the noise field, so it is a kernel `pad_for` has to
+    # cover -- and a kernel missing from pad_for seams a tiled export along
+    # exactly its radius while every preview looks fine.
+    smp = P.sanitize({"global_intensity": 40, "global_size": 12.0,
+                      "global_opacity": 1.0, "global_smooth": 1.0})
+    a = eng.render_image(img, smp, 1.0, tile=4096, supersample=2)
+    b = eng.render_image(img, smp, 1.0, tile=128, supersample=2)
+    d = float(np.abs(a - b).max())
+    check("tile independence with smoothing on", d < 2e-3, f"max delta {d:.2e}")
+
+    # -- 5c-iii. anti-aliasing: lose the staircase, keep the edge -------------
+    # The claim this stage makes is a *trade*, so both halves are pinned. It
+    # filters along the isophote and never across it, which is what separates
+    # it from every blur in the pipeline -- so jaggedness must fall a long way
+    # while the across-edge slope barely moves. Ships at 0, so this is also its
+    # own tile-independence run: it adds both a kernel and a displacement.
+    print("\nanti-aliasing (staircase off, edge intact)")
+    aa_h = aa_w = 400
+    _y = np.arange(aa_h)[:, None]
+    _x = np.arange(aa_w)[None, :]
+    # A shallow diagonal sampled with no partial coverage at all: every step is
+    # a whole pixel, which is precisely the artifact and gives the contour a
+    # 1/sqrt(12) = 0.289px residual about its own straight-line fit.
+    aa_img = np.ascontiguousarray(np.repeat(
+        np.where(_x < 150.0 + _y * 0.18, 0.15, 0.85).astype(np.float32)[:, :, None],
+        3, axis=2))
+
+    def aa_params(**kw) -> dict:
+        over = {k: 0.0 for k in P.NEUTRAL_ZERO}
+        over.update(kw)
+        return P.sanitize(over)
+
+    def contour(lum: np.ndarray) -> np.ndarray:
+        """Sub-pixel x of the 50% crossing on each row."""
+        mid = (lum.min() + lum.max()) * 0.5
+        out = []
+        for r in lum:
+            i = int(np.argmax(r > mid))
+            if i == 0:
+                out.append(np.nan)
+                continue
+            a_, b_ = r[i - 1], r[i]
+            out.append(i - 1 + (mid - a_) / (b_ - a_) if b_ != a_ else float(i))
+        return np.array(out)
+
+    def jagged(lum: np.ndarray) -> float:
+        c = contour(lum)
+        ys = np.arange(len(c))
+        ok = np.isfinite(c)
+        fit = np.polyval(np.polyfit(ys[ok], c[ok], 1), ys)
+        return float(np.std(c[ok] - fit[ok]))
+
+    def slope(lum: np.ndarray) -> float:
+        return float(np.abs(np.diff(lum, axis=1)).max(axis=1).mean())
+
+    aa_base = eng.render_image(aa_img, aa_params(), 1.0, supersample=1)
+    j0, k0 = jagged(aa_base.mean(axis=2)), slope(aa_base.mean(axis=2))
+    aa_on = eng.render_image(
+        aa_img, aa_params(aa_strength=1.0, aa_radius=1.0, aa_edge_only=0.7),
+        1.0, supersample=1)
+    j1, k1 = jagged(aa_on.mean(axis=2)), slope(aa_on.mean(axis=2))
+    check(
+        "the staircase comes off", j1 < 0.80 * j0,
+        f"contour residual {j0:.3f}px -> {j1:.3f}px ({j1 / j0 * 100:.0f}%)",
+    )
+    # The whole point of filtering along the contour rather than across it. For
+    # scale: `edge_sand` keeps 73% of the sharpness for 32% of the jaggedness,
+    # because it is working at a much longer wavelength; at the pixel scale
+    # this trade is meant to be the better one.
+    check(
+        "the edge stays as sharp as it was", k1 > 0.80 * k0,
+        f"across-edge slope {k0:.4f} -> {k1:.4f} ({k1 / k0 * 100:.0f}% kept) "
+        f"for {(1 - j1 / j0) * 100:.0f}% of the jaggedness removed",
+    )
+    # Off must be *exactly* off -- it sits ahead of the masks, so a stage that
+    # ran at 0 would move every downstream weighting with it.
+    aa_zero = eng.render_image(aa_img, aa_params(aa_strength=0.0), 1.0,
+                               supersample=1)
+    d = float(np.abs(aa_zero - aa_base).max())
+    check("0 is a true no-op", d == 0.0, f"max delta {d:.2e}")
+    # Above 1 the filter repeats, re-aiming each time. A single pass was
+    # reported as doing "little to none", and repeating is the right lever
+    # rather than a longer radius -- the taps are short on purpose. Both halves
+    # of the trade have to keep improving together, or "more aggressive" just
+    # means "blurrier": the ladder must be monotonic in jaggedness removed while
+    # the across-edge slope stays well clear of what a blur would leave.
+    ladder = []
+    for st in (1.0, 2.0, 3.0):
+        o = eng.render_image(
+            aa_img, aa_params(aa_strength=st, aa_radius=1.0, aa_edge_only=0.7),
+            1.0, supersample=1).mean(axis=2)
+        ladder.append((st, jagged(o), slope(o)))
+    js = [j for _, j, _ in ladder]
+    check(
+        "repeating keeps taking the staircase down",
+        js[2] < js[1] < js[0] and js[2] < 0.45 * j0,
+        ", ".join(f"{st:.0f} pass -> {j / j0 * 100:.0f}%" for st, j, _ in ladder),
+    )
+    check(
+        "and does not turn into a blur doing it", ladder[2][2] > 0.60 * k0,
+        ", ".join(f"{st:.0f} pass -> {k / k0 * 100:.0f}% slope"
+                  for st, _, k in ladder),
+    )
+    # Whole numbers are whole passes and the remainder fades the last one in, so
+    # strength 1 has to stay *bit* identical to the single-pass version it was
+    # before passes existed -- otherwise raising the ceiling silently moved
+    # every value under it.
+    d = float(np.abs(
+        eng.render_image(aa_img, aa_params(aa_strength=1.0, aa_radius=1.0,
+                                           aa_edge_only=0.7), 1.0,
+                         supersample=1).astype(float) - aa_on.astype(float)
+    ).max())
+    check("strength 1 is still exactly one pass", d == 0.0, f"max delta {d:.2e}")
+    # Three passes each displace a radius and each re-derive a tangent from
+    # blurred luma, so pad_for has to count both terms three times over. Miss it
+    # and a tiled export seams along the accumulated reach.
+    aap = aa_params(aa_strength=3.0, aa_radius=4.0, aa_edge_only=0.3)
+    a = eng.render_image(img, aap, 1.0, tile=4096, supersample=2)
+    b = eng.render_image(img, aap, 1.0, tile=96, supersample=2)
+    d = float(np.abs(a - b).max())
+    check("tile independence at three passes", d < 2e-3, f"max delta {d:.2e}")
+
+    # Edge Only is the texture guard, and the discriminator is step *amplitude*
+    # -- the same one edge softening uses, and for the same reason: keying on
+    # "is there a micro-edge here" would select fabric, which is made of them.
+    aa_rng = np.random.default_rng(11)
+    aa_tex = np.ascontiguousarray(np.repeat(
+        np.clip(0.5 + (aa_rng.random((300, 300)) - 0.5) * 0.04, 0, 1
+                ).astype(np.float32)[:, :, None], 3, axis=2))
+    t0 = float(eng.render_image(aa_tex, aa_params(), 1.0, supersample=1).std())
+    keep = {}
+    for eo in (1.0, 0.0):
+        t = eng.render_image(
+            aa_tex, aa_params(aa_strength=1.0, aa_radius=1.0, aa_edge_only=eo),
+            1.0, supersample=1)
+        keep[eo] = float(t.std()) / t0
+    check(
+        "Edge Only protects fine texture", keep[1.0] > 0.97 > keep[0.0],
+        f"fabric-scale texture kept {keep[1.0] * 100:.0f}% at Edge Only 1 "
+        f"against {keep[0.0] * 100:.0f}% at 0",
+    )
+
+    aap = P.sanitize({"aa_strength": 1.0, "aa_radius": 2.0, "aa_edge_only": 0.7})
+    a = eng.render_image(img, aap, 1.0, tile=4096, supersample=2)
+    b = eng.render_image(img, aap, 1.0, tile=128, supersample=2)
+    d = float(np.abs(a - b).max())
+    check("tile independence", d < 2e-3, f"max delta {d:.2e}")
+    # The radius is a length in full-resolution pixels like every other spatial
+    # quantity, so the proxy has to predict the export.
+    view = eng.render_view(img, aap, (100, 100, 400, 400), 0.5, 2)
+    small = eng.render_image(
+        np.ascontiguousarray(iio.downscale(img, 0.5)), aap, 0.5, tile=4096,
+        supersample=2)
+    ref = small[50: 50 + view.shape[0], 50: 50 + view.shape[1]]
+    n = min(ref.shape[0], view.shape[0]), min(ref.shape[1], view.shape[1])
+    d = float(np.abs(ref[: n[0], : n[1]] - view[: n[0], : n[1]]).max())
+    check("scale invariance", d < 6e-3, f"max delta {d:.2e}")
+
     # -- 5d. edge softening: soften borders, keep texture and grain ----------
     # The point of this stage is that it is *not* a global blur, so it is
     # checked against a frame that is half hard border and half fine texture.
@@ -344,6 +672,79 @@ def main() -> int:
     b = eng.render_image(img, P.sanitize(soft), 1.0, tile=128, supersample=2)
     d = float(np.abs(a - b).max())
     check("tile independence", d < 2e-3, f"max delta {d:.2e}")
+
+    # -- 5d1. pre-blur: the same kernel as micro-blur, a different stage -----
+    # It ships at 0, so the default-parameter checks render straight past it,
+    # and it adds a blur kernel in series with micro-blur -- a kernel missing
+    # from pad_for seams a tiled export along exactly its radius while every
+    # preview looks fine.
+    #
+    # The interesting assertions are the two that separate it from micro-blur:
+    # it runs before `lum_ref`, so it *must* cost grain (the exact opposite of
+    # the check three lines above), and it runs before pre-sharpen, so the
+    # sharpen has to survive it.
+    print("\npre-blur (softens the source, and the masks with it)")
+    gp0, ep0, tp0 = es_measure({"micro_blur": 0.0, "edge_soften": 0.0})
+    preb = {"micro_blur": 0.0, "edge_soften": 0.0, "pre_blur": 3.0}
+    gp1, ep1, tp1 = es_measure(preb)
+    check("border softens", ep1 < ep0 * 0.5, f"hard edge {ep1 / ep0 * 100:.0f}% of unblurred")
+    check(
+        "texture goes too", tp1 < tp0 * 0.5,
+        f"fine texture {tp1 / tp0 * 100:.0f}% kept -- a blur is not edge_soften",
+    )
+    # The whole reason this is not micro-blur: the masks are measured after it,
+    # so softening the source turns the grain down with it. micro_blur 3.0 on
+    # the identical frame holds grain within 5% (checked above); this must not.
+    check(
+        "grain follows the softened frame", gp1 < gp0 * 0.9,
+        f"grain {gp1 / gp0 * 100:.0f}% of unblurred, vs micro-blur's "
+        f"{g2 / g0 * 100:.0f}%",
+    )
+    # Order: pre-blur first, then pre-sharpen. Run the other way round the blur
+    # would wipe the sharpening out and this would land back on blur-alone.
+    _, ep2, _ = es_measure({**preb, "pre_sharpen": 8.0, "pre_sharpen_radius": 3.0})
+    check(
+        "pre-sharpen survives the pre-blur", ep2 > ep1 * 1.15,
+        f"hard edge {ep2 / ep1 * 100:.0f}% of pre-blur alone",
+    )
+    # Blurring in linear light, not in the display encoding. On a black/white
+    # border the two differ enormously: averaging gamma-encoded values holds
+    # the *encoded* mean, which is a fraction of the light it stands for, so
+    # every edge the kernel crosses comes out darker than the light that made
+    # it. Measured in the transition band only -- outside it both agree.
+    print("\npre-blur runs in linear light (energy across an edge)")
+    bw = np.zeros((120, 240, 3), np.float32)
+    bw[:, 120:] = 1.0
+    bw = np.ascontiguousarray(bw)
+    pb_only = P.sanitize({**P.neutral_values(), "pre_blur": 4.0})
+    pb_out = eng.render_image(bw, pb_only, 1.0, supersample=1)
+
+    def _lin(a: np.ndarray) -> np.ndarray:
+        return np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** 2.4)
+
+    band = slice(120 - 14, 120 + 14)
+    want = float(_lin(bw[:, band]).mean())
+    got = float(_lin(pb_out[:, band]).mean())
+    # sRGB-space blurring reads this band at ~0.21 against linear's 0.50.
+    check(
+        "light is conserved across the border", abs(got - want) < 0.02,
+        f"linear mean {got:.3f} vs {want:.3f} (gamma-space blurring gives ~0.21)",
+    )
+    a = eng.render_image(img, P.sanitize(preb), 1.0, tile=4096, supersample=2)
+    b = eng.render_image(img, P.sanitize(preb), 1.0, tile=128, supersample=2)
+    d = float(np.abs(a - b).max())
+    check("tile independence", d < 2e-3, f"max delta {d:.2e}")
+    # Scale invariance: the radius is a full-resolution length like every other
+    # spatial quantity, so a half-scale view must still predict the export.
+    view = eng.render_view(img, P.sanitize(preb), (100, 100, 400, 400), 0.5, 2)
+    small = eng.render_image(
+        np.ascontiguousarray(iio.downscale(img, 0.5)), P.sanitize(preb), 0.5,
+        tile=4096, supersample=2,
+    )
+    ref = small[50: 50 + view.shape[0], 50: 50 + view.shape[1]]
+    n = min(ref.shape[0], view.shape[0]), min(ref.shape[1], view.shape[1])
+    d = float(np.abs(ref[: n[0], : n[1]] - view[: n[0], : n[1]]).max())
+    check("scale invariance", d < 6e-3, f"max delta {d:.2e}")
 
     # -- 5e. edge jitter actually displaces edges ----------------------------
     # Measured as sub-pixel border position rather than as a pixel delta: a
@@ -791,6 +1192,34 @@ def main() -> int:
     n = min(ref.shape[0], view.shape[0]), min(ref.shape[1], view.shape[1])
     d = float(np.abs(ref[: n[0], : n[1]] - view[: n[0], : n[1]]).max())
     check("scale invariance", d < 6e-3, f"max delta {d:.2e}")
+    # Scatter runs *before* micro-blur, and the order is not cosmetic -- it is
+    # worth a check because swapping it back would look plausible in a diff and
+    # change every preset that has both stages on.
+    #
+    # The tell is a hard edge. Blurring first and scattering second came out
+    # *harder* on a border than the blur alone (60% of the original slope
+    # against 34%), because displacing a blurred gradient by whole pixels drops
+    # a hard step back into it -- scatter was undoing the blur. In this order
+    # scatter shreds the border and the blur then averages the raggedness, so
+    # the pair must land *below* blur-alone instead of above it.
+    ord_edge = np.ascontiguousarray(np.repeat(
+        np.where(np.arange(600)[None, :].repeat(300, 0) < 300, 0.2, 0.8)
+        .astype(np.float32)[:, :, None], 3, axis=2))
+
+    def ord_slope(over: dict) -> float:
+        o = sc_run(over, ord_edge).mean(axis=2)
+        return float(np.abs(np.diff(o, axis=1)).max(axis=1).mean())
+
+    e_ref = ord_slope({})
+    e_blur = ord_slope({"micro_blur": 1.0})
+    e_both = ord_slope({"micro_blur": 1.0, "scatter": 0.85,
+                        "scatter_radius": 3.0, "scatter_cell": 1.2})
+    check(
+        "scatter runs before micro-blur", e_both < e_blur * 0.95,
+        f"hard-edge slope {e_blur / e_ref * 100:.0f}% of untouched for the blur "
+        f"alone, {e_both / e_ref * 100:.0f}% with scatter ahead of it "
+        f"(the old order measured 60%, above the blur)",
+    )
 
     # -- 5e4. halation blue compensation -------------------------------------
     # Halation adds warm light, and adding light desaturates whatever it lands
