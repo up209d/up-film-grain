@@ -44,14 +44,13 @@ GROUPS: list[str] = [
     "Pre Blur",
     "Pre Sharpen",
     "Grain Structure",
-    "Luminance Response",
     "Edge Destruction",
-    "Halation",
-    "Optical",
     "Anti Aliasing",
-    "Tone Response",
     "Global Grain",
     "Sharpening",
+    "Luminance Response",
+    "Halation",
+    "Tone Response",
     "Film Texture",
     "Output",
 ]
@@ -446,7 +445,11 @@ PARAMS: list[Param] = [
         "Lower it when halation is strong and the tint starts to read as a "
         "colour cast rather than as light.",
     ),
-    # -------------------------------------------------------------- optical
+    # ----------------------------------------------------- edge destruction
+    # (scatter and micro-blur -- formerly their own "Optical" group, merged in
+    # here 2026-08-04 on request; the engine's step numbering is unaffected,
+    # this is a UI grouping only.)
+    #
     # Scatter first, micro-blur last, in the panel and in the pipeline alike --
     # see step 1 in engine.render(). The order is the point: scatter gets the
     # source's own detail to take apart, and the blur then averages what is
@@ -455,7 +458,7 @@ PARAMS: list[Param] = [
     # Scatter: diffusion resolved as discrete deflections instead of as an
     # average. See _scatter for why that is not a blur.
     Param(
-        "scatter", "Scatter", "Optical",
+        "scatter", "Scatter", "Edge Destruction",
         0.0, 1.0, 0.01, 0.0, "",
         "Spreads detail into the neighbouring pixels *without* averaging "
         "anything, so the picture loses its digital exactness while keeping "
@@ -472,7 +475,7 @@ PARAMS: list[Param] = [
         "detail is the only thing that comes apart. 0 = off.",
     ),
     Param(
-        "scatter_radius", "Scatter Reach", "Optical",
+        "scatter_radius", "Scatter Reach", "Edge Destruction",
         0.5, 24.0, 0.1, 3.0, "px",
         "How far a displaced pixel travels, at full resolution. Small reads "
         "as an emulsion that will not quite resolve; large tears detail into "
@@ -484,7 +487,7 @@ PARAMS: list[Param] = [
         spatial=True,
     ),
     Param(
-        "scatter_pattern", "Scatter Pattern", "Optical",
+        "scatter_pattern", "Scatter Pattern", "Edge Destruction",
         0.0, 8.0, 1.0, 0.0, "",
         "Where a displaced pixel is allowed to land -- the stencil. Restricting "
         "the choice is what makes the result read as a *structure* rather than "
@@ -504,7 +507,7 @@ PARAMS: list[Param] = [
                  "Star", "Horizontal", "Vertical"),
     ),
     Param(
-        "scatter_spread", "Reach Spread", "Optical",
+        "scatter_spread", "Reach Spread", "Edge Destruction",
         0.0, 1.0, 0.01, 1.0, "",
         "Whether every displaced pixel travels the full reach or a share of "
         "it. 0 is a shell -- everything lands on the edge of the pattern's "
@@ -515,7 +518,7 @@ PARAMS: list[Param] = [
         "at any setting, so this only decides how thick its ring is.",
     ),
     Param(
-        "scatter_cell", "Scatter Clump", "Optical",
+        "scatter_cell", "Scatter Clump", "Edge Destruction",
         0.1, 5.0, 0.1, 1.0, "px",
         "How big a piece of the picture moves as one. At 1 every pixel "
         "chooses for itself and the image crumbles; larger values move whole "
@@ -532,7 +535,7 @@ PARAMS: list[Param] = [
         spatial=True,
     ),
     Param(
-        "micro_blur", "Micro-Blur", "Optical",
+        "micro_blur", "Micro-Blur", "Edge Destruction",
         0.0, 3.0, 0.01, 0.45, "px",
         "Light diffusion through the gel layers, as an average: every pixel "
         "is mixed with its neighbours. That is the smooth half of diffusion, "

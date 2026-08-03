@@ -51,16 +51,21 @@ const ZOOM_STEPS = [0.05, 0.1, 0.17, 0.25, 0.33, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 
 const WHEEL_RATE = 0.0025;
 const PINCH_RATE = 0.01;
 
-/** How close to Fit a wheel step has to land before it becomes Fit.
+/** How close to Fit a wheel step has to land before it locks to Fit mode.
  *
  *  Fit is a *mode*, not a number: it follows the container, so a window resize
  *  keeps the whole frame visible. Landing on 0.1997 when fit is 0.2 would look
- *  identical and quietly lose that, so the bottom of the wheel's range is Fit
- *  itself and anything within this of it becomes Fit outright. Scrolling out
- *  therefore stops there rather than sailing past to 5% -- a continuous
+ *  identical and quietly lose that, so anything within this fraction of Fit
+ *  becomes Fit outright rather than a very-close zoom value -- a continuous
  *  control almost never *lands* on a snap point, it crosses it, so a snap that
- *  only fires on a near-miss is a snap that fires at random. Below Fit is
- *  still reachable, deliberately, from the - button. */
+ *  only fires on a near-miss is a snap that fires at random.
+ *
+ *  The band is checked on **both** sides of Fit (changed 2026-08-04, on
+ *  request): the wheel used to bottom out at Fit and hand off to the - button
+ *  for anything smaller, which needed only a one-sided `next <= fit` check.
+ *  Scrolling out is not capped there any more -- see `ZOOM_STEPS[0]` below --
+ *  so a one-sided check would now catch *every* zoomed-out value, not just the
+ *  ones near Fit, and the wheel would never leave Fit mode once it reached it. */
 const FIT_SNAP = 0.02;
 
 /** Mount border around the previewed photo, in *screen* pixels.
@@ -83,6 +88,13 @@ const FRAME_DEFAULT = 18;
 const FRAME_SHADOW_BLUR = 24;
 const FRAME_SHADOW_DROP = 8;
 const FRAME_SHADOW_ROOM = FRAME_SHADOW_BLUR + FRAME_SHADOW_DROP;
+
+/** Breathing room Fit leaves on every side, in screen pixels, whether or not
+ *  the mount is on. Fit used to size the image to the exact pane, so it butted
+ *  straight against the panel edge with no margin to judge it against -- this
+ *  reserves the same kind of room the mount does, just always on rather than
+ *  only with Frame enabled. */
+const FIT_PADDING = 30;
 
 /** Marker written into saved preset files. Only used to make a hand-inspected
  *  file self-describing -- loading deliberately does not require it, so a bare
@@ -121,6 +133,10 @@ export default function App() {
   const [split, setSplit] = useState(1); // 1 = fully processed
   const [showBefore, setShowBefore] = useState(false);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  /** Which sections are switched off, and what they will restore to. Declared
+   *  up here rather than beside `toggleGroup` below because boot now reads it
+   *  too -- the app opens with every section muted, see `muteAll`. */
+  const [muted, setMuted] = useState<Record<string, Values>>({});
 
   /** Megapixels of the image the current values were dialled in on. Sent with
    *  every render so the server rescales lengths to whatever photo is loaded;
@@ -162,15 +178,38 @@ export default function App() {
     [],
   );
 
+  /** Mute every section at once, the way pressing every section's own mute
+   *  button would -- each group's *kept* values come from `src` (the starting
+   *  preset), while the group's live values are neutral, exactly like
+   *  `toggleGroup` does for one section. This is what boot and Reset show: the
+   *  photo opens untouched, with the starting preset's whole look sitting
+   *  behind the "○" buttons rather than applied. Picking a preset or loading a
+   *  file is the only thing that clears this and turns every section on -- see
+   *  `applyPreset` and `loadPreset`. */
+  const muteAll = (s: Schema, src: Values): Record<string, Values> => {
+    const m: Record<string, Values> = {};
+    for (const g of s.groups) {
+      const keys = s.params.filter((p) => p.group === g).map((p) => p.key);
+      const keep: Values = {};
+      for (const k of keys) keep[k] = src[k];
+      m[g] = keep;
+    }
+    return m;
+  };
+
   // ---------------------------------------------------------------- boot --
   useEffect(() => {
     getSchema()
       .then((s) => {
         setSchema(s);
         const start = startingValues(s);
-        setValues(start.values);
-        setApplied(start.values);
+        // The starting preset's values are held as "muted" rather than applied
+        // -- the app opens showing the untouched photo, with every section's
+        // Stock look one click away on its own toggle rather than already on.
+        setValues(s.neutral);
+        setApplied(s.neutral);
         setReferenceMp(start.referenceMp);
+        setMuted(muteAll(s, start.values));
       })
       .catch((e) => setError(String(e.message ?? e)));
     getHealth()
@@ -400,6 +439,12 @@ export default function App() {
 
   // Presets and reset are single discrete actions, not gestures, so they go
   // straight through to the renderer.
+  //
+  // Picking a preset is the one thing that turns every section on: it is a
+  // deliberate "use this whole look", unlike boot or Reset which stage the
+  // preset's values behind each section's mute button instead. `setMuted({})`
+  // clears any muting left over from boot, from Reset, or from switching
+  // sections off by hand.
   const applyPreset = (name: string) => {
     const p = schema?.presets.find((x) => x.name === name);
     if (!p) return;
@@ -410,14 +455,19 @@ export default function App() {
     const v = { ...values, ...p.values };
     setValues(v);
     setApplied(v);
+    setMuted({});
   };
 
+  // "How it opened" has to mean what boot shows, muted sections included --
+  // otherwise Reset and a fresh load would disagree about the starting point,
+  // which is exactly the small bug `startingValues` is written to avoid.
   const resetAll = () => {
     if (!schema) return;
     const start = startingValues(schema);
-    setValues(start.values);
-    setApplied(start.values);
+    setValues(schema.neutral);
+    setApplied(schema.neutral);
     setReferenceMp(start.referenceMp);
+    setMuted(muteAll(schema, start.values));
   };
 
   /** Switch the whole pipeline off, so the preview is the untouched photo.
@@ -433,8 +483,6 @@ export default function App() {
   /** Switch one section off, same idea. Reaching for this is usually "is this
    *  section even earning its keep" -- so it toggles: press it again and the
    *  section comes back exactly as it was. */
-  const [muted, setMuted] = useState<Record<string, Values>>({});
-
   const toggleGroup = (group: string) => {
     if (!schema) return;
     const keys = schema.params.filter((x) => x.group === group).map((x) => x.key);
@@ -569,7 +617,10 @@ export default function App() {
       if (typeof raw?.reference_mp === "number") setReferenceMp(raw.reference_mp);
       setValues(v);
       setApplied(v); // discrete action -- render straight away
-        setError(null);
+      // A loaded file is a whole look too, same as picking one from the menu --
+      // every section goes live rather than staying behind its mute button.
+      setMuted({});
+      setError(null);
       setNotice(
         dropped.length
           ? `Loaded ${file.name} — ignored unknown key${
@@ -1089,6 +1140,12 @@ function Stage(props: {
   const split = props.showBefore ? 0 : props.split;
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const drag = useRef<{ x: number; y: number; cx: number; cy: number } | null>(null);
+  // The wheel handler's memory of an in-flight zoom excursion that is
+  // currently snap-displayed as Fit -- see the wheel handler below for why
+  // this has to persist independent of the displayed zoom. Cleared wherever
+  // Fit is set for a reason *other* than the wheel handler's own snap, so a
+  // fresh "go to Fit" never inherits a stale excursion from a previous scroll.
+  const wheelContRef = useRef<number | null>(null);
   // null = fit: follow the container instead of holding a fixed factor, so
   // resizing the window keeps the whole frame visible.
   const [zoom, setZoom] = useState<number | null>(null);
@@ -1107,6 +1164,7 @@ function Stage(props: {
   // corner crop of the last photo is never where you want to land.
   useEffect(() => {
     setCenter({ x: 0.5, y: 0.5 });
+    wheelContRef.current = null;
     setZoom(null);
   }, [props.meta?.id]);
 
@@ -1134,7 +1192,11 @@ function Stage(props: {
   // the zoom is computed. Reserved on both axes because the border is drawn on
   // all four sides. Left out of `place()`'s clamping, which works in image
   // coordinates: the mount hangs outside the image box and never moves it.
-  const inset = frame ? frameWidth + FRAME_SHADOW_ROOM : 0;
+  //
+  // FIT_PADDING is added unconditionally, mount or no mount: Fit used to size
+  // the image to the exact pane, leaving no margin to judge it against the
+  // panel behind it.
+  const inset = FIT_PADDING + (frame ? frameWidth + FRAME_SHADOW_ROOM : 0);
   const fitZoom =
     Math.min(
       Math.max(pane.w - 2 * inset, 1) / iw,
@@ -1149,8 +1211,8 @@ function Stage(props: {
   // and by hand, so without this it would close over whatever zoom happened to
   // be current when it was attached and every notch would zoom from the same
   // starting point.
-  const geom = useRef({ eff: 1, fit: 1, iw: 1, ih: 1, pane: { w: 0, h: 0 } });
-  geom.current = { eff, fit: fitZoom, iw, ih, pane };
+  const geom = useRef({ eff: 1, fit: 1, iw: 1, ih: 1, pane: { w: 0, h: 0 }, zoomIsNull: true });
+  geom.current = { eff, fit: fitZoom, iw, ih, pane, zoomIsNull: zoom === null };
 
   // Scroll to zoom, anchored on the pointer.
   //
@@ -1185,10 +1247,18 @@ function Stage(props: {
             : e.deltaY;
       const rate = e.ctrlKey ? PINCH_RATE : WHEEL_RATE;
       const hi = ZOOM_STEPS[ZOOM_STEPS.length - 1];
-      // Scrolling out bottoms out at Fit rather than at the button range's 5%.
-      const lo = Math.min(g.fit, hi);
-      const next = Math.min(hi, Math.max(lo, g.eff * Math.exp(-dy * rate)));
-      if (Math.abs(next - g.eff) < 1e-6) return;
+      // Same floor as the - button (changed 2026-08-04, on request): the wheel
+      // used to bottom out at Fit and required the button for anything smaller,
+      // which is a floor a continuous gesture should not have needed to defer to
+      // a click for.
+      const lo = ZOOM_STEPS[0];
+      // The true starting point for this tick: the in-flight excursion if the
+      // display is currently snapped to Fit and one is recorded, otherwise the
+      // displayed value itself (there is nothing hidden to recover).
+      const from =
+        g.zoomIsNull && wheelContRef.current !== null ? wheelContRef.current : g.eff;
+      const next = Math.min(hi, Math.max(lo, from * Math.exp(-dy * rate)));
+      if (Math.abs(next - from) < 1e-6) return;
 
       const fr = frame.getBoundingClientRect();
       const pr = paneEl.getBoundingClientRect();
@@ -1206,7 +1276,12 @@ function Stage(props: {
         x: Math.min(1, Math.max(0, u + (g.pane.w / 2 - px) / dw2)),
         y: Math.min(1, Math.max(0, v + (g.pane.h / 2 - py) / dh2)),
       });
-      setZoom(next <= g.fit * (1 + FIT_SNAP) ? null : next);
+      // Two-sided now that scrolling out is not capped at Fit -- see FIT_SNAP.
+      const snapped = Math.abs(next - g.fit) <= g.fit * FIT_SNAP;
+      // Keep the true position alive under the snap so the *next* tick can
+      // still tell it apart from a fresh arrival at Fit -- see wheelContRef.
+      wheelContRef.current = snapped ? next : null;
+      setZoom(snapped ? null : next);
     };
 
     host.addEventListener("wheel", onWheel as EventListener, { passive: false });
@@ -1368,7 +1443,10 @@ function Stage(props: {
       <span className="vsep" />
       <button
         className={zoom === null ? "seg on" : "seg"}
-        onClick={() => setZoom(null)}
+        onClick={() => {
+          wheelContRef.current = null;
+          setZoom(null);
+        }}
       >
         Fit
       </button>

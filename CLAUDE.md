@@ -183,7 +183,9 @@ What the client-side scaling bought:
   `getBoundingClientRect` rather than recomputed from `center`, so it inherits
   `place()`'s clamping instead of duplicating it. Fit is a *mode*, not a
   number — it tracks the container so a resize keeps the frame visible — so
-  the wheel snaps back to it within `FIT_SNAP`.
+  the wheel locks to it within `FIT_SNAP` of the fit value, on either side, and
+  is no longer floored at Fit going the other way -- see the wheel-zoom section
+  below for a real bug this uncovered.
 * The server-side crop grid-phase problem is gone. It used to be that below 1:1
   the read origin had to be **snapped** so `origin * scale` landed on a whole
   working pixel, because a crop starting mid-pixel resolves on a different grid
@@ -402,9 +404,10 @@ what the user asked for — detail destroyed, harshness kept.
 
 ### The two run scatter-first, and the old order was undoing itself (2026-08-03)
 
-Changed on request, along with moving `micro_blur` to the bottom of the Optical
-panel so the panel and the pipeline read the same way. It is **not** a cosmetic
-reorder — measured on separate plates at scatter 0.85 / reach 3 / blur 1px:
+Changed on request, along with moving `micro_blur` to the bottom of its panel
+section (then "Optical", now merged into Edge Destruction — see below) so the
+panel and the pipeline read the same way. It is **not** a cosmetic reorder —
+measured on separate plates at scatter 0.85 / reach 3 / blur 1px:
 
 | | fine texture | hard edge |
 |---|---|---|
@@ -649,7 +652,46 @@ three unrelated jobs, and putting the fringing slider directly under the erosion
 slider it modifies is more discoverable than the merge alone would be. One
 `group` string each to move if it reads wrong.
 
-### `global_chroma` is *not* built the way `chroma_grain` is
+## The panel order, again (2026-08-04)
+
+A second reorg on top of the Colour merge above, this time touching `GROUPS`
+only — no parameter changed section. `Optical` is gone the same way `Color`
+went: its six params (`scatter*`, `micro_blur`) took on group `"Edge
+Destruction"`, so the mechanism they share with jitter and sanding — tearing
+detail apart before grain goes on — now lives under one heading instead of two.
+Nothing else about them changed; the pipeline still runs scatter and micro-blur
+where step 1/1b says, and `verify.py`'s per-stage checks key on parameter values,
+not on group names, so none of them needed touching.
+
+`GROUPS` itself, before and after:
+
+```
+before                          after
+------                           -----
+Pre Blur                        Pre Blur
+Pre Sharpen                     Pre Sharpen
+Grain Structure                 Grain Structure
+Luminance Response              Edge Destruction   (+ former Optical)
+Edge Destruction                Anti Aliasing
+Halation                        Global Grain
+Optical                         Sharpening
+Anti Aliasing                   Luminance Response
+Tone Response                   Halation
+Global Grain                    Tone Response
+Sharpening                      Film Texture
+Film Texture                    Output
+Output
+```
+
+Read as one story rather than twelve independent moves: everything that tears
+the image apart at the pixel and edge level -- scatter, micro-blur, jitter,
+sanding, then the anti-alias pass that cleans up stair-stepping, then the two
+overlay layers that ride on top of the result (Global Grain, Sharpening) -- now
+runs as one uninterrupted block. Luminance Response and Halation, both about how
+light behaves rather than how detail is destroyed, sit together right after it,
+directly ahead of Tone Response. Grouping by request rather than by re-deriving
+a rationale from scratch — the four moves were independent asks and this is
+simply where they land in combination.
 
 Same job — decorrelate the three channels so the layer carries colour speckle
 instead of pure luminance noise — and deliberately a different construction. The
@@ -695,9 +737,10 @@ is already covered.
 ## Anti-aliasing: filter along the contour, never across it (added 2026-08-03)
 
 Step 1c, in the optical block beside micro-blur and scatter, in linear light.
-Ships at 0. The UI section sits between Optical and Tone Response because the
-user asked for it there (it was Optical/Colour before the merge above); the
-pipeline position is its own decision, and an
+Ships at 0. The UI section has moved twice since it was added — first between
+Optical and Tone Response (Optical/Colour before that merge), now right after
+Edge Destruction (2026-08-04, on request, alongside the panel reorg below). The
+pipeline position is its own decision either way, and an
 anti-alias filter is an *optical* element — a birefringent plate in front of a
 sensor — so the light path is where it belongs. It also has to run before the
 masks are measured, or the grain keeps keying on the jaggies it just removed.
@@ -1063,6 +1106,63 @@ the zoom controls, on the same reasoning that put zoom there: they change the
 *view*, not the render, and driving a wipe across the photo from a panel on the
 other side of the screen means looking away from the thing you are judging.
 
+### Wheel zoom-out is no longer floored at Fit, and Fit itself keeps a margin (2026-08-04)
+
+Two independent requests landed on the same code at once. **Fit reserves
+`FIT_PADDING` (30px, screen pixels) on every side now**, mount or no mount --
+before it sized the image to the exact pane, so the photo butted against the
+panel edge with nothing to judge it against. It folds into the same `inset`
+the mount's own room reservation uses, so a framed *and* fit image gets both
+allowances at once rather than either one clobbering the other.
+
+**The wheel used to bottom out at Fit and hand off to the - button for
+anything smaller** -- deliberate at the time (see the `FIT_SNAP` doc comment's
+history), but reported back as wrong: a continuous gesture should not need a
+different control partway through it. `lo` is `ZOOM_STEPS[0]` now, matching the
+button's own floor, and zooming in from there climbs back past Fit and on up
+without a floor either.
+
+**That surfaced a real bug in the Fit-snap band, not just a missing feature.**
+`FIT_SNAP` decides how close to Fit counts as "close enough to lock to Fit
+mode", and the check used to be one-sided (`next <= fit * (1 + snap)`) because
+scrolling out could never go far enough below fit for the distinction to
+matter -- the floor caught it first. Remove the floor and that one-sided check
+means *every* zoomed-out value satisfies "at or below fit", so the wheel would
+lock to Fit on the first tick past it and never come back out. Fixed by
+checking both sides: `abs(next - fit) <= fit * FIT_SNAP`.
+
+That fix alone was not enough, and finding out why is the more interesting
+part. `zoom` displays as `null` (Fit) for the whole time a continuous scroll
+sits inside the band, and the next wheel tick used to compute its step from
+`eff` -- which, displaying Fit, reports exactly `fitZoom` regardless of *how
+far* into the band the gesture actually was. A slow scroll advancing by less
+than the band's own width per tick therefore recomputed from `fitZoom` every
+single time, landed back inside the band every single time, and never
+escaped: **the gesture was stuck exactly at Fit.** Measured with synthetic
+wheel events sized to a plausible trackpad tick (2% zoom change per event
+against a 2% `FIT_SNAP` band): every tick relocked, and 25 ticks in a row
+moved the display 0.00 percentage points.
+
+The fix is `wheelContRef`, a ref that remembers the true, unsnapped position
+through a Fit-locked stretch, independent of what is on screen. Each tick reads
+its starting point from that ref rather than from `eff` whenever the display is
+currently `null`, so the *next* computation continues from where the gesture
+really is rather than from the band's centre; whenever the ref holds nothing
+(nothing in flight) or the display is a concrete number (no ambiguity to
+begin with), `eff` is trusted directly. The ref is deliberately cleared at both
+`setZoom(null)` call sites that are *not* this handler's own snap decision --
+the Fit button and the new-image reset -- so a fresh "go to Fit" never
+inherits a stale excursion left over from a previous scroll. Re-measured after
+the fix: the same 2%-per-tick gesture takes exactly one tick to lock to Fit and
+the very next tick to leave it, in both directions, and a moderate zoom-out
+followed by zooming back in climbs straight through Fit and on past it rather
+than sticking.
+
+Verified end to end with a real running instance (headless Chrome driven over
+CDP, synthetic wheel events dispatched on the actual `.pane` element) rather
+than by inspection alone -- this is exactly the kind of interaction bug that
+looks fine in a diff and only shows up when something actually scrolls.
+
 ### The mount is a view control, and its width is in *screen* pixels (2026-08-03)
 
 `Frame` on the `viewbar`: an off-white board around the photo plus a drop
@@ -1174,6 +1274,48 @@ Two ways to populate it instead:
   photo**, then **Save to file…**.
 * All at once: `FILM_GRAIN_DEFAULT_REFERENCE_MP=24` makes every preset with no
   recorded size be treated as authored at 24MP.
+
+## The app opens with every section muted (added 2026-08-04)
+
+Requested: the photo should show untouched on boot -- and after Reset -- even
+though the starting point is still `Stock` (or whatever `DEFAULT_PRESET`
+resolves to), and picking a preset from the dropdown or loading a file should
+be the one thing that switches every section on at once.
+
+This is built entirely out of the mute mechanism that already existed for one
+section at a time (`toggleGroup`): muting a group keeps its real values in
+`muted[group]` while the *displayed* values for that group go to
+`schema.neutral`, so un-muting restores exactly what was there. `muteAll(s,
+src)` does that for every group in one pass, seeding each group's kept values
+from `src` -- the starting preset's authored values, not whatever the sliders
+currently show.
+
+Boot and `resetAll` both now call `setValues(schema.neutral)` /
+`setApplied(schema.neutral)` plus `setMuted(muteAll(schema, start.values))`,
+instead of applying `start.values` directly. That is a small but deliberate
+extension of the existing "boot and Reset share `startingValues` so they
+cannot drift" rule: Reset means "how it opened", and now that opening means
+*muted*, Reset has to produce the muted state too, or pressing it would
+un-mute sections that boot left off -- reintroducing exactly the drift the
+shared helper was written to prevent.
+
+`applyPreset` and `loadPreset` both call `setMuted({})` after applying their
+values -- picking a whole look, whether from the menu or from a file, is the
+one thing that is not a partial "try this and see" action, so every section
+goes live rather than staying staged behind its own toggle.
+
+Two things that fall out of this rather than needing separate handling: the
+`Original` button's `disabled={isOriginal}` correctly reads *true* right after
+boot, because `values === schema.neutral` at that point -- the app opens
+already agreeing with its own "show the untouched photo" state, not merely
+looking like it does. And `master_opacity` (excluded from `NEUTRAL_ZERO`
+because 1.0, not 0, is its neutral) is unaffected by any of this: muting the
+Output group still means "no dial-back", exactly as it does when toggled by
+hand.
+
+Verified against a real running instance rather than by inspection: every
+section reads muted on a fresh load, picking a preset flips all twelve to
+enabled in one render, and loading a preset file from disk does the same.
 
 ## Tuning constants (all in engine.py, all calibrated by measurement)
 
