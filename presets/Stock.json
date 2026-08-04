@@ -3,7 +3,7 @@
   "version": 1,
   "name": "Stock",
   "reference_mp": 24,
-  "lut": "Fuji Classic Neg by Seim 1.1",
+  "lut": "ClassicNegative",
   "values": {
     "grade_temp": 0,
     "grade_tint": 0,
