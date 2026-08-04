@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -11,15 +12,21 @@ import {
   exportStatus,
   fetchSource,
   getHealth,
+  getLuts,
   getSchema,
   renderPreview,
   startExport,
   uploadImage,
+  uploadLut,
   type ExportJob,
+  type ExportScale,
   type ImageMeta,
+  type LutInfo,
   type Schema,
   type ViewRequest,
 } from "./api";
+import filmGrain1x1 from "./assets/film-grain-1x1.jpg";
+import filmGrain16x9 from "./assets/film-grain-16x9.jpg";
 
 type Values = Record<string, number>;
 
@@ -38,13 +45,78 @@ const DEBOUNCE_MS = 140;
  *  These used to be constrained to clean fractions because the server cropped
  *  and resampled at the requested zoom, and an awkward factor put the read
  *  origin on a half pixel. Zooming is a pure browser transform now, so the
- *  list is free -- it is only about how the steps feel. */
+ *  list is free -- it is only about how the steps feel. The wheel does not
+ *  step through them; it only borrows the two ends as its limits. */
 const ZOOM_STEPS = [0.05, 0.1, 0.17, 0.25, 0.33, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8];
+
+/** Wheel zoom rate, as an exponent on the scroll delta. A mouse notch is 100
+ *  units in most browsers, so 0.0025 is about 2.8 notches per doubling --
+ *  fast enough to cross the range without hunting, slow enough to land on a
+ *  value. A trackpad pinch arrives as ctrl+wheel with a far smaller delta,
+ *  hence its own rate. */
+const WHEEL_RATE = 0.0025;
+const PINCH_RATE = 0.01;
+
+/** How close to Fit a wheel step has to land before it locks to Fit mode.
+ *
+ *  Fit is a *mode*, not a number: it follows the container, so a window resize
+ *  keeps the whole frame visible. Landing on 0.1997 when fit is 0.2 would look
+ *  identical and quietly lose that, so anything within this fraction of Fit
+ *  becomes Fit outright rather than a very-close zoom value -- a continuous
+ *  control almost never *lands* on a snap point, it crosses it, so a snap that
+ *  only fires on a near-miss is a snap that fires at random.
+ *
+ *  The band is checked on **both** sides of Fit (changed 2026-08-04, on
+ *  request): the wheel used to bottom out at Fit and hand off to the - button
+ *  for anything smaller, which needed only a one-sided `next <= fit` check.
+ *  Scrolling out is not capped there any more -- see `ZOOM_STEPS[0]` below --
+ *  so a one-sided check would now catch *every* zoomed-out value, not just the
+ *  ones near Fit, and the wheel would never leave Fit mode once it reached it. */
+const FIT_SNAP = 0.02;
+
+/** Mount border around the previewed photo, in *screen* pixels.
+ *
+ *  Screen pixels rather than source pixels on purpose. Every spatial parameter
+ *  the engine takes is a length in full-resolution pixels precisely so it means
+ *  the same thing at any zoom -- this is the opposite kind of quantity. It is
+ *  furniture around the viewport, not part of the picture, so it must hold its
+ *  apparent thickness as you zoom instead of growing to fill the pane at 800%.
+ *
+ *  The shadow allowance is added to the border when reserving room for Fit.
+ *  Without it the mount lands exactly on the pane's edge and `overflow: hidden`
+ *  eats the shadow, which is the half of the effect that separates the photo
+ *  from the background. It has to cover the blur radius plus the vertical
+ *  offset, not just one of them -- at a wide frame the mount nearly fills the
+ *  pane and there is no background left to darken, so an allowance that is
+ *  merely close leaves the shadow visible at 18px and gone at 96px. */
+const FRAME_MAX = 96;
+const FRAME_DEFAULT = 30;
+const FRAME_SHADOW_BLUR = 24;
+const FRAME_SHADOW_DROP = 8;
+const FRAME_SHADOW_ROOM = FRAME_SHADOW_BLUR + FRAME_SHADOW_DROP;
+
+/** Breathing room Fit leaves on every side, in screen pixels, whether or not
+ *  the mount is on. Fit used to size the image to the exact pane, so it butted
+ *  straight against the panel edge with no margin to judge it against -- this
+ *  reserves the same kind of room the mount does, just always on rather than
+ *  only with Frame enabled. */
+const FIT_PADDING = 30;
 
 /** Marker written into saved preset files. Only used to make a hand-inspected
  *  file self-describing -- loading deliberately does not require it, so a bare
  *  `{"intensity": 40}` typed by hand still works. */
 const PRESET_FORMAT = "film-grain-preset";
+
+/** Section the LUT picker is rendered into, immediately above its own Mix
+ *  slider.
+ *
+ *  The panel is generated from the schema and hand-adding a *slider* here would
+ *  be a bug — the schema is the single source of truth for parameters. A LUT is
+ *  not a parameter: it is a named resource, like a preset file, so it cannot be
+ *  a number in the schema and there is nothing for the generator to pick up. It
+ *  is placed by key rather than at the top or bottom of the section so the panel
+ *  reads in pipeline order: the four adjustments, then the LUT they feed. */
+const LUT_ANCHOR_KEY = "lut_amount";
 
 export default function App() {
   const [schema, setSchema] = useState<Schema | null>(null);
@@ -59,6 +131,9 @@ export default function App() {
   const [device, setDevice] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Drop-target highlight for the Open image button. A drop is invisible
+  // otherwise -- there is nothing to tell you the button will take the file.
+  const [dropping, setDropping] = useState(false);
 
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [sourceUrl, setSourceUrl] = useState<string | null>(null);
@@ -75,6 +150,10 @@ export default function App() {
   const [split, setSplit] = useState(1); // 1 = fully processed
   const [showBefore, setShowBefore] = useState(false);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  /** Which sections are switched off, and what they will restore to. Declared
+   *  up here rather than beside `toggleGroup` below because boot now reads it
+   *  too -- the app opens with every section muted, see `muteAll`. */
+  const [muted, setMuted] = useState<Record<string, Values>>({});
 
   /** Megapixels of the image the current values were dialled in on. Sent with
    *  every render so the server rescales lengths to whatever photo is loaded;
@@ -82,7 +161,29 @@ export default function App() {
   const [referenceMp, setReferenceMp] = useState<number | null>(null);
   const [scaleToRef, setScaleToRef] = useState(true);
 
+  /** Reroll `seed` and `texture_seed` whenever a photo is opened, so different
+   *  photos do not render with the identical grain and damage pattern -- both
+   *  are deterministic by design (that is what makes them re-orderable at
+   *  all), so left alone they are the *same* deterministic pattern on every
+   *  photo. On by default: a repeated seed is the surprising outcome, not the
+   *  wanted one. */
+  const [randomizeSeedOnOpen, setRandomizeSeedOnOpen] = useState(true);
+
+  /** Available LUTs, and which one is selected. The selection is its own state
+   *  rather than a value in `values` because it is a name, not a number — see
+   *  LUT_ANCHOR_KEY. It travels with the values everywhere they go: into a
+   *  render request, into an export, into a saved preset file, and back out of
+   *  one. Muting the section zeroes `lut_amount` and leaves this alone, which is
+   *  how every other "what it was set to" survives a mute. */
+  const [luts, setLuts] = useState<LutInfo[]>([]);
+  const [lut, setLut] = useState<string | null>(null);
+  const lutFileRef = useRef<HTMLInputElement | null>(null);
+
   const [format, setFormat] = useState("jpeg");
+  /** Full resolution, or the proxy exactly as previewed. Not a size choice:
+   *  the proxy renders every length at proxy scale, so its grain is the grain
+   *  on screen. Downscaling a 1:1 export to the same pixels would not match. */
+  const [exportScale, setExportScale] = useState<ExportScale>("full");
   const [job, setJob] = useState<ExportJob | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
@@ -97,20 +198,44 @@ export default function App() {
    *  the two cannot drift -- "reset" meaning something different from "how it
    *  opened" is its own small bug. */
   const startingValues = useCallback(
-    (s: Schema): { values: Values; referenceMp: number | null } => {
+    (s: Schema): { values: Values; referenceMp: number | null; lut: string | null } => {
       const v: Values = {};
       for (const p of s.params) v[p.key] = p.default;
       const preset = s.presets.find((x) => x.name === s.default_preset);
-      // The reference size travels with the values. Returning it here rather
-      // than only in applyPreset is the point: boot and Reset go through this
-      // path, so without it the app opened on Stock with size scaling inert
-      // until you re-picked Stock from the dropdown by hand.
+      // The reference size travels with the values, and so does the LUT name.
+      // Returning them here rather than only in applyPreset is the point: boot
+      // and Reset go through this path, so without it the app opened on Stock
+      // with size scaling inert until you re-picked Stock from the dropdown by
+      // hand.
       return preset
-        ? { values: { ...v, ...preset.values }, referenceMp: preset.reference_mp }
-        : { values: v, referenceMp: null };
+        ? {
+            values: { ...v, ...preset.values },
+            referenceMp: preset.reference_mp,
+            lut: preset.lut ?? null,
+          }
+        : { values: v, referenceMp: null, lut: null };
     },
     [],
   );
+
+  /** Mute every section at once, the way pressing every section's own mute
+   *  button would -- each group's *kept* values come from `src` (the starting
+   *  preset), while the group's live values are neutral, exactly like
+   *  `toggleGroup` does for one section. This is what boot and Reset show: the
+   *  photo opens untouched, with the starting preset's whole look sitting
+   *  behind the "○" buttons rather than applied. Picking a preset or loading a
+   *  file is the only thing that clears this and turns every section on -- see
+   *  `applyPreset` and `loadPreset`. */
+  const muteAll = (s: Schema, src: Values): Record<string, Values> => {
+    const m: Record<string, Values> = {};
+    for (const g of s.groups) {
+      const keys = s.params.filter((p) => p.group === g).map((p) => p.key);
+      const keep: Values = {};
+      for (const k of keys) keep[k] = src[k];
+      m[g] = keep;
+    }
+    return m;
+  };
 
   // ---------------------------------------------------------------- boot --
   useEffect(() => {
@@ -118,13 +243,23 @@ export default function App() {
       .then((s) => {
         setSchema(s);
         const start = startingValues(s);
-        setValues(start.values);
-        setApplied(start.values);
+        // The starting preset's values are held as "muted" rather than applied
+        // -- the app opens showing the untouched photo, with every section's
+        // Stock look one click away on its own toggle rather than already on.
+        setValues(s.neutral);
+        setApplied(s.neutral);
         setReferenceMp(start.referenceMp);
+        setLut(start.lut);
+        setMuted(muteAll(s, start.values));
       })
       .catch((e) => setError(String(e.message ?? e)));
     getHealth()
       .then((h) => setDevice(h.device))
+      .catch(() => undefined);
+    // A missing or unreadable luts/ folder is not an error worth a banner --
+    // the picker just offers nothing but "None".
+    getLuts()
+      .then(setLuts)
       .catch(() => undefined);
   }, []);
 
@@ -163,8 +298,9 @@ export default function App() {
       params: applied,
       supersample,
       reference_mp: scaleToRef ? referenceMp : null,
+      lut,
     };
-  }, [meta, applied, supersample, referenceMp, scaleToRef]);
+  }, [meta, applied, supersample, referenceMp, scaleToRef, lut]);
 
   // The untouched image is the same bytes for the life of an upload, and it is
   // now a full-resolution PNG -- so it is fetched once here rather than riding
@@ -249,6 +385,7 @@ export default function App() {
       setRenderMs(0);
       setMeta(m);
       setJob(null);
+      if (randomizeSeedOnOpen) randomizeSeeds();
     } catch (e: any) {
       setError(String(e.message ?? e));
     }
@@ -264,7 +401,9 @@ export default function App() {
         format,
         supersample,
         quality: 95,
+        scale: exportScale,
         reference_mp: scaleToRef ? referenceMp : null,
+        lut,
       });
       const poll = async () => {
         const s = await exportStatus(id);
@@ -292,13 +431,215 @@ export default function App() {
       .filter((g) => g.params.length > 0);
   }, [schema]);
 
-  const setValue = (k: string, v: number) => setValues((s) => ({ ...s, [k]: v }));
+  const groupOf = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const p of schema?.params ?? []) m[p.key] = p.group;
+    return m;
+  }, [schema]);
+
+  /** Touching a control in a muted section switches that section back on.
+   *
+   *  What gets applied is not just the edit: it is the section's *kept* values
+   *  restored — exactly what clicking its own ● would do — with the edit laid on
+   *  top. Without that, un-muting by editing would quietly discard whatever the
+   *  rest of the section had been holding.
+   *
+   *  This matters far more than it used to. The app opens with every section
+   *  muted, so an edit to a muted section is no longer an odd case, it is the
+   *  first thing anybody does — and the state it left behind was incoherent
+   *  both ways round: the edit applied and rendered while the section's switch
+   *  still read "off", and a mute/un-mute round trip then reverted it to the
+   *  snapshot taken at mute time. Measured in a real browser: pick a LUT on a
+   *  fresh load, toggle the section off and on, and the mix went back to 0.
+   *
+   *  Split into a pure half and a side-effecting half on purpose: a `setMuted`
+   *  call inside a `setValues` updater would run twice under StrictMode. */
+  const keptFor = (k: string): Values | null => {
+    const g = groupOf[k];
+    return g && muted[g] ? muted[g] : null;
+  };
+
+  const liveFor = (k: string) => {
+    const g = groupOf[k];
+    if (!g || !muted[g]) return;
+    setMuted((m) => {
+      const n = { ...m };
+      delete n[g];
+      return n;
+    });
+  };
+
+  const setValue = (k: string, v: number) => {
+    const keep = keptFor(k);
+    setValues((s) => ({ ...s, ...keep, [k]: v }));
+    liveFor(k);
+  };
 
   /** Hand the live values to the renderer. Passing the ref's current object
    *  means an uncommitted gesture is a no-op: React bails out when the state
    *  is set to the identical reference, so this costs nothing when nothing
    *  moved. */
   const commit = useCallback(() => setApplied(valuesRef.current), []);
+
+  /** Set a value *and* render it, in one gesture.
+   *
+   *  `setValue` followed by `commit()` does not work and looks like it should:
+   *  `commit` reads `valuesRef`, which is only refreshed during render, so
+   *  called synchronously it applies the value from *before* the change.
+   *  Sliders never noticed because their `pointerup` arrives a render later
+   *  and commits the right thing; a menu has no second event, so a selection
+   *  did nothing until the control lost focus. Building the next object here
+   *  and handing it to both setters keeps them in step. */
+  const setValueNow = (k: string, v: number) => {
+    const next = { ...valuesRef.current, ...keptFor(k), [k]: v };
+    setValues(next);
+    setApplied(next);
+    liveFor(k);
+  };
+
+  /** Reroll the grain and texture seeds for a freshly opened photo.
+   *
+   *  Deliberately *not* two `setValueNow` calls: each one independently reads
+   *  `valuesRef.current` and hands a whole replacement object to `setValues`,
+   *  so the second call's object is built without the first call's edit in it
+   *  and silently drops it -- the same stale-snapshot trap `setValueNow`'s own
+   *  comment documents for `commit()`. Both seeds are folded into one object
+   *  here instead.
+   *
+   *  And deliberately *not* `setValueNow` at all for a muted group: that
+   *  un-mutes on the reasoning that a real edit means "I want this section
+   *  live now," which does not hold for a reroll nobody asked for by name --
+   *  opening a photo silently switching a muted section back on would be a
+   *  far bigger surprise than a repeated seed. A muted group's kept snapshot
+   *  is updated in place instead, so the new seed is there and rendering the
+   *  moment the section is switched on by hand, same as any other value a
+   *  mute round trip is expected to preserve. */
+  const randomizeSeeds = () => {
+    const seedVal = Math.floor(Math.random() * 10000);
+    const textureVal = Math.floor(Math.random() * 10000);
+    const rolls: [string, string, number][] = [
+      ["seed", "Grain Structure", seedVal],
+      ["texture_seed", "Film Texture", textureVal],
+    ];
+
+    const liveNext: Values = {};
+    let mutedNext: Record<string, Values> | null = null;
+    for (const [key, group, val] of rolls) {
+      if (muted[group]) {
+        const base: Record<string, Values> = mutedNext ?? muted;
+        mutedNext = { ...base, [group]: { ...base[group], [key]: val } };
+      } else {
+        liveNext[key] = val;
+      }
+    }
+
+    if (mutedNext) setMuted(mutedNext);
+    if (Object.keys(liveNext).length) {
+      const next = { ...valuesRef.current, ...liveNext };
+      setValues(next);
+      setApplied(next);
+    }
+  };
+
+  /** One parameter's control, generated from the schema.
+   *
+   *  Extracted from the panel's map so the LUT picker can be interleaved into
+   *  the same list without duplicating any of this. It is still the only place a
+   *  control is built from a `Param`, which is the rule that matters: adding a
+   *  parameter means adding a `Param` in `params.py` and nothing here. */
+  const paramControl = (p: Schema["params"][number]) =>
+    // A discrete parameter is a menu, not a slider. It is still a plain number
+    // everywhere else -- in the schema, in the engine and in a preset file -- so
+    // this is the only place that knows the difference.
+    p.choices?.length ? (
+      <div className="slider">
+        <div className="slabel">
+          <Help text={p.help} label={p.label} />
+        </div>
+        <select
+          value={String(values[p.key] ?? p.default)}
+          onChange={(e) => setValueNow(p.key, Number(e.target.value))}
+        >
+          {p.choices.map((c, i) => (
+            <option key={c} value={i}>
+              {c}
+            </option>
+          ))}
+        </select>
+      </div>
+    ) : (
+      <div className="slider">
+        <div className="slabel">
+          <Help text={p.help} label={p.label} />
+          <input
+            className="num"
+            type="number"
+            min={p.min}
+            max={p.max}
+            step={p.step}
+            value={values[p.key] ?? p.default}
+            onChange={(e) => setValue(p.key, Number(e.target.value))}
+            onKeyUp={commit}
+            onBlur={commit}
+          />
+          {p.unit && <em>{p.unit}</em>}
+        </div>
+        <input
+          type="range"
+          min={p.min}
+          max={p.max}
+          step={p.step}
+          value={values[p.key] ?? p.default}
+          onChange={(e) => setValue(p.key, Number(e.target.value))}
+          // Pointer releases come from the window listener above; these cover
+          // the keyboard path (arrows nudge the thumb without ever producing a
+          // pointer event).
+          onKeyUp={commit}
+          onBlur={commit}
+        />
+      </div>
+    );
+
+  /** Pick a LUT (or clear it), and switch the stage on if it was off.
+   *
+   *  Bumping Mix from 0 to 1 is the one bit of behaviour here that is not
+   *  mechanical, and it is deliberate: Mix ships at 0 like every other stage in
+   *  the app, so a freshly-picked LUT would otherwise change nothing at all and
+   *  read as broken. A Mix the user has already moved is left exactly where they
+   *  put it — this only fires on a stage that is genuinely off. Clearing the LUT
+   *  leaves Mix alone, so re-picking one returns you to the strength you had.
+   *
+   *  Both setters, one gesture: `setValue` then `commit()` would apply the
+   *  *previous* value here, for the reason `setValueNow` documents — a menu has
+   *  no pointerup to clean up after it. */
+  const pickLut = (id: string | null) => {
+    setLut(id);
+    if (id && (valuesRef.current[LUT_ANCHOR_KEY] ?? 0) <= 0) {
+      // Goes through setValueNow, so it also switches the section on -- see
+      // keptFor/liveFor. On a fresh load every section is muted, and a LUT that
+      // renders while its own section reads "off" is the incoherent state that
+      // pair exists to prevent.
+      setValueNow(LUT_ANCHOR_KEY, 1);
+    } else if (id) {
+      liveFor(LUT_ANCHOR_KEY);
+    }
+    // Clearing it needs neither: `lut` is part of the render request, so
+    // changing it re-fires the render effect on its own, and "no LUT" is not a
+    // reason to switch a muted section back on.
+  };
+
+  const onLutFile = async (file: File) => {
+    try {
+      const info = await uploadLut(file);
+      setLuts((ls) => [...ls.filter((x) => x.id !== info.id), info]);
+      pickLut(info.id);
+      setError(null);
+      setNotice(`Loaded LUT ${info.name} (${info.size}³)`);
+    } catch (e: any) {
+      setNotice(null);
+      setError(`Could not load ${file.name}: ${e.message ?? e}`);
+    }
+  };
 
   // A drag that ends outside the slider -- release the mouse over the image,
   // or flick past the panel edge -- never delivers `pointerup` to the input,
@@ -334,6 +675,12 @@ export default function App() {
 
   // Presets and reset are single discrete actions, not gestures, so they go
   // straight through to the renderer.
+  //
+  // Picking a preset is the one thing that turns every section on: it is a
+  // deliberate "use this whole look", unlike boot or Reset which stage the
+  // preset's values behind each section's mute button instead. `setMuted({})`
+  // clears any muting left over from boot, from Reset, or from switching
+  // sections off by hand.
   const applyPreset = (name: string) => {
     const p = schema?.presets.find((x) => x.name === name);
     if (!p) return;
@@ -341,17 +688,27 @@ export default function App() {
     // one; the server rescales lengths by the linear ratio, but only if it is
     // told what size the values were authored at.
     setReferenceMp(p.reference_mp ?? null);
+    // The LUT is part of the look, so it comes along -- including its absence.
+    // A preset with no LUT has to *clear* one that is selected, or the last
+    // look's grade would keep riding under the new one.
+    setLut(p.lut ?? null);
     const v = { ...values, ...p.values };
     setValues(v);
     setApplied(v);
+    setMuted({});
   };
 
+  // "How it opened" has to mean what boot shows, muted sections included --
+  // otherwise Reset and a fresh load would disagree about the starting point,
+  // which is exactly the small bug `startingValues` is written to avoid.
   const resetAll = () => {
     if (!schema) return;
     const start = startingValues(schema);
-    setValues(start.values);
-    setApplied(start.values);
+    setValues(schema.neutral);
+    setApplied(schema.neutral);
     setReferenceMp(start.referenceMp);
+    setLut(start.lut);
+    setMuted(muteAll(schema, start.values));
   };
 
   /** Switch the whole pipeline off, so the preview is the untouched photo.
@@ -367,8 +724,6 @@ export default function App() {
   /** Switch one section off, same idea. Reaching for this is usually "is this
    *  section even earning its keep" -- so it toggles: press it again and the
    *  section comes back exactly as it was. */
-  const [muted, setMuted] = useState<Record<string, Values>>({});
-
   const toggleGroup = (group: string) => {
     if (!schema) return;
     const keys = schema.params.filter((x) => x.group === group).map((x) => x.key);
@@ -470,6 +825,11 @@ export default function App() {
       // Falls back to whatever it was loaded with, so re-saving a preset you
       // did not author here does not silently re-base it onto this image.
       reference_mp: referenceMp ?? meta?.megapixels ?? null,
+      // A sibling of `values`, not one of them -- a LUT is named, not numbered.
+      // An uploaded LUT's id will not resolve in a future session; that is the
+      // honest thing to write, and the picker shows the name as missing rather
+      // than the app pretending the grade is still there.
+      lut,
       values: Object.fromEntries(
         // Written in schema order, not insertion order, so a hand-edited file
         // stays readable and two saves diff cleanly.
@@ -501,9 +861,16 @@ export default function App() {
       const raw = JSON.parse(await file.text());
       const { values: v, dropped } = coerce(raw);
       if (typeof raw?.reference_mp === "number") setReferenceMp(raw.reference_mp);
+      // Set unconditionally, `null` included: a file with no LUT describes a
+      // look that has none, and leaving the previous selection in place would
+      // silently blend two grades.
+      setLut(typeof raw?.lut === "string" && raw.lut ? raw.lut : null);
       setValues(v);
       setApplied(v); // discrete action -- render straight away
-        setError(null);
+      // A loaded file is a whole look too, same as picking one from the menu --
+      // every section goes live rather than staying behind its mute button.
+      setMuted({});
+      setError(null);
       setNotice(
         dropped.length
           ? `Loaded ${file.name} — ignored unknown key${
@@ -522,11 +889,28 @@ export default function App() {
     <div className="app">
       <header className="bar">
         <div className="brand">
-          <span className="dot" />
+          <img src={filmGrain1x1} alt="Film grain" className="film-grain-icon" />
           Film Grain Engine
         </div>
-        <label className="btn">
-          Open image
+        <label
+          className={`btn${dropping ? " dropping" : ""}`}
+          // dragOver has to preventDefault on *every* event, not just the
+          // first: the browser reads the absence of it as "this target does
+          // not accept drops" and falls back to navigating to the file.
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "copy";
+            if (!dropping) setDropping(true);
+          }}
+          onDragLeave={() => setDropping(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDropping(false);
+            const f = e.dataTransfer.files?.[0];
+            if (f) onFile(f);
+          }}
+        >
+          Open image (drop here)
           <input
             type="file"
             accept="image/jpeg,image/png"
@@ -541,6 +925,22 @@ export default function App() {
             }}
           />
         </label>
+        <label
+          className="checkfield"
+          title={
+            "Reroll the grain Seed and Texture Seed whenever a photo is " +
+            "opened, so different photos don't render with the identical " +
+            "grain and damage pattern. Off keeps whatever seeds are " +
+            "currently dialled in."
+          }
+        >
+          <input
+            type="checkbox"
+            checked={randomizeSeedOnOpen}
+            onChange={(e) => setRandomizeSeedOnOpen(e.target.checked)}
+          />
+          With random seed
+        </label>
         {meta && (
           <span className="meta">
             {meta.name} · {meta.width}×{meta.height} · {meta.megapixels}MP
@@ -548,6 +948,7 @@ export default function App() {
         )}
         <div className="spacer" />
         <span className={`status ${rendering ? "busy" : ""}`}>
+          {rendering && <div className="spinner" />}
           {rendering ? "rendering…" : `${renderMs}ms`}
         </span>
         <span className="meta">{device}</span>
@@ -559,51 +960,26 @@ export default function App() {
           previewUrl={previewUrl}
           sourceUrl={sourceUrl}
           compare={compare}
-          split={showBefore ? 0 : split}
+          onCompare={setCompare}
+          split={split}
+          onSplit={setSplit}
+          showBefore={showBefore}
+          onShowBefore={setShowBefore}
           previewFull={previewFull}
           onFile={onFile}
+          rendering={rendering}
+          job={job}
         />
 
         <aside className="panel">
           {error && <div className="err">{error}</div>}
 
-          <Field label="Compare">
-            <div className="row">
-              <button
-                className={compare === "overlay" ? "seg on" : "seg"}
-                onClick={() => setCompare("overlay")}
-              >
-                Overlay
-              </button>
-              <button
-                className={compare === "side" ? "seg on" : "seg"}
-                onClick={() => setCompare("side")}
-              >
-                Side by side
-              </button>
-            </div>
-          </Field>
-          {compare === "overlay" && (
-            <Field label="Wipe">
-              <button
-                className={showBefore ? "swap on" : "swap"}
-                onClick={() => setShowBefore((v) => !v)}
-                disabled={!meta}
-                title="Swap before/after — or hold B"
-              >
-                {showBefore ? "Before" : "After"}
-              </button>
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.001}
-                value={split}
-                disabled={showBefore}
-                onChange={(e) => setSplit(Number(e.target.value))}
-              />
-            </Field>
-          )}
+          <img src={filmGrain16x9} alt="Film grain sample" className="film-grain-preview" />
+
+          {/* Compare and Wipe used to live here. They are on the preview's own
+              bar now: they are things you do *to the view*, like zoom, and
+              having them in the panel meant looking away from the photo to
+              drive a wipe across it. */}
           {meta && (
             <Field label="Size scaling">
               <button
@@ -695,7 +1071,8 @@ export default function App() {
             drops back to the proxy.
           </p>
           <p className="hint">
-            Zoom and pan live on the preview itself and never re-render.
+            Scroll over the photo to zoom about the pointer, drag to pan.
+            Neither re-renders.
           </p>
 
           <Field label="Quality">
@@ -808,53 +1185,111 @@ export default function App() {
                 </h3>
                 {!collapsed[group] &&
                   params.map((p) => (
-                    <div className="slider" key={p.key}>
-                      <div className="slabel">
-                        <Help text={p.help} label={p.label} />
-                        <input
-                          className="num"
-                          type="number"
-                          min={p.min}
-                          max={p.max}
-                          step={p.step}
-                          value={values[p.key] ?? p.default}
-                          onChange={(e) =>
-                            setValue(p.key, Number(e.target.value))
-                          }
-                          onKeyUp={commit}
-                          onBlur={commit}
+                    <Fragment key={p.key}>
+                      {/* The LUT picker. Not a parameter and so not generated
+                          from the schema -- a LUT is a named resource, like a
+                          preset file. Anchored to its own Mix slider so the
+                          section still reads in pipeline order. */}
+                      {p.key === LUT_ANCHOR_KEY && (
+                        <LutPicker
+                          luts={luts}
+                          value={lut}
+                          onPick={pickLut}
+                          onLoadFile={() => lutFileRef.current?.click()}
                         />
-                        {p.unit && <em>{p.unit}</em>}
-                      </div>
-                      <input
-                        type="range"
-                        min={p.min}
-                        max={p.max}
-                        step={p.step}
-                        value={values[p.key] ?? p.default}
-                        onChange={(e) => setValue(p.key, Number(e.target.value))}
-                        // Pointer releases come from the window listener above;
-                        // these cover the keyboard path (arrows nudge the thumb
-                        // without ever producing a pointer event).
-                        onKeyUp={commit}
-                        onBlur={commit}
-                      />
-                    </div>
+                      )}
+                      {paramControl(p)}
+                    </Fragment>
                   ))}
               </section>
             ))}
           </div>
+          <input
+            ref={lutFileRef}
+            type="file"
+            accept=".cube"
+            hidden
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              // Cleared for the reason the image and preset pickers are: without
+              // it, re-picking the same file fires no change event at all.
+              e.target.value = "";
+              if (f) onLutFile(f);
+            }}
+          />
 
           <div className="export">
+            <select
+              value={exportScale}
+              onChange={(e) => setExportScale(e.target.value as ExportScale)}
+            >
+              <option value="full">
+                Full size{meta ? ` — ${meta.width}×${meta.height}` : ""}
+              </option>
+              <option value="preview">
+                As previewed
+                {meta ? ` — ${meta.proxy_width}×${meta.proxy_height}` : ""}
+              </option>
+              <option value="preview_full">
+                As previewed, full size
+                {meta ? ` — ${meta.width}×${meta.height}` : ""}
+              </option>
+            </select>
             <select value={format} onChange={(e) => setFormat(e.target.value)}>
               <option value="jpeg">JPEG 95</option>
               <option value="png16">PNG 16-bit</option>
               <option value="png8">PNG 8-bit</option>
             </select>
-            <button className="btn primary" onClick={doExport} disabled={!meta}>
-              Export full size
-            </button>
           </div>
+          <button
+            className="btn primary export-go"
+            onClick={doExport}
+            disabled={!meta}
+          >
+            {exportScale === "preview"
+              ? "Export as previewed"
+              : exportScale === "preview_full"
+              ? "Export as previewed, full size"
+              : "Export full size"}
+          </button>
+          {exportScale === "preview" && (
+            <p className="hint">
+              {meta && meta.proxy_width >= meta.width ? (
+                <>
+                  This photo is already smaller than the proxy, so every option
+                  renders the same pixels.
+                </>
+              ) : (
+                <>
+                  Writes the proxy render itself — the grain you are looking at,
+                  not a downscale of the 1:1 render. Every length scales with the
+                  frame, so at full size the same settings resolve finer, denser
+                  grain; if the preview is the look you want, this is the file
+                  that has it.
+                </>
+              )}
+            </p>
+          )}
+          {exportScale === "preview_full" && (
+            <p className="hint">
+              {meta && meta.proxy_width >= meta.width ? (
+                <>
+                  This photo is already smaller than the proxy, so every option
+                  renders the same pixels.
+                </>
+              ) : (
+                <>
+                  The proxy render above, enlarged to {meta?.width}×{meta?.height}
+                  — a pixel match to what is on screen, not a fresh full-resolution
+                  render. It adds no detail: zoomed in, the grain is the same
+                  softer proxy texture, just bigger, not the finer grain "Full
+                  size" would resolve at this scale. Reach for this when the
+                  preview's look is what you want to keep, in a file sized for
+                  printing or sharing at full size.
+                </>
+              )}
+            </p>
+          )}
           {job && job.status !== "done" && (
             <div className="job">
               {job.status === "error" ? (
@@ -933,6 +1368,73 @@ function Help({ text, label }: { text: string; label: string }) {
   );
 }
 
+/** The 3D LUT selector: everything in `luts/`, everything uploaded this
+ *  session, and a button to add one.
+ *
+ *  A LUT that is selected but absent from the list gets its own entry rather
+ *  than silently resetting the menu to None. That happens for real -- a preset
+ *  file naming a `.cube` that has since been renamed, or an upload from a
+ *  previous run, since those live in process memory. Showing "missing" is the
+ *  honest state: the server renders with no LUT and zeroes the mix, so the
+ *  picture is right, and the picker says why rather than looking like the
+ *  preset had no LUT in it.
+ *
+ *  Sizes are shown for uploads because they were parsed on the way in. Folder
+ *  entries do not report one -- listing them deliberately does not open them,
+ *  so a directory of 64-cubes costs nothing to browse. */
+function LutPicker(props: {
+  luts: LutInfo[];
+  value: string | null;
+  onPick: (id: string | null) => void;
+  onLoadFile: () => void;
+}) {
+  const { luts, value } = props;
+  const missing = !!value && !luts.some((l) => l.id === value);
+  return (
+    <div className="slider lutpick">
+      <div className="slabel">
+        <span className="title">LUT</span>
+        <button
+          className="seg"
+          onClick={props.onLoadFile}
+          title="Load a .cube file from disk for this session"
+        >
+          Load .cube…
+        </button>
+      </div>
+      <select
+        value={value ?? ""}
+        onChange={(e) => props.onPick(e.target.value || null)}
+      >
+        <option value="">None</option>
+        {missing && <option value={value!}>{lutLabel(value!)} — missing</option>}
+        {luts.map((l) => (
+          <option key={l.id} value={l.id}>
+            {l.name}
+            {l.size ? ` (${l.size}³)` : ""}
+            {l.source === "upload" ? " — loaded" : ""}
+          </option>
+        ))}
+      </select>
+      {missing && (
+        <p className="hint">
+          This look wants a LUT called <strong>{lutLabel(value!)}</strong>, which
+          is not in <code>luts/</code>
+          {value!.startsWith("upload:")
+            ? " — it was loaded from disk in an earlier session, so it has to be loaded again."
+            : " — drop the .cube file in there, or load it from disk."}{" "}
+          Nothing is being applied in the meantime.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** A LUT id as something to show a person. Uploads carry an opaque id, so there
+ *  is nothing better to print for one that is no longer loaded. */
+const lutLabel = (id: string) =>
+  id.startsWith("upload:") ? "a loaded file" : id;
+
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="field">
@@ -961,23 +1463,48 @@ function Stage(props: {
   previewUrl: string | null;
   sourceUrl: string | null;
   compare: Compare;
+  onCompare: (c: Compare) => void;
   split: number;
+  onSplit: (v: number) => void;
+  showBefore: boolean;
+  onShowBefore: (v: boolean) => void;
   previewFull: boolean;
   onFile: (f: File) => void;
+  rendering: boolean;
+  job: ExportJob | null;
 }) {
-  const { meta, previewUrl, sourceUrl, compare, split, previewFull } = props;
+  const { meta, previewUrl, sourceUrl, compare, previewFull, rendering, job } = props;
+  // Holding B peeks at the original outright, which is the wipe pushed all the
+  // way over rather than a separate mode -- so it is resolved here, once,
+  // instead of every consumer remembering to check both.
+  const split = props.showBefore ? 0 : props.split;
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const drag = useRef<{ x: number; y: number; cx: number; cy: number } | null>(null);
+  // The wheel handler's memory of an in-flight zoom excursion that is
+  // currently snap-displayed as Fit -- see the wheel handler below for why
+  // this has to persist independent of the displayed zoom. Cleared wherever
+  // Fit is set for a reason *other* than the wheel handler's own snap, so a
+  // fresh "go to Fit" never inherits a stale excursion from a previous scroll.
+  const wheelContRef = useRef<number | null>(null);
   // null = fit: follow the container instead of holding a fixed factor, so
   // resizing the window keeps the whole frame visible.
   const [zoom, setZoom] = useState<number | null>(null);
   const [center, setCenter] = useState({ x: 0.5, y: 0.5 });
   const [pane, setPane] = useState({ w: 0, h: 0 });
+  // A mount border and a drop shadow around the photo. Purely a view control,
+  // which is why it lives here and on the viewbar rather than in `params.py`:
+  // it changes nothing about the render and nothing about an export. The point
+  // is judging the picture, not decorating it -- a photograph butted straight
+  // against a dark panel reads darker and flatter than it is, and the edge of
+  // the frame stops being visible at all where the picture goes to black.
+  const [frame, setFrame] = useState(true);
+  const [frameWidth, setFrameWidth] = useState(FRAME_DEFAULT);
 
   // A new image inherits neither the old pan nor the old magnification -- a
   // corner crop of the last photo is never where you want to land.
   useEffect(() => {
     setCenter({ x: 0.5, y: 0.5 });
+    wheelContRef.current = null;
     setZoom(null);
   }, [props.meta?.id]);
 
@@ -1000,11 +1527,107 @@ function Stage(props: {
 
   const iw = meta?.width ?? 1;
   const ih = meta?.height ?? 1;
-  const fitZoom = Math.min(pane.w / iw, pane.h / ih) || 1;
+  // Fit means "the whole thing is visible", and with a mount on, the mount is
+  // part of the whole thing -- so the room it needs comes out of the fit before
+  // the zoom is computed. Reserved on both axes because the border is drawn on
+  // all four sides. Left out of `place()`'s clamping, which works in image
+  // coordinates: the mount hangs outside the image box and never moves it.
+  //
+  // FIT_PADDING is added unconditionally, mount or no mount: Fit used to size
+  // the image to the exact pane, leaving no margin to judge it against the
+  // panel behind it.
+  const inset = FIT_PADDING + (frame ? frameWidth + FRAME_SHADOW_ROOM : 0);
+  const fitZoom =
+    Math.min(
+      Math.max(pane.w - 2 * inset, 1) / iw,
+      Math.max(pane.h - 2 * inset, 1) / ih,
+    ) || 1;
   const eff = zoom ?? fitZoom;
   const dw = iw * eff;
   const dh = ih * eff;
   const canPan = dw > pane.w + 1 || dh > pane.h + 1;
+
+  // Live geometry for the wheel handler below. That listener is attached once
+  // and by hand, so without this it would close over whatever zoom happened to
+  // be current when it was attached and every notch would zoom from the same
+  // starting point.
+  const geom = useRef({ eff: 1, fit: 1, iw: 1, ih: 1, pane: { w: 0, h: 0 }, zoomIsNull: true });
+  geom.current = { eff, fit: fitZoom, iw, ih, pane, zoomIsNull: zoom === null };
+
+  // Scroll to zoom, anchored on the pointer.
+  //
+  // Attached by hand rather than as an `onWheel` prop because React registers
+  // wheel listeners as *passive*, where preventDefault is a no-op -- so the
+  // React version would zoom the photo and scroll the page underneath it at
+  // the same time.
+  //
+  // Anchoring is the part that makes it feel like anything: the image point
+  // under the cursor has to still be under the cursor afterwards, or zooming
+  // in on a detail walks it off the screen and you pan it back every time.
+  // The anchor is read from the frame's own rect rather than recomputed from
+  // `center`, so it accounts for the clamping in place() for free.
+  useEffect(() => {
+    const host = wrapRef.current?.querySelector(".panes");
+    if (!host) return;
+
+    const onWheel = (e: WheelEvent) => {
+      const paneEl = (e.target as Element | null)?.closest?.(".pane");
+      const frame = paneEl?.querySelector(".frame") as HTMLElement | null;
+      if (!paneEl || !frame) return;
+      e.preventDefault();
+
+      const g = geom.current;
+      // deltaY is in pixels, lines or pages depending on the browser and the
+      // device; Firefox reports lines for a mouse wheel.
+      const dy =
+        e.deltaMode === 1
+          ? e.deltaY * 16
+          : e.deltaMode === 2
+            ? e.deltaY * (g.pane.h || 400)
+            : e.deltaY;
+      const rate = e.ctrlKey ? PINCH_RATE : WHEEL_RATE;
+      const hi = ZOOM_STEPS[ZOOM_STEPS.length - 1];
+      // Same floor as the - button (changed 2026-08-04, on request): the wheel
+      // used to bottom out at Fit and required the button for anything smaller,
+      // which is a floor a continuous gesture should not have needed to defer to
+      // a click for.
+      const lo = ZOOM_STEPS[0];
+      // The true starting point for this tick: the in-flight excursion if the
+      // display is currently snapped to Fit and one is recorded, otherwise the
+      // displayed value itself (there is nothing hidden to recover).
+      const from =
+        g.zoomIsNull && wheelContRef.current !== null ? wheelContRef.current : g.eff;
+      const next = Math.min(hi, Math.max(lo, from * Math.exp(-dy * rate)));
+      if (Math.abs(next - from) < 1e-6) return;
+
+      const fr = frame.getBoundingClientRect();
+      const pr = paneEl.getBoundingClientRect();
+      // Where the cursor is on the image, 0..1, and where it is in the pane.
+      const u = (e.clientX - fr.left) / fr.width;
+      const v = (e.clientY - fr.top) / fr.height;
+      const px = e.clientX - pr.left;
+      const py = e.clientY - pr.top;
+      // place() puts the image at left = pane.w/2 - center.x*dw, so holding
+      // `u` at `px` across the zoom means center.x = u + (pane.w/2 - px)/dw.
+      // Clamped to the image; place() clamps the placement again on top.
+      const dw2 = g.iw * next;
+      const dh2 = g.ih * next;
+      setCenter({
+        x: Math.min(1, Math.max(0, u + (g.pane.w / 2 - px) / dw2)),
+        y: Math.min(1, Math.max(0, v + (g.pane.h / 2 - py) / dh2)),
+      });
+      // Two-sided now that scrolling out is not capped at Fit -- see FIT_SNAP.
+      const snapped = Math.abs(next - g.fit) <= g.fit * FIT_SNAP;
+      // Keep the true position alive under the snap so the *next* tick can
+      // still tell it apart from a fresh arrival at Fit -- see wheelContRef.
+      wheelContRef.current = snapped ? next : null;
+      setZoom(snapped ? null : next);
+    };
+
+    host.addEventListener("wheel", onWheel as EventListener, { passive: false });
+    return () =>
+      host.removeEventListener("wheel", onWheel as EventListener);
+  }, [compare, !!meta]);
 
   const stepZoom = (dir: 1 | -1) => {
     const next =
@@ -1076,22 +1699,98 @@ function Stage(props: {
     };
   };
 
+  /** The mount border and its shadow, as one element behind the images.
+   *
+   *  Its own element rather than a border on the `<img>`, for two reasons. The
+   *  overlay mode draws the wipe by clipping the result image with `clipPath`,
+   *  and clipPath clips a box-shadow with it -- so a ring on that image would
+   *  lose whichever side was wiped away. And a CSS border would grow the box
+   *  past the `dw x dh` that every coordinate in here is derived from, putting
+   *  the pointer-anchored zoom half a border out and dragging `place()`'s
+   *  clamping with it.
+   *
+   *  Drawn as two spread shadows rather than a border and a filter, so it
+   *  occupies no layout at all: geometry stays exactly `place()`'s. The drop
+   *  shadow carries the same spread as the border, or it would be laid down
+   *  from the image's edge and sit *underneath* the opaque mount instead of
+   *  around it. */
+  const mount = () =>
+    frame ? (
+      <div
+        className="mount"
+        style={{
+          ...place(),
+          boxShadow:
+            `0 0 0 ${frameWidth}px var(--mount), ` +
+            `0 ${FRAME_SHADOW_DROP}px ${FRAME_SHADOW_BLUR}px ` +
+            `${frameWidth}px rgba(0,0,0,.7)`,
+        }}
+      />
+    ) : null;
+
   // The proxy resolves detail only up to its own resolution; past that the
   // browser is enlarging it and grain is not being shown honestly. Say so
   // rather than letting a soft preview read as a soft result.
   const proxyLimit = (meta?.proxy_width ?? 0) / iw;
   const softened = !previewFull && eff > proxyLimit * 1.05;
 
+  // One bar for everything that changes the *view* and nothing that changes
+  // the render: compare mode, the wipe, and the zoom. Grouped left to right in
+  // the order you reach for them, with the wipe next to the mode that owns it.
+  const isExporting = job && job.status !== "done" && job.status !== "error";
   const bar = (
     <div className="viewbar">
+      <div className={`spinner-placeholder ${rendering || isExporting ? "active" : ""}`}>
+        <div className="spinner-icon" />
+      </div>
       {softened && (
         <span className="fid" title="Enlarged beyond the proxy's resolution — press Render 1:1 to judge grain">
           proxy
         </span>
       )}
       <button
+        className={compare === "overlay" ? "seg on" : "seg"}
+        onClick={() => props.onCompare("overlay")}
+        title="Wipe the result over the original"
+      >
+        Overlay
+      </button>
+      <button
+        className={compare === "side" ? "seg on" : "seg"}
+        onClick={() => props.onCompare("side")}
+        title="Original and result side by side, panning and zooming together"
+      >
+        Side
+      </button>
+      {compare === "overlay" && (
+        <>
+          <button
+            className={props.showBefore ? "swap on" : "swap"}
+            onClick={() => props.onShowBefore(!props.showBefore)}
+            title="Swap before/after — or hold B"
+          >
+            {props.showBefore ? "Before" : "After"}
+          </button>
+          <input
+            className="wipe"
+            type="range"
+            min={0}
+            max={1}
+            step={0.001}
+            value={props.split}
+            disabled={props.showBefore}
+            onChange={(e) => props.onSplit(Number(e.target.value))}
+            title="Wipe"
+          />
+        </>
+      )}
+      <span className="vsep" />
+      <button
         className={zoom === null ? "seg on" : "seg"}
-        onClick={() => setZoom(null)}
+        onClick={() => {
+          wheelContRef.current = null;
+          setZoom(null);
+        }}
       >
         Fit
       </button>
@@ -1118,6 +1817,30 @@ function Stage(props: {
       >
         +
       </button>
+      <span className="vsep" />
+      {/* Third group: the mount. A view control like everything else on this
+          bar -- it changes nothing that gets rendered or exported. The width
+          slider appears only with the frame on, matching how the wipe follows
+          the mode that owns it, so the bar does not carry a dead control. */}
+      <button
+        className={frame ? "seg on" : "seg"}
+        onClick={() => setFrame(!frame)}
+        title="Show the photo on a mount, with a drop shadow"
+      >
+        Frame
+      </button>
+      {frame && (
+        <input
+          className="framew"
+          type="range"
+          min={0}
+          max={FRAME_MAX}
+          step={1}
+          value={frameWidth}
+          onChange={(e) => setFrameWidth(Number(e.target.value))}
+          title={`Frame width — ${frameWidth}px on screen`}
+        />
+      )}
     </div>
   );
 
@@ -1136,12 +1859,14 @@ function Stage(props: {
         >
           <div className="pane">
             <span className="tag">Before</span>
+            {mount()}
             {sourceUrl && (
               <img className="frame" style={place()} src={sourceUrl} alt="before" draggable={false} />
             )}
           </div>
           <div className="pane">
             <span className="tag">After</span>
+            {mount()}
             {previewUrl && (
               <img className="frame" style={place()} src={previewUrl} alt="after" draggable={false} />
             )}
@@ -1162,6 +1887,7 @@ function Stage(props: {
         onPointerCancel={onPointerUp}
       >
         <div className="pane">
+          {mount()}
           {sourceUrl && (
             <img className="frame" style={place()} src={sourceUrl} alt="before" draggable={false} />
           )}

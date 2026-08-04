@@ -16,6 +16,15 @@ Design notes that matter for correctness:
   sampling the same global position get bit-identical values, so tiles composite
   without seams given enough overlap to cover the blur kernels.
 
+* **Not every softening stage is a filter.** ``scatter`` displaces a share of
+  the pixels onto their neighbours and averages nothing at all, so it takes the
+  image's exactness without taking its micro-contrast. It samples nearest-
+  neighbour on whole-pixel offsets precisely so each output pixel stays a copy
+  of a real one; measured against a blur of the same reach it keeps 100% of
+  fine-texture sigma where the blur keeps 14%. Anything that turns it into an
+  average -- bilinear resampling, cross-fading the moved pixel with the
+  original -- destroys the only reason it exists.
+
 * **Grain is structural.** Alongside the weighted additive term, the grain field
   multiplies the image's own micro-detail (``edge_erosion``). That term is zero
   in flat areas and grows on edges, so grain erodes existing edge structure
@@ -30,7 +39,9 @@ Design notes that matter for correctness:
 
 from __future__ import annotations
 
+import collections
 import math
+import os
 
 import numpy as np
 import torch
@@ -53,6 +64,19 @@ EDGE_REF = 0.06
 # per-image statistic, so tiles stay seamless.
 _GNORM = 0.55
 
+# Byte cap on the Global Grain texture cache (see `_global_grain_field`). Sized
+# for a handful of tiles at preview resolution -- one entry is [1,3,h,w] at
+# *working* resolution, so 113MB per tile at tile 1536 / supersample 2, or ~38MB
+# for the monochrome case. Capped by bytes rather than by entry count for
+# exactly that reason: an entry-count cap sized for the chroma case would hold
+# three times too much memory when chroma is off, and vice versa.
+#
+# Shared budget, not an independent one: this competes with the working set that
+# `tile_for` sizes tiles against, so raising one means lowering the other.
+_GG_CACHE_BYTES = int(
+    float(os.environ.get("FILM_GRAIN_GRAIN_CACHE_GB", "0.5")) * (1 << 30)
+)
+
 # Converts the 0..100 intensity slider into image-referred amplitude. Chosen so
 # the default intensity of 32 lands near 3.5% luminance sigma in the midtones,
 # which is about right for a 400-speed stock viewed at 100%.
@@ -68,6 +92,149 @@ _AMP_SCALE = 0.38
 # lattice is clamped. Below Nyquist it would simply alias.
 _MIN_CELL = 0.8
 
+# Global-grain smoothing. Value noise is a quilt -- its extrema sit on an
+# axis-aligned lattice and each cell is a separable patch -- so past roughly
+# 8px the cells read as rectangles. Measured on a cell-20 field, |gradient|
+# binned by phase within a cell swings by 1.74x its own mean, which is that
+# grid showing up as a number.
+#
+# _SMOOTH_MAX  peak blur sigma as a fraction of the clump, at Smoothness 1.
+#              Half a cell takes that 1.74 to 0.27 on the bare field and
+#              1.72 to 0.32 through a full render (the figure `verify.py`
+#              pins) -- the quilt is gone rather than merely softened -- and
+#              still leaves clump-scale structure behind.
+# _SMOOTH_GAIN_K  restores the amplitude the blur costs. Measured, the loss
+#              depends on sigma/cell *alone*: cells of 8, 16 and 32px attenuate
+#              within 0.5% of each other at every ratio tested, so one closed
+#              form covers every size. sqrt(1 + k(sigma/cell)^2) fits it to
+#              0.6% over the whole 0..0.5 range this stage can reach. Analytic
+#              on purpose -- reading the tile's own std would restore a
+#              different amount per tile and seam the export.
+#
+#              **Fit it against the field it is actually used on.** Calibrated
+#              first on single-octave value noise it came out 7.7, but the
+#              global layer is a two-octave fBm whose coarse half survives a
+#              blur far better, so 7.7 over-restored and made full Smoothness
+#              10% louder than no smoothing -- exactly the amplitude coupling
+#              the gain exists to prevent.
+_SMOOTH_MAX = 0.5
+_SMOOTH_GAIN_K = 5.62
+
+# --- colour grading (step -1, above everything) ---------------------------- #
+#
+# Peak channel gain for the temperature shift, at grade_temp = +/-1. Red and
+# blue move by this much in opposite directions and green is left alone; the
+# whole vector is then normalised against the luma weights, so the control
+# changes the light's colour and not its level. 0.40 puts the extremes at a
+# roughly 3200K/8000K feel without any setting driving a channel to a rail.
+_GRADE_TEMP_GAIN = 0.40
+#
+# Peak channel gain for Tint, the other white-balance axis: green against
+# magenta. Deliberately *smaller* than Temperature's -- green carries most of
+# the luma weight (0.7152 against red's 0.2126 and blue's 0.0722), so the same
+# magnitude on this axis costs more level. Measured on an asymmetric plate,
+# 0.40 drifts luma up to 2.3%, against Temperature's own 1.8% at its 0.40; 0.30
+# brings the worst case to 1.4%, in the same envelope as Temperature.
+_GRADE_TINT_GAIN = 0.30
+#
+# Where the shadow and highlight ramps meet. Each control acts on one side of
+# it only -- so every pixel is in exactly one of them, the two are independent
+# by construction rather than by bookkeeping, and both curves leave the knee at
+# slope exactly 1, which is what makes the join invisible on a gradient without
+# a ramp to fade them in. Not exposed: a knee plus a falloff per end would be
+# four more sliders for a section that is meant to stay cheap and quick.
+_GRADE_TONE_KNEE = 0.5
+#
+# How far a tone lift can travel at +/-1, as a share of the headroom it has.
+#
+# Not 1.0, and the difference matters more than it sounds. The lift is a share
+# of the distance to the rail, so at 1.0 a setting of +1 takes a black pixel to
+# *pure white* -- which means the whole top of the slider is unusable and the
+# useful range is squeezed into its first tenth. Measured on a real photograph
+# (mean luma 0.21), Shadows at only +0.5 took the frame's mean from 0.19 to
+# 0.53; that is not a shadow lift, it is a different exposure. At 0.35 the same
+# +1 moves a black pixel to 0.35 -- a thoroughly lifted, faded-print look, which
+# is a fair thing to find at the end of the travel -- and +0.3 gives the natural
+# one-stop-ish lift you actually reach for. Same lesson as `_JITTER_MAX`, from
+# the other direction: a control whose whole range has to be usable.
+#
+# Applies to the *expanding* half of each control only -- Shadows negative and
+# Highlights positive, which push a tone toward the rail it is already nearest.
+# The recovering halves (Shadows positive, Highlights negative) do not use it:
+# they are asymptotic rolls whose endpoint is fixed by the curve's own shape,
+# and a share-of-headroom cap is exactly what made them non-monotonic. See
+# `_tone_roll`.
+_GRADE_TONE_MAX = 0.35
+#
+# Where a channel starts counting as clipped, for highlight reconstruction: the
+# soft window over which "this is a real measurement" becomes "this hit the
+# ceiling and the true value is somewhere above it".
+#
+# Soft rather than a single threshold because the window doubles as the blend
+# weight, and a hard switch would draw a visible contour around every blown
+# region. The top is just short of 1.0 rather than at it because an 8-bit
+# ceiling is 255/255 and JPEG ringing puts real clipped pixels a code value or
+# two either side of it.
+_RECON_LO = 0.94
+_RECON_HI = 0.999
+#
+# How much local evidence a channel needs before its reconstruction is trusted,
+# as a share of the neighbourhood that still holds a valid measurement of that
+# channel. Below this the estimate fades out rather than being divided into
+# existence: in the middle of a region blown wide in every channel there is
+# genuinely nothing to recover from, and saying so is better than inventing it.
+_RECON_MIN_EVIDENCE = 0.02
+#
+# Ceiling on a reconstructed value, in display-referred units -- two stops above
+# white. The estimate divides by the local chromaticity of whichever channels
+# survived, so a highlight lit by something the surviving channel barely sees
+# (deep blue in tungsten light) has a small denominator and would otherwise run
+# away. Two stops is more headroom than any 8-bit source can justify and still
+# bounded.
+_RECON_CEIL = 4.0
+#
+# Knee for reconstruction's own roll -- the curve that brings what it recovered
+# back inside the visible range, without which the whole stage is invisible.
+#
+# High, at 0.80, and that is the point: the recovered data lands just above
+# white, so only the top fifth of the range has to give way to make room for it.
+# A knee at `_GRADE_TONE_KNEE` (0.5) would work too and would be the wrong
+# control -- that is a broad highlight roll, i.e. what `grade_highlights` is
+# for, and duplicating it here would mean reconstruction quietly graded the
+# picture as well as repairing it.
+_RECON_ROLL_KNEE = 0.80
+#
+# How wide to smooth the roll's gate, as a fraction of the reconstruction
+# radius. The gate is the reconstruction's own weight field, so the roll engages
+# only where something was actually repaired -- but a per-pixel gate would draw
+# an edge around every repaired region, so it is dilated and feathered.
+#
+# 0.25 rather than the 0.5 first tried, and it is better on every axis measured,
+# which is worth recording because the larger value looks like the safer one. The
+# gate only has to be wide enough not to contour: swept against the second
+# derivative of a repaired ramp, 0.05 starts introducing curvature the source
+# does not have (3.2e-03 against the source's own 2.2e-03) while 0.10, 0.25 and
+# 0.50 all sit at 1.4e-03, so 0.25 clears it with a 5x margin. Going wider then
+# only costs -- the recovered span holds flatter across the radius at 0.25
+# (0.0736 / 0.0736 / 0.0735 / 0.0657 against 0.5's 0.0736 / 0.0735 / 0.0650 /
+# 0.0654 at 8/16/32/64px) and `pad_for` at the top of the radius range is 933px
+# against 1233px.
+_RECON_ROLL_GATE_FRAC = 0.25
+# Gain on the positive side of Clarity. The negative side is pinned at exactly
+# 1.0 and cannot be raised: at gain 1 a setting of -1 removes precisely 100% of
+# the local-contrast band, and anything past that does not flatten further, it
+# *inverts* -- dark halos on the light side of every edge. Positive has no such
+# limit, so it gets the headroom to be worth reaching for.
+_GRADE_CLARITY_GAIN = 1.6
+#
+# Gain on Contrast's pivot-about-middle-grey, at +/-1. Floored so the gain can
+# never reach 0 or go negative: at -1 it is 0.1, a tenth of the original
+# spread rather than a flattened or inverted picture. Deliberately smaller than
+# the film characteristic curve's own 1.1 -- this control has no shoulder to
+# catch what it steepens, so a gentler reach keeps the top of the slider from
+# clipping immediately.
+_GRADE_CONTRAST_GAIN = 0.9
+
 # Local mean-absolute-deviation thresholds, in luma units, separating "smooth"
 # from "textured" over a medium radius. Skin and clear sky sit near or below
 # _TEX_LO; fabric, foliage and hair sit above _TEX_HI. Fixed constants, not
@@ -82,6 +249,25 @@ _TEX_HI = 0.015
 # intact. Fixed constants, not per-image statistics, so tiles stay independent.
 _STEP_LO = 0.030
 _STEP_HI = 0.110
+
+# Hue the blue compensation centres on, in degrees, measured *in linear light*
+# because that is where the stage runs. Skies land at 222 (pale) to 236
+# (zenith) there, so 230 sits in the middle of them; cyan water is 194 and
+# purple shadow 249, comfortably outside a narrow Blue Range. Note these are
+# not the sRGB numbers -- the transfer curve is per-channel and monotonic, so
+# it preserves the hue *sector* but moves the angle inside it by 6-10 degrees.
+_BLUE_HUE = 230.0
+
+# Half-width of the hue window, in degrees. Fixed rather than exposed: the
+# discriminator that actually matters is *brightness*, not hue width -- the
+# wash only reaches what is near the light, so a deep blue is untouched
+# whatever its hue. This was a slider and it was the wrong control.
+_BLUE_RANGE = 70.0
+
+# Saturation below which a pixel counts as grey and the compensation leaves it
+# alone. Without it the mask would strengthen colour in something that has
+# none, which is the failure `vibrance` is written to avoid as well.
+_BLUE_SAT_FLOOR = 0.12
 
 # Peak edge displacement in full-resolution pixels at edge_jitter = 1.
 #
@@ -117,6 +303,32 @@ _SAND_DIR_K = 0.6
 # and the effect faded out. Well under a real edge's gradient, so it only
 # catches genuinely flat ground -- where there is nothing to sand anyway.
 _SAND_MIN_GRAD = 0.012
+
+# Anti-aliasing: a three-tap 1-2-1 along the isophote. Short on purpose -- a
+# stair-step is a *pixel-scale* wobble along the contour, so reaching further
+# only starts averaging away the shape the contour has. That is the whole
+# difference in scale from `edge_sand`, whose taps run to +/-2 sigma because
+# the roughness it removes sits at much longer wavelengths.
+_AA_TAPS = ((-1.0, 0.25), (0.0, 0.5), (1.0, 0.25))
+
+# Maximum anti-aliasing passes, and therefore the top of `aa_strength`. One
+# pass of a three-tap filter is a gentle thing -- measured, 35% of a stair-step
+# -- and the way to make it bite is to run it again rather than to lengthen it:
+# the taps are short *on purpose*, so a longer reach averages away the shape the
+# contour has instead of the wobble on it. Each pass re-estimates the tangent
+# from the image it is given, which re-aims along a curving edge where one wide
+# pass cuts the corner. Same reasoning and same shape as `_SAND_PASSES`, and
+# like that one `pad_for` assumes this count exactly, so the two must not drift.
+_AA_PASSES = 3
+
+# Direction-estimate blur for the AA tangent, as a fraction of its radius, and
+# a floor. Smaller than `_SAND_DIR_K` against a smaller radius: this filter has
+# to follow a contour at the pixel scale, and estimating its direction over a
+# wide window would cut the corners off small features. The floor is what keeps
+# the tangent from swinging on single-pixel noise, which is the same stability
+# problem `_SAND_DIR_K` exists for.
+_AA_DIR_K = 0.5
+_AA_DIR_MIN = 0.7
 
 # Thresholds that turn a value-noise field into sparse marks for the film
 # texture, one band per mark type. These have to be read off the field's actual
@@ -179,19 +391,47 @@ _BLOB_CELLS_DUST = 14.0
 _BLOB_CELLS_SCRATCH = 26.0
 _BLOB_CELLS_HAIR = 0.5
 
-# Floor on the width of a light leak's gate band, in field units. A leak with a
-# narrow gate has a hard edge, and a hard-edged leak reads as a painted shape
-# rather than as light -- so however few leaks are asked for, the gate keeps
-# enough of a ramp to fall off through.
-_LEAK_MIN_BAND = 0.16
+# -- light leaks ---------------------------------------------------------- #
+# A leak is a *shaft* of light past an obstruction, so it is drawn as a small
+# number of discrete oriented beams anchored on the perimeter, not as a wash
+# gated along the whole border. See `_leak_sites` for why a list of them does
+# not break tile independence the way a list of dust specks would.
 
-# Cap on how far a leak reaches in, as a fraction of the half-frame (edge_d
-# runs 0 at the border to 0.5 at the centre). Held low on purpose: a leak that
-# washes the middle stops reading as a leak.
-_LEAK_REACH_MAX = 0.17
+# Step used to place leaks around the perimeter, as a fraction of it. Golden
+# ratio, i.e. a low-discrepancy sequence rather than a stratification, so leak
+# k lands in the same place whatever the count is -- raising the count must add
+# a leak, not reshuffle the ones already on the frame.
+_LEAK_PHI = 0.6180339887498949
 
-# How much further a leak blooms at a corner than at an edge midpoint.
-_LEAK_CORNER = 1.6
+# How hard leaks are pulled toward the ends of their border. The film gate's
+# corners and the cassette mouth are where light actually gets past, and an
+# even spread along the perimeter is the single most "generated"-looking thing
+# a leak field can do. Applied inside one border segment, so it biases a leak
+# toward a corner without ever moving it onto a different edge.
+#
+# Must stay under 1 / 2pi = 0.159, or `t - bias * sin(2 pi t)` stops being
+# monotonic and starts *folding*: at 0.24 its slope goes to -0.51 near the
+# ends, which maps a quarter of the way along a border to one hundredth of the
+# way along it. Every leak then piles into a corner, which is not a bias, it is
+# a collapse -- and it looks exactly like the four-corner symmetry this stage
+# was rewritten to get away from.
+_LEAK_CORNER_BIAS = 0.10
+
+# Peak of the domain warp that breaks a leak's outline up, as a fraction of its
+# reach. The shape has a definite edge by construction -- that is the point,
+# real leaks have one -- and this is what stops that edge being a drawn curve.
+_LEAK_WARP = 0.15
+
+# Divisor on the reach cap. The cap exists so a leak cannot fog the centre, and
+# the warp above can carry the falloff `_LEAK_WARP * reach` further in than the
+# reach alone, so the cap has to be paid for twice over. 1.25 against a warp of
+# 0.15 leaves real margin rather than landing exactly on zero -- a falloff
+# exponent below 1 turns a float epsilon into a visible lift.
+_LEAK_REACH_SAFETY = 1.25
+
+# Exposure one unit of leak deposits, before `leak_strength`. Calibrated so the
+# default strength lands a hot leak's core just into saturation.
+_LEAK_GAIN = 2.0
 
 
 def _threshold_for(fraction: float) -> float:
@@ -220,6 +460,162 @@ def _count_threshold(
     """
     cells = max(frame_area / max(cell_area, 1e-6), 1.0)
     return _threshold_for(max(count, 0.0) / (cells * blob_cells))
+
+
+def _leak_sites(count: float, seed: int, var: float) -> list[dict]:
+    """Per-leak parameters, in units that do not depend on the frame's size.
+
+    This *is* a list of objects, which the rest of the film-texture section
+    refuses to use -- and it is still tile-independent, because the list is a
+    function of the count, the seed and nothing else. Every tile builds the
+    identical list; so does the proxy, so does the export. What breaks tile
+    independence is deriving a list from the *region being rendered* (N specks
+    per tile, or positions drawn against the tile's own area), and nothing
+    here reads either.
+
+    Objects rather than thresholded noise because a leak is not a mark, it is a
+    beam: it has a source, a direction and a length, and a field that only
+    knows "how far am I from the nearest border" can express none of those.
+
+    ``var`` is `leak_variation`: every draw except the reach is a blend from
+    the middle of its range toward the drawn value, so 0 makes every leak
+    identical in everything but where it sits and how far it comes in.
+    """
+    n = int(min(max(round(count), 0), 64))
+
+    def mix(u: float, lo: float, hi: float) -> float:
+        return 0.5 * (lo + hi) + var * (u - 0.5) * (hi - lo)
+
+    sites = []
+    for k in range(n):
+        # Seeded per leak, not once per frame, for the same reason the
+        # positions come off a low-discrepancy sequence: leak 3 must not
+        # change when leak 9 is added.
+        rng = np.random.default_rng(
+            np.uint64((int(seed) & 0xFFFF) * 1000003 + k * 7919 + 17)
+        )
+        u = rng.random(10)
+        sites.append({
+            # Where on the perimeter, 0..1. The jitter is small on purpose --
+            # the golden step already spreads them, and a large jitter just
+            # lets two leaks land on top of each other.
+            "pos": (0.37 + _LEAK_PHI * k + 0.10 * (u[0] - 0.5)) % 1.0,
+            # Reach is the one draw `var` does not touch: the two size sliders
+            # state its spread outright, and the help text promises variation
+            # changes everything *except* size.
+            "reach_t": u[1],
+            # Half-length along the border, as a fraction of that border.
+            # A fraction of the *border* rather than a multiple of the reach:
+            # a failed seal runs along a seam, so a leak is long sideways and
+            # shallow inward, and sizing it off its own depth makes blobs.
+            "width": mix(u[2], 0.03, 0.30),
+            # Lateral drift per unit depth. This is what makes a leak a streak
+            # leaning across the frame instead of a symmetric wedge, and it is
+            # kept as a shear rather than as a rotation so that "reach" stays
+            # exactly the perpendicular depth the slider claims.
+            "shear": mix(u[3], -1.7, 1.7),
+            # How much the beam fans out as it travels in.
+            "flare": mix(u[4], -0.55, 0.75),
+            # Asymmetry of the two long edges. A leak is light spilling past an
+            # obstruction, so one side is the obstruction's shadow and is much
+            # harder than the other; a shape soft on both sides reads as haze.
+            "hard": mix(u[5], 0.25, 1.0),
+            "hard_side": 1.0 if u[6] >= 0.5 else -1.0,
+            "strength": mix(u[7], 0.45, 1.35),
+            # Halo: pushes this leak's half-strength distance around.
+            "halo": u[8],
+            # Hue jitter, added to `leak_hue`.
+            "hue": mix(u[9], -0.20, 0.20),
+        })
+    return sites
+
+
+def _leak_anchor(pos: float, fh: float, fw: float) -> tuple[int, float]:
+    """Map a perimeter position to (border, along-border coordinate in px).
+
+    Borders are 0 top, 1 bottom, 2 left, 3 right; the coordinate is x on the
+    horizontal borders and y on the vertical ones.
+    """
+    a = (pos % 1.0) * 2.0 * (fh + fw)
+    for border, length in ((0, fw), (3, fh), (1, fw), (2, fh)):
+        if a < length or length <= 0.0:
+            t = (a / length) if length > 0.0 else 0.0
+            # Pull toward both ends of the segment, i.e. toward the corners.
+            t = min(max(t - _LEAK_CORNER_BIAS * math.sin(2.0 * math.pi * t),
+                        0.0), 1.0)
+            return border, t * length
+        a -= length
+    return 0, 0.0
+
+
+class RenderCancelled(Exception):
+    """Raised out of `render_image` when its `should_cancel` hook says stop.
+
+    Its own type rather than a bool return so a cancelled render cannot be
+    mistaken for a finished one by a caller that forgot to check.
+    """
+
+
+# Peak render memory per *working* pixel -- i.e. per pixel of the padded tile
+# after supersampling. Measured, not guessed: single-tile `Stock` renders at 512,
+# 768, 1024 and 1280 square with supersample 2 gave marginal costs of 763, 530
+# and 424 bytes per working pixel as the frame grew (the allocator reserves in
+# ~1GB steps, so the small end reads high). 512 is above the worst marginal
+# figure, which is the safe direction to be wrong in: over-estimating picks a
+# smaller tile and renders slower, under-estimating runs the machine out of
+# memory. `defaults` measures roughly half this, so the constant is sized for
+# the heaviest preset rather than the typical one.
+_WORKING_BYTES_PER_PX = 512
+
+# Fraction of the backend's recommended working set to actually use. The rest is
+# headroom for the client, the encoder and whatever else shares the GPU -- the
+# render is not the only thing on the machine, and on Apple silicon this is
+# system RAM, so overcommitting means swapping rather than a clean failure.
+_RENDER_BUDGET_FRACTION = 0.5
+
+# Tile floor and ceiling. The floor is not a memory figure: below it `pad_for`
+# overlap dominates the useful area so completely that the extra work costs more
+# than the memory it saves, and every supported backend can hold a tile this
+# size. The ceiling keeps a single enormous tile from defeating the point of
+# tiling on a machine that reports a very large budget.
+_TILE_MIN = 768
+_TILE_MAX = 8192
+
+
+def _render_budget_bytes() -> int:
+    """Working-set budget for one tile, in bytes.
+
+    `FILM_GRAIN_TILE_BUDGET_GB` overrides it outright, in the same spirit as
+    `FILM_GRAIN_DEFAULT_PRESET` -- useful both for forcing large tiles on a big
+    machine and for reproducing a small machine's tiling on a large one, which is
+    what makes the tile-independence checks in `verify.py` testable here.
+    """
+    env = os.environ.get("FILM_GRAIN_TILE_BUDGET_GB")
+    if env:
+        try:
+            return int(float(env) * (1 << 30))
+        except ValueError:
+            pass
+    total = 0
+    if torch.backends.mps.is_available():
+        try:
+            total = int(torch.mps.recommended_max_memory())
+        except Exception:
+            total = 0
+    elif torch.cuda.is_available():
+        try:
+            total = int(torch.cuda.get_device_properties(0).total_memory)
+        except Exception:
+            total = 0
+    if total <= 0:
+        # CPU, or a backend that will not say. Derive from system RAM, which is
+        # the real constraint there too.
+        try:
+            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except (OSError, ValueError, AttributeError):
+            total = 4 << 30
+    return max(1 << 30, int(total * _RENDER_BUDGET_FRACTION))
+
 
 def pick_device() -> torch.device:
     if torch.cuda.is_available():
@@ -312,11 +708,65 @@ def _hsv_to_rgb(h_deg: float, sat: float, val: float = 1.0) -> tuple[float, floa
     return (r + m, g + m, b + m)
 
 
-def _warp(x: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+def _hue_sat(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Hue in degrees and HSV saturation, per pixel.
+
+    Saturation is chroma over value, the HSV definition, matching what
+    ``vibrance`` already uses: it reads a deep blue as fully saturated however
+    dark it is, where distance from the luma axis would call the same blue
+    unsaturated.
+    """
+    mx = x.amax(dim=1, keepdim=True)
+    mn = x.amin(dim=1, keepdim=True)
+    c = mx - mn
+    sat = c / mx.clamp_min(1e-6)
+    cc = c.clamp_min(1e-6)
+    r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+    h = torch.where(
+        mx == r, ((g - b) / cc) % 6.0,
+        torch.where(mx == g, (b - r) / cc + 2.0, (r - g) / cc + 4.0),
+    ) * 60.0
+    # Hue is undefined on grey, and the ratio above is 0/0 there.
+    return torch.where(c < 1e-6, torch.zeros_like(h), h), sat
+
+
+def _rotate_hue(x: torch.Tensor, deg: torch.Tensor) -> torch.Tensor:
+    """Rotate colours about the grey axis by a per-pixel angle.
+
+    Rodrigues about (1,1,1)/sqrt(3), which is exactly a hue rotation in RGB:
+    it leaves grey untouched by construction (grey lies *on* the axis) and
+    preserves the channel sum, so it changes colour without changing how
+    bright the pixel is. Cheaper and better behaved than a round trip through
+    HSV, which has to divide by a chroma that goes to zero.
+    """
+    th = deg * (math.pi / 180.0)
+    c, s = torch.cos(th), torch.sin(th)
+    k = 1.0 / math.sqrt(3.0)
+    r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
+    # k . v, and the axis-aligned part that the rotation leaves alone.
+    axis = (r + g + b) * k * k * (1.0 - c)
+    return torch.cat([
+        r * c + (b - g) * k * s + axis,
+        g * c + (r - b) * k * s + axis,
+        b * c + (g - r) * k * s + axis,
+    ], dim=1)
+
+
+def _warp(
+    x: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor, mode: str = "bilinear",
+) -> torch.Tensor:
     """Resample ``x`` displaced by ``(dx, dy)``, both given in working pixels.
 
-    Shared by edge jitter and edge sanding -- they differ only in the spatial
-    frequency of the field they hand in, not in how it is applied.
+    Shared by edge jitter, edge sanding and scatter -- they differ only in the
+    spatial frequency of the field they hand in, not in how it is applied.
+
+    ``mode="nearest"`` makes the result an exact *copy* of a source pixel
+    rather than a blend of four, which is the whole point of the scatter
+    stage: bilinear resampling at a fractional offset is a 2x2 average, and an
+    average is precisely the thing that stage exists not to do. Callers using
+    it hand in whole-pixel displacements, so the choice of nearest neighbour
+    is unambiguous rather than resting on which side of a half-pixel the
+    floating-point arithmetic lands.
     """
     h, w = x.shape[-2:]
     ys = torch.linspace(-1.0, 1.0, h, device=x.device)
@@ -327,8 +777,37 @@ def _warp(x: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
     gy = Y.unsqueeze(0).unsqueeze(0) + dy * (2.0 / max(h - 1, 1))
     grid = torch.stack([gx[:, 0], gy[:, 0]], dim=-1)
     return F.grid_sample(
-        x, grid, mode="bilinear", align_corners=True, padding_mode="border"
+        x, grid, mode=mode, align_corners=True, padding_mode="border"
     )
+
+
+def _isophote(
+    lum: torch.Tensor, dir_sigma: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Unit tangent along the contour, plus the gradient magnitude.
+
+    Shared by edge sanding and anti-aliasing, which want the same vector for
+    opposite-scale reasons -- one polishes roughness off a contour, the other
+    takes stair-steps off one -- and differ only in how far they then reach
+    along it and what they gate the result on.
+
+    ``dir_sigma`` is not optional and must not be zero. Taken per-pixel the
+    gradient follows whatever noise is present and the tangent sands in
+    circles; worse, where the gradient is weak the direction is a ratio of two
+    near-zero numbers, so it swings on floating-point alone and a filter
+    reaching along it samples somewhere else entirely. That is not just noisy,
+    it made tiled exports seam: two tilings hand the gradient marginally
+    different values. Callers gate on the returned magnitude for the same
+    reason.
+    """
+    gl = _blur(lum, dir_sigma)
+    px_ = F.pad(gl, (1, 1, 0, 0), mode="replicate")
+    gx_ = (px_[..., 2:] - px_[..., :-2]) * 0.5
+    py_ = F.pad(gl, (0, 0, 1, 1), mode="replicate")
+    gy_ = (py_[..., 2:, :] - py_[..., :-2, :]) * 0.5
+    mag = (gx_ * gx_ + gy_ * gy_).sqrt().clamp_min(1e-6)
+    # The tangent is the gradient turned 90 degrees.
+    return -gy_ / mag, gx_ / mag, mag
 
 
 def _srgb_to_linear(x: torch.Tensor) -> torch.Tensor:
@@ -339,6 +818,53 @@ def _srgb_to_linear(x: torch.Tensor) -> torch.Tensor:
 def _linear_to_srgb(x: torch.Tensor) -> torch.Tensor:
     x = x.clamp_min(0.0)
     return torch.where(x <= 0.0031308, x * 12.92, 1.055 * x ** (1.0 / 2.4) - 0.055)
+
+
+def _apply_lut(x: torch.Tensor, lut) -> torch.Tensor:
+    """Trilinear 3D LUT lookup. ``x`` is [1,3,h,w] display-referred in 0..1.
+
+    ``lut`` is a ``server.lut.Lut``; duck-typed rather than imported so the
+    engine keeps no dependency on the file loader. It supplies the table as a
+    ``[1, 3, D, H, W]`` volume and its input domain.
+
+    One ``grid_sample`` call, which is trilinear in 3D and runs on the GPU -- so
+    a 35-cube and a 65-cube cost the same and neither shows up against the
+    stages below. The alternative, gathering eight corners by flat index and
+    interpolating by hand, needs int64 index tensors that MPS handles badly and
+    eight full-frame gathers of working memory.
+
+    Two things are load-bearing:
+
+    * **``align_corners=True``.** A LUT's first and last samples *are* input 0
+      and input 1, not the centres of edge cells. With the default the whole
+      table would be read at half a cell's offset -- a small, uniform, entirely
+      wrong shift that would look like the LUT being slightly off rather than
+      like a bug.
+    * **The grid's last dimension is ``(x, y, z)`` mapping to ``(W, H, D)``,**
+      and the table is stored ``[c][b][g][r]`` so that maps to ``(r, g, b)``.
+      That is why the grid is simply the image's own channels in order. Get it
+      backwards and any symmetric LUT still looks fine while every real one is
+      channel-swapped, which is what ``verify.py`` uses an asymmetric table to
+      pin.
+
+    ``padding_mode="border"`` clamps rather than reflecting, so a value that has
+    somehow left 0..1 reads the nearest real entry instead of folding back into
+    the middle of the cube.
+    """
+    tab = lut.tensor(x.device)
+    n = x
+    # Almost every LUT in the wild declares the 0..1 domain, so the rescale is
+    # skipped rather than paid for -- a per-channel multiply-add over the frame
+    # for nothing.
+    if lut.dmin != (0.0, 0.0, 0.0) or lut.dmax != (1.0, 1.0, 1.0):
+        lo = torch.tensor(lut.dmin, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        hi = torch.tensor(lut.dmax, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        n = (n - lo) / (hi - lo).clamp_min(1e-6)
+    grid = n.permute(0, 2, 3, 1).unsqueeze(1) * 2.0 - 1.0  # [1,1,h,w,3] as (r,g,b)
+    out = F.grid_sample(
+        tab, grid, mode="bilinear", padding_mode="border", align_corners=True,
+    )
+    return out.squeeze(2)
 
 
 def _soft_knee(x: torch.Tensor, amount: float, span: float) -> torch.Tensor:
@@ -357,6 +883,266 @@ def _soft_knee(x: torch.Tensor, amount: float, span: float) -> torch.Tensor:
     denom = max(1.0 - knee, 1e-4)
     t = ((x - knee) / denom).clamp_min(0.0)
     return torch.where(x > knee, knee + denom * torch.tanh(t), x)
+
+
+def _shoulder(t: torch.Tensor) -> torch.Tensor:
+    """``1 - exp(-t)``: the roll every recovery in this file blends toward.
+
+    Slope 1 at the knee, so it joins the identity without a seam; asymptotes at
+    1, so an unbounded input lands inside a bounded output; strictly increasing
+    everywhere, so ordering -- and therefore detail -- is never lost. Shared by
+    `_tone_roll` and by highlight reconstruction's own local roll so the two
+    cannot drift apart.
+    """
+    return 1.0 - torch.exp(-t)
+
+
+def _tone_roll(t: torch.Tensor, amount: float) -> torch.Tensor:
+    """The one monotone curve behind both tone-recovery directions.
+
+    ``t`` is distance from the knee toward a rail, in units of the distance to
+    that rail: ``t = 0`` is the knee, ``t = 1`` is the rail itself, and
+    ``t > 1`` is a value that has already left the cube -- which is the whole
+    reason this exists. Returns the rolled distance, to be mapped back the same
+    way it came in.
+
+    ``amount > 0`` recovers: a convex blend of the identity and the exponential
+    shoulder ``1 - exp(-t)``, so at 1.0 the rail becomes an *asymptote*. Two
+    properties fall out of that and both are the point:
+
+    * **Strictly monotone at every setting.** The slope is
+      ``1 - amount * (1 - exp(-t))``, which for ``amount <= 1`` is bounded below
+      by ``exp(-t) > 0``. Ordering is never lost, so neither is detail: two
+      tones that differ before the curve still differ after it.
+    * **Unbounded input, bounded output.** Anything from the knee to infinity
+      lands inside the cube, monotonically. That is what makes over-range data
+      -- from reconstruction, from exposure, from a bright source -- *visible*
+      rather than clipped flat, and it is the difference between recovering a
+      highlight and merely dimming it.
+
+    ``amount < 0`` expands instead, and keeps the old share-of-headroom form:
+    ``t + |amount| * _GRADE_TONE_MAX * quintic(t) * (1 - t)``. Also monotone
+    (measured slope stays above ``1 - _GRADE_TONE_MAX``), and it cannot drive an
+    in-gamut value out of the cube, which is the guarantee that half of each
+    control has always made.
+
+    The asymmetry is deliberate and is the same shape of decision Clarity's is:
+    pushing a tone toward a rail and pulling one back off it are different
+    operations, and one formula that did both would do neither well. What made
+    the previous single formula fail was precisely that its strength was a
+    function of the pixel's own level -- ``x + a * m(x) * (1 - x)`` with ``m``
+    rising steeply through the band it was gating -- so in the recovering
+    direction the ``m'`` term overwhelmed the ``1`` and the transfer *inverted*:
+    measured slope **-0.21 over 16% of the range at 1.0**, which does not
+    compress highlight detail, it destroys and flips it. Hence a curve whose
+    monotonicity is a property of its own algebra rather than of how far the
+    slider happens to be pushed.
+    """
+    if amount >= 0.0:
+        # (1 - a) * t + a * shoulder(t), written so a = 0 returns t exactly.
+        return t + amount * (_shoulder(t) - t)
+    ramp = _smootherstep(0.0, 1.0, t)
+    return t + (-amount) * _GRADE_TONE_MAX * ramp * (1.0 - t)
+
+
+def _recon_estimate(
+    img: torch.Tensor, amount: float, radius: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The estimate half of highlight reconstruction: what was the clipped value?
+
+    Returns ``(out, w)`` -- the image with clipped channels raised to their
+    estimated true values, which are **above 1.0** by design, and the per-channel
+    weight that raising was applied with. `_reconstruct_highlights` then rolls
+    that back into the visible range; the two are split so the estimate's
+    accuracy can be checked as an equality against a known unclipped scene
+    without the roll's compression in the way, which is exactly what
+    ``verify.py`` does.
+
+    An 8-bit file clips per channel, not per pixel, and that asymmetry is the
+    opening this works through: a warm highlight reaches the ceiling in red
+    long before green and well before blue, so across a blown cloud the red
+    channel is a flat plateau while green and blue are still recording the
+    scene's own gradient. The detail is *in the file*; it is only missing from
+    one channel at a time. Where every channel is at the ceiling there is
+    genuinely nothing left, and this says so rather than inventing it.
+
+    Per channel, in display-referred space:
+
+    * ``clipped`` is the soft indicator over ``_RECON_LO.._RECON_HI``, and
+      ``valid = 1 - clipped`` marks what is still a real measurement.
+    * ``q`` is each channel's local level, blurred over ``radius`` but averaged
+      **only over whole clean pixels** -- ones with nothing clipped in any
+      channel -- so a plateau of ceiling values contributes nothing to the
+      estimate of what its own colour should be, and every channel's mean is a
+      mean over the *same* pixels. That second half is load-bearing; see the
+      comment in the body for the 6% ratio error that using each channel's own
+      mask produced, and for why that error made the whole stage a no-op.
+      Normalising ``q`` by its own luma-weighted mean across channels gives
+      ``k``, the local chromaticity: the colour of the light around here,
+      measured where it could be measured.
+    * ``guide`` is this pixel's own brightness read off whichever channels are
+      still valid, divided back through ``k`` so a surviving channel that the
+      local light happens to be poor in does not read as a darker pixel. With
+      one channel valid it reduces exactly to ``x_c / k_c``.
+    * ``recon = k * guide`` is then the pixel's brightness wearing the local
+      chromaticity -- and it exceeds 1.0 exactly as far as the clipped channel
+      really did.
+
+    Only ever *raises* a channel, and only ever a clipped one, weighted by how
+    clipped it is and by whether there was evidence to work from -- so an
+    unblown photograph is untouched and this half cannot darken anything.
+
+    Tile-independent for the ordinary reason: two fixed-radius blurs and
+    per-pixel arithmetic, no statistic of the region anywhere.
+    """
+    lw = torch.tensor(_LUMA, device=img.device, dtype=img.dtype).view(1, 3, 1, 1)
+    clipped = _smoothstep(_RECON_LO, _RECON_HI, img)
+    valid = 1.0 - clipped
+
+    # Local chromaticity, averaged over **whole clean pixels** -- ones with
+    # nothing clipped in any channel -- rather than over each channel's own
+    # valid mask.
+    #
+    # That distinction is the difference between this working and this quietly
+    # not working, and it took a measurement to see. Averaging each channel over
+    # wherever *it* was valid compares means taken over different sets of
+    # pixels: red's mask stops at the clip boundary while green's runs on into
+    # the brighter region past it, so red's mean is drawn from a darker
+    # neighbourhood than green's and the ratio between them comes out
+    # compressed. Measured on a warm ramp clipping in red only, the estimate
+    # landed at k_R = 1.136 against a true 1.205 -- a 6% underestimate, which is
+    # enough to put the reconstruction *below* the ceiling it was recovering
+    # from, so the ``clamp_min(0)`` swallowed it and the stage did precisely
+    # nothing. One shared mask makes every channel's mean a mean over the same
+    # pixels, and the ratio exact.
+    #
+    # Note the two masks answer different questions and both are needed:
+    # `clean` is "is this *pixel* a trustworthy sample of the local colour",
+    # `valid` below is "is this *channel* of this pixel a trustworthy reading of
+    # its brightness".
+    clean = valid.amin(dim=1, keepdim=True)
+    den = _blur(clean, radius)
+    q = _blur(img * clean, radius) / den.clamp_min(1e-3)
+    ev = _smoothstep(0.0, _RECON_MIN_EVIDENCE, den)
+
+    # Normalised so a neutral neighbourhood gives k = 1 in every channel.
+    # `_LUMA` sums to 1, so this is a mean and not merely a sum.
+    qg = (q * lw).sum(dim=1, keepdim=True)
+    k = q / qg.clamp_min(1e-4)
+
+    # This pixel's brightness from its surviving channels, read through the same
+    # chromaticity so the two are on one scale. With a single channel valid it
+    # reduces to x_c / k_c.
+    wv = lw * valid
+    guide = (wv * img).sum(dim=1, keepdim=True) / (wv * k).sum(
+        dim=1, keepdim=True).clamp_min(1e-4)
+    recon = (k * guide).clamp(0.0, _RECON_CEIL)
+
+    # Two more things have to be true before a value is trusted. There has to
+    # have been a clean pixel within reach to read the colour from (`ev`), and
+    # this pixel has to have at least one channel of its own left to read its
+    # brightness off -- one white in all three has nothing to be recovered from
+    # and must come through untouched rather than through a division by an
+    # epsilon.
+    w = amount * clipped * ev
+    return img + w * (recon - img).clamp_min(0.0), w
+
+
+def _reconstruct_highlights(
+    img: torch.Tensor, amount: float, radius: float,
+) -> torch.Tensor:
+    """`_recon_estimate`, then the roll that makes its result *visible*.
+
+    Kept as one stage behind one slider because either half alone is useless: the
+    estimate without the roll is invisible, and the roll without the estimate is
+    just a highlight dimmer. ``pad_for`` carries all three of the kernels
+    involved, in series.
+    """
+    out, w = _recon_estimate(img, amount, radius)
+
+    # The roll that makes any of that *visible*, which the first version of this
+    # stage left out and which made the whole control read as dead.
+    #
+    # Reconstruction's output is above 1.0 -- that is the entire point, it is
+    # where the clipped channel really was -- and the section's final clamp then
+    # took it straight back off, so the slider moved 0.0004 of mean level on a
+    # real photograph. Reported as "I don't see any effect from those sliders at
+    # all", and correct. Pairing it with Highlights did work (0.395 of max change
+    # against 0.05) but a control that needs a second, differently-named control
+    # to do anything is broken however clearly the help text says so.
+    #
+    # There is a hard constraint here worth stating, because it rules out the
+    # tidier designs: **any curve that brings over-range data into view must move
+    # in-gamut highlights too.** A gamut map with its knee exactly at 1.0 has to
+    # jump -- it would send v = 1 to 1 - d -- so a smooth one needs its knee
+    # below 1, and everything above that knee moves. "Visible on its own" and
+    # "bit-exact no-op" are therefore in genuine conflict for a *global* curve.
+    #
+    # The way out is to make it **local**: gate the roll on reconstruction's own
+    # weight field, blurred. Then the conflict dissolves rather than being
+    # traded off --
+    #
+    # * where nothing was repaired the gate is 0, the roll is the identity, and
+    #   an unblown photograph comes through **bit-exactly** untouched, which is
+    #   the property that keeps this a repair tool and not a second highlight
+    #   grade;
+    # * where something was repaired the roll engages and the recovered detail
+    #   appears;
+    # * and the gate is smooth, so there is no contour at the boundary -- a
+    #   per-pixel gate would outline every repaired region.
+    #
+    # Same `_shoulder` as `_tone_roll`, but applied **per channel** -- the
+    # opposite of the tone stage's channel-max-and-uniform-scale, and the
+    # difference is not stylistic.
+    #
+    # Uniform scaling holds hue *exactly*, which is a virtue in the tone stage
+    # because its input is near the cube already. Here the input can be 2-4x over
+    # white in **one** channel, and holding the ratio exact then means dragging
+    # the other two down by the same factor. Measured on a real photograph before
+    # this was changed: a bright warm highlight at (1.000, 0.871, 0.634) came out
+    # (1.000, 0.305, 0.222) -- luma 0.882 -> 0.447, a **dark saturated red where a
+    # bright highlight had been**, on about 6% of the frame. Exactly the artifact
+    # this stage exists to remove, introduced by the stage itself.
+    #
+    # Per channel, each rolls against its own headroom: the reconstructed 2.0 in
+    # red comes back to just under white while green barely moves and blue, below
+    # the knee, is untouched. The highlight stays bright and loses a little
+    # saturation -- which is what film does as a dye layer approaches saturation,
+    # and is the same behaviour `highlight_desat` models further down the
+    # pipeline. Fitting an out-of-gamut brightness into the cube costs either
+    # saturation or luminance; for a highlight, saturation is the right one to
+    # spend.
+    # **Dilate before feathering, or the radius fights the repair.** A plain blur
+    # of the weight field dilutes it: a blown region 120px across, gated through
+    # a sigma-100 blur, comes out with a peak well under 1, so the roll weakens
+    # and *less* of the recovered range becomes visible. Measured before this
+    # was added, the recovered span ran 0.069 at a 16px radius down to 0.041 at
+    # 200px -- i.e. reaching further to find the colour made the repair fainter,
+    # which is not what the control says it does.
+    #
+    # Growing the mask first and feathering the grown version is the standard fix
+    # and it decouples the two: the gate stays saturated across everything that
+    # was repaired, whatever the radius, and only its outer ramp widens.
+    # Separable, as two 1-D max pools, because a single 2-D pool at a 200px
+    # radius is a 401x401 window.
+    # Dilate **wider than the feather**, or the gate never saturates: a blur of a
+    # mask dilated by exactly its own sigma pulls the peak back below 1 near the
+    # mask's edge, so the roll runs at partial strength and leaves over-range
+    # values for the hard clamp to flatten -- the original bug, in miniature.
+    # Growing by 2x the feather leaves the interior at a clean 1.0.
+    rg = max(1, int(round(radius * _RECON_ROLL_GATE_FRAC)))
+    rd = 2 * rg
+    gate = w.amax(dim=1, keepdim=True)
+    gate = F.max_pool2d(gate, (1, 2 * rd + 1), stride=1, padding=(0, rd))
+    gate = F.max_pool2d(gate, (2 * rd + 1, 1), stride=1, padding=(rd, 0))
+    gate = _blur(gate, float(rg))
+    d = 1.0 - _RECON_ROLL_KNEE
+    t = ((out - _RECON_ROLL_KNEE) / d).clamp_min(0.0)
+    return torch.where(
+        out > _RECON_ROLL_KNEE,
+        _RECON_ROLL_KNEE + d * (t + gate * (_shoulder(t) - t)),
+        out,
+    )
 
 
 # Middle grey (0.18 linear) sits near here once sRGB-encoded; the straight-line
@@ -382,31 +1168,106 @@ def _characteristic_curve(
     return x
 
 
+def _u64(v: int) -> int:
+    """Reinterpret a 64-bit constant as the signed int64 with the same bits."""
+    return int(np.uint64(v).astype(np.int64))
+
+
+# splitmix64's mixing constants, as signed int64. Multiplication and addition are
+# bit-identical for signed and unsigned two's complement, so the same bit
+# patterns give the same hash -- only the *shifts* need care. See `_lsr`.
+_HASH_KY = _u64(0xC2B2AE3D27D4EB4F)
+_HASH_KX = _u64(0x9E3779B97F4A7C15)
+_HASH_M1 = _u64(0xBF58476D1CE4E5B9)
+_HASH_M2 = _u64(0x94D049BB133111EB)
+
+
+def _lsr(n: torch.Tensor, k: int) -> torch.Tensor:
+    """Logical (unsigned) right shift on an int64 tensor.
+
+    torch has no uint64, and int64 `>>` is *arithmetic* -- it smears the sign bit
+    down instead of shifting zeros in, so it is simply the wrong operator for a
+    hash. Masking off the bits above the shift width restores the unsigned
+    result: after shifting right by ``k`` only ``64 - k`` bits can be set.
+
+    **The mask has to come from ``k``.** A first pass at this used one wide
+    constant for every shift, which produced something that still *looked* like
+    noise and was a different field -- exactly the kind of bug that survives an
+    eyeball test, which is why ``verify.py`` asserts bit-equality against the
+    numpy reference rather than rendering a frame and squinting at it.
+    """
+    return (n >> k) & ((1 << (64 - k)) - 1)
+
+
 def _lattice_np(iy0: int, ix0: int, hl: int, wl: int, seed: int, nfields: int) -> np.ndarray:
     """Deterministic hash noise on an integer lattice window.
 
-    Computed in uint64 on the CPU: integer hashing is exact here and portable,
-    whereas 64-bit integer ops are poorly supported on MPS. The lattice is far
-    smaller than the pixel grid, so this is cheap.
+    Integer hashing, so it runs on the CPU rather than the GPU: 64-bit integer
+    ops are poorly supported on MPS, and the exactness is the point -- two tiles
+    asking about the same lattice point must agree bit for bit or exports seam.
+
+    **It is not a small amount of work, whatever the shape of the lattice
+    suggests.** An older version of this note claimed the lattice is "far smaller
+    than the pixel grid, so this is cheap", and that is false at every setting
+    the app actually ships. ``cell`` is floored at ``_MIN_CELL`` = 0.8 *working*
+    pixels and every preset in ``presets/`` sets ``grain_size`` to 0.1-0.3, so
+    the base lattice is *denser* than the pixel grid. Measured lattice points
+    hashed per output pixel: defaults 2.5x, Dreamy 5.7x, Dramatic 38x, Subtle
+    48x, ExtraGrain 54x, **Stock 58x** -- 291M hashes for one 2400px proxy
+    preview. It was 23% of that render's wall time.
+
+    So it runs in **torch on the CPU rather than numpy**, which is worth 2.5x for
+    free: numpy's uint64 elementwise ops are single-threaded, torch's int64 ones
+    use ``at::parallel_for`` across every core, and the arithmetic is otherwise
+    identical. Measured 113ms -> 46ms on a 44M-point lattice, bit-exact. It stays
+    on the CPU (rather than moving to the GPU in 32-bit, which would be faster
+    still) because that would change every value and reroll every preset's grain.
+
+    Returns numpy for its callers' ``torch.from_numpy(...)``; the conversion
+    shares memory and costs nothing.
     """
-    # Lattice indices go negative near the origin; reinterpret the bits rather
-    # than casting, so negative coordinates wrap into the hash domain.
-    yy = np.arange(iy0, iy0 + hl, dtype=np.int64).view(np.uint64)[:, None]
-    xx = np.arange(ix0, ix0 + wl, dtype=np.int64).view(np.uint64)[None, :]
-    out = np.empty((nfields, hl, wl), dtype=np.float32)
+    # Lattice indices go negative near the origin; the int64 bit pattern *is* the
+    # unsigned one, so this needs no reinterpretation -- it is the same wrap the
+    # old `.view(np.uint64)` produced.
+    yy = torch.arange(iy0, iy0 + hl, dtype=torch.int64).unsqueeze(1)
+    xx = torch.arange(ix0, ix0 + wl, dtype=torch.int64).unsqueeze(0)
+    out = torch.empty((nfields, hl, wl), dtype=torch.float32)
     for f in range(nfields):
-        # Fold the seed in Python ints so the wrap is explicit and numpy does
-        # not warn about the (intentional) scalar overflow.
-        s = np.uint64(((seed + f * 7919) * 0x165667B19E3779F9) % (1 << 64))
-        n = xx * np.uint64(0x9E3779B97F4A7C15) + yy * np.uint64(0xC2B2AE3D27D4EB4F)
-        n = n + s
-        n = n ^ (n >> np.uint64(29))
-        n = n * np.uint64(0xBF58476D1CE4E5B9)
-        n = n ^ (n >> np.uint64(32))
-        n = n * np.uint64(0x94D049BB133111EB)
-        n = n ^ (n >> np.uint64(31))
-        out[f] = (n >> np.uint64(40)).astype(np.float32) / float(1 << 24)
-    return out
+        # Fold the seed in Python ints so the wrap is explicit.
+        s = _u64(((seed + f * 7919) * 0x165667B19E3779F9) % (1 << 64))
+        n = xx * _HASH_KX + yy * _HASH_KY + s
+        n = n ^ _lsr(n, 29)
+        n = n * _HASH_M1
+        n = n ^ _lsr(n, 32)
+        n = n * _HASH_M2
+        n = n ^ _lsr(n, 31)
+        out[f] = _lsr(n, 40).to(torch.float32) / float(1 << 24)
+    return out.numpy()
+
+
+def _lat_span(
+    n: int, origin: float, cell: float, pad_lo: int, pad_hi: int,
+) -> tuple[int, int]:
+    """First lattice index and count covering ``n`` working pixels from ``origin``.
+
+    Exists to keep this arithmetic off the GPU. The three noise builders used to
+    build their coordinate ramp on the device and then read scalars back off it
+    (``int(math.floor(float(ys[0])))``), and every such read drains the MPS
+    command queue -- counted 32 per ``render_supersampled`` at defaults and 108
+    at ``Stock``, each a full pipeline stall for a number Python already had.
+
+    **Computed in float32, and that is not pedantry.** The device ramp is
+    ``torch.arange(n, dtype=float32) + origin``, and a Python float scalar takes
+    the tensor's dtype, so the whole expression is float32. Doing it in float64
+    here would occasionally land on the other side of an integer boundary and
+    select a *different* lattice window -- which is a different noise field, not
+    a rounding difference. ``verify.py`` pins this against the device path.
+    """
+    f = np.float32
+    lo = f(f(f(0.0) + f(origin)) / f(cell))
+    hi = f(f(f(n - 1) + f(origin)) / f(cell))
+    i0 = int(math.floor(float(lo))) - pad_lo
+    return i0, int(math.floor(float(hi))) + pad_hi - i0 + 1
 
 
 def _value_noise(
@@ -426,13 +1287,11 @@ def _value_noise(
     of pixels tall and a couple wide.
     """
     cy = cell if cell_y is None else cell_y
+    iy0, hl = _lat_span(h, y0, cy, 1, 2)
+    ix0, wl = _lat_span(w, x0, cell, 1, 2)
+
     ys = (torch.arange(h, device=device, dtype=torch.float32) + float(y0)) / cy
     xs = (torch.arange(w, device=device, dtype=torch.float32) + float(x0)) / cell
-
-    iy0 = int(math.floor(float(ys[0]))) - 1
-    ix0 = int(math.floor(float(xs[0]))) - 1
-    hl = int(math.floor(float(ys[-1]))) + 2 - iy0 + 1
-    wl = int(math.floor(float(xs[-1]))) + 2 - ix0 + 1
 
     lat = torch.from_numpy(_lattice_np(iy0, ix0, hl, wl, seed, nfields))
     lat = lat.to(device).unsqueeze(0)
@@ -452,6 +1311,349 @@ def _value_noise(
     return F.grid_sample(
         lat, grid, mode="bilinear", align_corners=True, padding_mode="border"
     )
+
+
+def _cell_noise(
+    h: int, w: int, y0: float, x0: float, cell: float, seed: int, nfields: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """One constant hash value per lattice cell -- blocky, and *uniform*.
+
+    The counterpart to ``_value_noise``, and it exists for one reason:
+    interpolation destroys the distribution. Quintic value noise is heavily
+    centre-weighted -- p10-p90 spans only 0.41-0.71 -- which is fine for a
+    field you are going to threshold or spread, and useless for one you are
+    going to *quantise*. ``floor(n * 4)`` over an interpolated field returns 1
+    or 2 almost every time, so a four-way stencil would fire two of its four
+    directions and the scatter would come out with a diagonal bias nobody
+    asked for. Reading the lattice without interpolating gives back the hash's
+    own uniform distribution, so every direction is equally likely.
+
+    Blockiness is the other half of the point. Every pixel inside one cell
+    reads the same value, so a whole cell of image is displaced as a unit --
+    that is what ``scatter_cell`` means, and it is why detail can survive the
+    trip instead of dissolving. Addressed by global coordinates like every
+    other field here, so two tiles asking about the same pixel agree.
+    """
+    iy0, hl = _lat_span(h, y0, cell, 0, 0)
+    ix0, wl = _lat_span(w, x0, cell, 0, 0)
+
+    ys = (torch.arange(h, device=device, dtype=torch.float32) + float(y0)) / cell
+    xs = (torch.arange(w, device=device, dtype=torch.float32) + float(x0)) / cell
+
+    lat = torch.from_numpy(_lattice_np(iy0, ix0, hl, wl, seed, nfields)).to(device)
+    iy = (torch.floor(ys).long() - iy0).clamp(0, hl - 1)
+    ix = (torch.floor(xs).long() - ix0).clamp(0, wl - 1)
+    return lat[:, iy][:, :, ix].unsqueeze(0)
+
+
+# Jitter range for `_variable_cell_noise`'s point placement, as a fraction of
+# the cell. Keeping every point in the middle half of its own cell -- never
+# closer than a quarter-cell to an edge -- is what lets the neighbour search
+# below be *exact* rather than a heuristic, given the search radius below.
+_VARCELL_JITTER_LO = 0.25
+_VARCELL_JITTER_SPAN = 0.5
+
+# How many rings of neighbouring cells the search below checks, each way --
+# 2 means 5x5 (25 candidates). Worked from the far corner case: a point in the
+# first excluded ring is at least ``(RINGS + 1 - 0.75)`` cells from a pixel in
+# the search centre's own cell, and no point's radius can exceed one cell (see
+# ``_variable_cell_noise``), so the domain-warp amplitude below has to leave
+# at least that much margin over the 1-cell radius. At 1 ring (3x3) the margin
+# is only 0.25 cells, which measurably was not enough room to fix the
+# resonance below without also risking the proof; at 2 rings (5x5) it is 1.25,
+# comfortable enough that the warp amplitude is the only thing this trades
+# against, not correctness.
+_VARCELL_RINGS = 2
+
+# A domain warp on the pixel side of the distance computation only -- never on
+# which cell a pixel is nominally assigned to, which would need the search
+# proof above re-done against a wider slack. It exists for one specific
+# failure mode: when the working-pixel cell size lands on (or very near) an
+# exact integer, every pixel's position falls at *exactly the same* fractional
+# offset within its own cell, for every row and column -- the sampling grid
+# and the cell grid are commensurate, so no pixel is ever nearer than
+# `_VARCELL_JITTER_LO` of a cell to any point, anywhere, and the field can
+# never reach its own full amplitude. Measured on a flat field: cell 1.00
+# scored 0.123 std against 0.193 at 1.05 or 0.95, a >35% amplitude hole
+# exactly where a user's slider is most likely to land, since round numbers
+# are round numbers before and after the working-scale multiply.
+#
+# A first attempt warped by only 0.12 cells, the most a 3x3 (1-ring) search
+# could safely absorb, and it was not enough: measured, cell 1.00 only moved
+# 0.123 -> 0.128, because breaking a phase lock that pins *every* pixel at the
+# same offset takes a warp comparable to half a cell, not a tenth of one.
+# Widening the search to 5x5 buys room for that: swept 0.5 to 1.2 cells at
+# cell 1.00 against cell 1.6 as a control, and 0.7 is where the two agree to
+# within 0.3% (0.899 -> 0.997 -> back up past 1.0 and settling around 1 as the
+# warp overshoots and returns) -- comfortably inside the 1.25-cell budget the
+# 5x5 search allows. Sourced from `_value_noise` rather than a second point
+# lattice: interpolated noise does not itself suffer this failure mode (its
+# output varies smoothly pixel to pixel regardless of whether its own cell
+# aligns with the pixel grid), so it cannot reintroduce the same problem at
+# one remove.
+_VARCELL_WARP_CELL_FRAC = 0.37
+_VARCELL_WARP_AMOUNT = 0.7
+
+# How much better a candidate's falloff has to be than the current winner's
+# before it takes over. See the tie-break comment where this is used: the
+# coordinate arithmetic behind `dist` differs in its last bit or two between
+# computation paths, and without a margin comfortably above that noise floor
+# a near-tie between two candidates can resolve to a *different* winning
+# point -- and therefore a different brightness -- depending on how a tile
+# happened to be padded and cropped to get there.
+#
+# Swept 1e-4 to 1e-2 against a scene that reproduced the failure: 1e-4 still
+# left a 4.9e-3 tile-independence gap (too close to the ~2e-5 noise floor to
+# fully cover it), 3e-4 to 1e-3 both closed it to 1.4e-4, and 1e-2 reopened a
+# much larger one (4.9e-2) -- a margin that wide starts treating pixels with a
+# genuine, non-noise difference in falloff as tied, which is a different
+# failure than the one this exists to fix. Set in the middle of the working
+# range rather than at its edge.
+_VARCELL_TIE_MARGIN = 1e-3
+
+
+def _variable_cell_noise(
+    h: int, w: int, y0: float, x0: float, lo: float, hi: float, seed: int,
+    device: torch.device, nfields: int = 1,
+) -> torch.Tensor:
+    """Cellular ("Worley-style") noise with an independently random radius per
+    point, drawn uniformly from ``[lo, hi]`` -- genuine per-clump size
+    variation, rather than one clump size for the whole field.
+
+    ``_fbm`` cannot do this: its lattice is addressed on a single uniform
+    pitch, so every "clump" it produces is the same size by construction --
+    Octaves and Roughness change how much *structure* stacks on top of the
+    base clump, never the base clump's own size. Getting an independently
+    sized clump means giving up the uniform lattice and its cheap
+    ``grid_sample`` interpolation trick, and building the field from discrete
+    points instead.
+
+    One point per cell of a base lattice pitched at ``hi`` -- the *largest*
+    radius any point can have, which is what makes the fixed-ring neighbour
+    search below exact rather than approximate (see ``_VARCELL_JITTER_LO`` and
+    ``_VARCELL_RINGS`` for the proof). Each point's position is jittered
+    within the middle half of its cell, and each draws its own radius
+    uniformly from ``[lo, hi]`` and its own brightness, all from one hash per
+    cell -- deterministic and addressed in global coordinates, so two tiles
+    asking about the same point agree.
+
+    A pixel takes its value from whichever of the candidate points has
+    the strongest claim on it -- the largest radial falloff (1 at that point's
+    own centre, 0 at its own radius, cubic in between), which is "closest
+    *relative to that point's own size*" rather than closest in raw distance.
+    That point's own signed brightness, scaled by the falloff, is the output.
+    Selecting by falloff rather than combining every candidate is what keeps
+    this reading as discrete particles with their own edges rather than as
+    fog, and it is what makes coverage gaps -- clear film base between grains,
+    where no point's falloff ever rises off zero -- an honest consequence of a
+    wide ``lo``-``hi`` range rather than a bug to paper over.
+
+    **Centred on 0.5, the same convention `_fbm` returns, and for the same
+    reason `_smooth_noise` needs it**: that function re-centres explicitly
+    (``0.5 + blur(n - 0.5, sigma) * gain``), so a field that means something
+    different at 0.5 would be blurred around the wrong point. A gap -- every
+    candidate's falloff at zero -- must land exactly on 0.5, the shared
+    "no deviation" value both the blur and the caller's later ``*2-1`` remap
+    already assume; landing gaps on raw zero instead would read as the
+    strongest possible *darkening* over most of the frame the moment any
+    range wider than a sliver of ``lo``-``hi`` left real gaps, which is
+    backwards from "nothing is here". So brightness is drawn signed, in
+    ``[-1, 1)``, and the output is ``0.5 + 0.5 * falloff * brightness``: a gap
+    (falloff 0) is 0.5 regardless of any candidate's brightness, and a pixel
+    sitting in a point's centre reaches its own brightness at full amplitude,
+    lighter or darker with equal likelihood -- matching how real grain is not
+    one-sided either.
+
+    Returns shape ``[1, nfields, h, w]``, matching `_fbm`'s convention, so it
+    drops into the same normalise-and-clamp pipeline the mono and chroma
+    global-grain fields already share. Geometry (positions and radii) is
+    identical across fields and the winning point is chosen once, shared by
+    every field; only brightness is drawn independently per field and read
+    from whichever point won -- the same "shared shape, independent value"
+    pattern ``_lattice_np`` already gives ``_fbm``'s multi-field calls, and it
+    is what lets a chroma variant share every grain's position and size across
+    channels while still giving each channel its own intensity.
+    """
+    cell = hi
+    # The ramp is monotonically increasing (cell > 0 always), so its min and max
+    # are its first and last entries -- which `_lat_span` computes in Python,
+    # saving both the scalar reads and the two full-tensor reductions that used
+    # to feed them.
+    iy0, hl = _lat_span(h, y0, cell, _VARCELL_RINGS, _VARCELL_RINGS)
+    ix0, wl = _lat_span(w, x0, cell, _VARCELL_RINGS, _VARCELL_RINGS)
+
+    # Three geometry channels (jitter y, jitter x, radius fraction) plus one
+    # brightness channel per output field, all from the one hash so a single
+    # CPU call covers the whole lattice window.
+    lat = torch.from_numpy(_lattice_np(iy0, ix0, hl, wl, seed, 3 + nfields)).to(device)
+    jy = _VARCELL_JITTER_LO + _VARCELL_JITTER_SPAN * lat[0]
+    jx = _VARCELL_JITTER_LO + _VARCELL_JITTER_SPAN * lat[1]
+    rad = lo + lat[2] * (hi - lo)
+    bri = lat[3:] * 2.0 - 1.0  # [nfields, hl, wl], signed -- see the docstring
+
+    cell_iy = torch.arange(iy0, iy0 + hl, device=device, dtype=torch.float32)[:, None]
+    cell_ix = torch.arange(ix0, ix0 + wl, device=device, dtype=torch.float32)[None, :]
+    py = (cell_iy + jy) * cell  # [hl, wl], this cell's point in working px
+    px = (cell_ix + jx) * cell
+
+    Y = (torch.arange(h, device=device, dtype=torch.float32) + float(y0))[:, None]
+    X = (torch.arange(w, device=device, dtype=torch.float32) + float(x0))[None, :]
+    # Cell assignment uses the true, unwarped position -- the search proof
+    # above is against this coordinate, and warping it would need a wider
+    # search to stay valid.
+    piy = (torch.floor(Y / cell).long() - iy0).clamp(0, hl - 1)  # [h, 1]
+    pix = (torch.floor(X / cell).long() - ix0).clamp(0, wl - 1)  # [1, w]
+
+    # See `_VARCELL_WARP_CELL_FRAC` -- breaks the pixel-grid/cell-grid
+    # resonance without touching which cell a pixel belongs to.
+    warp_cell = max(_MIN_CELL, _VARCELL_WARP_CELL_FRAC * cell)
+    wn = _value_noise(h, w, y0, x0, warp_cell, seed + 51, 2, device)
+    Yw = Y + (wn[0, 0] * 2.0 - 1.0) * (_VARCELL_WARP_AMOUNT * cell)
+    Xw = X + (wn[0, 1] * 2.0 - 1.0) * (_VARCELL_WARP_AMOUNT * cell)
+
+    # The winning candidate is chosen by falloff alone -- shared across every
+    # field -- and only afterward is that winner's own (per-field) brightness
+    # read out. Selecting by the product instead would let a dim, distant
+    # candidate's positive brightness beat a near-zero-falloff gap into
+    # registering as real signal, which is exactly backwards: a gap must stay
+    # a gap regardless of what any nearby point's brightness happens to be.
+    # Carries the *winning cell*, not the winning brightness. Brightness is
+    # `[nfields, h, w]`, so keeping it in the loop meant `torch.where` rewriting
+    # nfields full-frame planes on all 25 iterations -- 75 plane writes to end up
+    # using one. The flat cell index is a single plane whatever `nfields` is, and
+    # one gather afterwards reads out the winner. Measured 1.26x on this function
+    # at nfields=3 and bit-identical, which it has to be: same candidates, same
+    # order, same comparison, so the same point wins and the same brightness is
+    # read from it. The saving is mostly peak memory, which is what lets a
+    # weaker machine afford a larger tile.
+    best_shape = torch.zeros(h, w, device=device)
+    best_cell = torch.zeros(h, w, device=device, dtype=torch.long)
+    for dy in range(-_VARCELL_RINGS, _VARCELL_RINGS + 1):
+        for dx in range(-_VARCELL_RINGS, _VARCELL_RINGS + 1):
+            ny = (piy + dy).clamp(0, hl - 1)
+            nx = (pix + dx).clamp(0, wl - 1)
+            dxp = Xw - px[ny, nx]
+            dyp = Yw - py[ny, nx]
+            dist = torch.sqrt(dxp * dxp + dyp * dyp)
+            d_norm = dist / rad[ny, nx].clamp_min(1e-3)
+            shape = 1.0 - _smoothstep(0.0, 1.0, d_norm)  # [h, w]
+            # A margin, not a bare `>`: two candidates can be genuinely almost
+            # tied (a pixel near the border between two blobs), and there the
+            # coordinate arithmetic feeding `dist` differs in its last bit or
+            # two depending on how a tile happens to be padded and cropped --
+            # around 2e-5 measured. Without a margin comfortably above that
+            # noise floor, a near-tie can resolve to a *different* winning
+            # point depending on tile layout, which is not a gradual drift but
+            # a discrete jump to that other point's own brightness -- the one
+            # thing a tile-independent field must never do. The margin is
+            # fixed and the candidate order is fixed (same dy, dx sweep every
+            # time), so whichever candidate is reached first while within it
+            # keeps the win consistently, regardless of how the image was
+            # tiled to get here.
+            win = shape > best_shape + _VARCELL_TIE_MARGIN
+            best_cell = torch.where(win, (ny * wl + nx).expand(h, w), best_cell)
+            best_shape = torch.where(win, shape, best_shape)
+
+    # One gather instead of 25 masked writes. `bri` is [nfields, hl, wl] and
+    # `best_cell` indexes its flattened lattice, so this reads each pixel's
+    # winning point's own per-field brightness.
+    best_bri = bri.reshape(nfields, -1).gather(
+        1, best_cell.reshape(1, -1).expand(nfields, -1)
+    ).reshape(nfields, h, w)
+    return (0.5 + 0.5 * best_shape.unsqueeze(0) * best_bri).unsqueeze(0)
+
+
+# Scatter stencils, indexed by the ``scatter_pattern`` parameter. A stencil is
+# the *set of places a displaced pixel may land*, and it takes three
+# independent things to describe one -- which is why this is a table and not
+# just a direction count:
+#
+#   name    matches the parameter's ``choices`` tuple in params.py, entry for
+#           entry. The two are one list in two places.
+#   first   angle of the first direction, in degrees.
+#   count   how many directions, evenly spaced from ``first``. 0 is the
+#           continuous case: any angle at all.
+#   locus   how travel varies with angle -- "circle" is the same distance
+#           every way; "diamond" is |dx|+|dy| = reach, so the shape reaches
+#           furthest along the axes and pulls in on the diagonals.
+#   inner   the hole, as a fraction of the reach. 0 fills the shape solid;
+#           a donut keeps every pixel out past this however Reach Spread is
+#           set, so nothing lands near where it started.
+#   alt     length multiplier on every other direction, which is what makes a
+#           star a star: long spokes on the axes, short ones between them. 1
+#           is uniform.
+#
+# **Every stencil must keep peak travel at or under the reach**, because that
+# is the figure `pad_for` reserves overlap for. "circle" and "diamond" both do
+# (diamond is shorter off-axis, never longer); an L-infinity "square" locus
+# would reach 1.41x on the diagonals and would have to be paid for there.
+#
+# The value stored in a preset file is the *index*, so renumbering these
+# silently changes the look of every preset that used one. Append, do not
+# insert. (Diamond, Donut and Star were inserted mid-list on 2026-08-01, while
+# the feature was still unreleased and no preset had ever stored a pattern.)
+_SCATTER_STENCILS: tuple[tuple[str, float, int, str, float, float], ...] = (
+    # name          first  count  locus      inner  alt
+    ("Any",           0.0,     0, "circle",   0.0,  1.00),
+    ("Cross",         0.0,     4, "circle",   0.0,  1.00),
+    ("Diagonal",     45.0,     4, "circle",   0.0,  1.00),
+    ("Box",           0.0,     8, "circle",   0.0,  1.00),
+    ("Diamond",       0.0,     0, "diamond",  0.0,  1.00),
+    ("Donut",         0.0,     0, "circle",  0.65,  1.00),
+    ("Star",          0.0,     8, "circle",   0.0,  0.40),
+    ("Horizontal",    0.0,     2, "circle",   0.0,  1.00),
+    ("Vertical",     90.0,     2, "circle",   0.0,  1.00),
+)
+
+# How far out a donut's hole pushes the *shortest* journey, and how far a
+# star's short spokes fall behind its long ones. Both live in the table above;
+# these names exist so the numbers there read as something.
+_SCATTER_NAMES: tuple[str, ...] = tuple(s[0] for s in _SCATTER_STENCILS)
+
+
+def _scatter_offsets(
+    sel: torch.Tensor, mag_n: torch.Tensor, reach: float, spread: float,
+    pattern: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-pixel travel in whole working pixels, on the chosen stencil.
+
+    ``sel`` and ``mag_n`` must be uniform on 0..1, which is why they come from
+    ``_cell_noise`` and not from ``_value_noise``: a quantised direction reads
+    the distribution directly, and value noise does not have one worth reading.
+
+    Rounded to whole pixels here and nowhere else. That is what keeps the
+    gather a copy rather than an interpolation, so it has to happen after every
+    shaping term rather than to the reach up front.
+    """
+    _, first, count, locus, inner, alt = _SCATTER_STENCILS[pattern]
+
+    if count == 0:
+        th = sel * (2.0 * math.pi)
+        spoke: torch.Tensor | float = 1.0
+    else:
+        bin_ = torch.floor(sel * count).clamp(0.0, count - 1.0)
+        th = math.radians(first) + bin_ * (2.0 * math.pi / count)
+        # Alternate directions run short. With eight directions starting on
+        # the axes that puts the long spokes N/E/S/W and the short ones on the
+        # diagonals, which is the shape a cross filter actually flares into.
+        spoke = 1.0 if alt == 1.0 else torch.where(
+            (bin_ % 2.0) < 0.5, 1.0, alt
+        )
+
+    c, s = torch.cos(th), torch.sin(th)
+    # Angular shaping. A diamond's vertices sit on the axes, so travel is the
+    # full reach there and 1/sqrt(2) of it on the diagonals -- the locus is
+    # |dx| + |dy| = reach.
+    shape: torch.Tensor | float = (
+        1.0 / (c.abs() + s.abs()).clamp_min(1e-4) if locus == "diamond" else 1.0
+    )
+    # Reach Spread fills the shape inward from its edge; `inner` holds a hole
+    # open in the middle of it whatever Spread says. At inner = 0 this is
+    # exactly reach * (1 - spread * u).
+    radial = inner + (1.0 - inner) * (1.0 - spread * mag_n)
+    r = reach * radial * shape * spoke
+    return torch.round(r * c), torch.round(r * s)
 
 
 def _fbm(
@@ -506,6 +1708,36 @@ def _fbm(
     return 0.5 + (field - 0.5) * gain if gain != 1.0 else field
 
 
+def _smooth_noise(n: torch.Tensor, cell: float, amount: float) -> torch.Tensor:
+    """Blur a 0..1 noise field and put back the amplitude the blur costs.
+
+    The defect this exists for is structural rather than a bad setting: value
+    noise is a quilt of axis-aligned cells, invisible at a 1.6px clump and
+    plainly rectangular at 20px. No amount of re-seeding or extra octaves moves
+    it, because every octave is built on the same kind of lattice -- measured,
+    the two-octave global field scores the same gridiness as one octave alone.
+    A filter on the field is the cure.
+
+    **Variance is restored, and that is the point.** `_fbm` preserves variance
+    so Octaves changes structure at constant strength; this follows the same
+    rule for the same reason. A smoothing control that quietly turned the layer
+    down would leave Global Intensity fighting it, and "smoother" would be
+    indistinguishable from "less".
+
+    The gain is a closed form in ``sigma/cell`` rather than a measurement of
+    the field in hand. Normalising against ``n.std()`` would be a statistic of
+    the region -- invariant 1 -- and would restore a different amount in every
+    tile of an export while every preview looked fine.
+    """
+    if amount <= 0.001:
+        return n
+    sigma = amount * _SMOOTH_MAX * cell
+    if sigma < 0.05:
+        return n
+    gain = math.sqrt(1.0 + _SMOOTH_GAIN_K * (sigma / cell) ** 2)
+    return 0.5 + _blur(n - 0.5, sigma) * gain
+
+
 # --------------------------------------------------------------------------- #
 # pipeline
 # --------------------------------------------------------------------------- #
@@ -513,6 +1745,25 @@ def _fbm(
 class GrainEngine:
     def __init__(self, device: torch.device | None = None) -> None:
         self.device = device or pick_device()
+        # Global Grain texture cache -- see `_global_grain_field`. An
+        # OrderedDict used as an LRU: `move_to_end` on a hit, pop from the front
+        # when over `_GG_CACHE_BYTES`.
+        #
+        # A plain dict needs no lock because `main._RENDER_LOCK` serialises every
+        # render. That is a load-bearing assumption borrowed from the caller: if
+        # renders ever run concurrently, this needs a lock or a per-render cache.
+        self._gg_cache: collections.OrderedDict = collections.OrderedDict()
+        self._gg_bytes = 0
+        # Hit/miss counters, for `verify.py` to assert *which* parameters miss
+        # rather than only that the output is right. A stale-cache bug renders a
+        # plausible texture, so "the numbers changed" is not enough of a test.
+        self.gg_hits = 0
+        self.gg_misses = 0
+
+    def clear_caches(self) -> None:
+        """Drop the Global Grain texture cache."""
+        self._gg_cache.clear()
+        self._gg_bytes = 0
 
     # ------------------------------------------------------------------ #
     def _grain_field(
@@ -553,6 +1804,689 @@ class GrainEngine:
         return t
 
     # ------------------------------------------------------------------ #
+    def _global_grain_field(
+        self, h: int, w: int, y0: float, x0: float, p: dict,
+        gcell: float, gcell_max: float, variable: bool,
+    ) -> torch.Tensor:
+        """The Global Grain texture layer, normalised and clamped. Cached.
+
+        Shape is ``[1,1,h,w]`` at chroma 0 and ``[1,3,h,w]`` above it; both
+        broadcast against the frame, which is why the channel count is allowed to
+        depend on a parameter.
+
+        **Cached because it reads no image data at all.** Every input is either a
+        parameter or the tile's own global coordinates, so nudging Halation or
+        Sharpen currently pays to rebuild a texture that has not changed --
+        measured at 1.29s of a 3.70s `Stock` proxy preview, 35%. The two sliders
+        in this section anyone actually drags, `global_intensity` and
+        `global_opacity`, are applied by the *caller* as a single scalar multiply
+        and so sit outside this boundary entirely: they cannot miss the cache.
+
+        The cache key has to cover every input, and the failure mode if it does
+        not is the nasty kind -- a stale hit renders a perfectly plausible
+        texture that is simply the previous one, so nothing looks broken. What is
+        in it, and why:
+
+        * ``y0, x0, h, w`` -- **absolute global coordinates, never a tile
+          index.** The field is addressed globally (invariant 1), so keying on
+          anything relative would hand one tile another tile's texture and seam
+          every export while every preview looked fine.
+        * ``gcell, gcell_max, variable`` -- the *derived* working cells, not the
+          raw sliders. Two different (size, scale) pairs that floor to the same
+          working cell genuinely produce the same field and should share an
+          entry, and this folds in both `scale` and the supersample level for
+          free, since the caller has already multiplied them in.
+        * ``seed`` -- both field draws offset from it.
+        * ``global_smooth`` -- `_smooth_noise` is inside this boundary.
+        * ``global_chroma`` -- decides whether the second field is built at all,
+          and changes the returned channel count.
+        * the device -- these are device-resident tensors.
+
+        Deliberately *not* keyed on the image or upload: the field never reads
+        either. Two photographs of the same dimensions already get an identical
+        global-grain field today, because the lattice is addressed in absolute
+        coordinates; caching does not change that, it just stops recomputing it.
+
+        Caching the finished field rather than `_lattice_np` is the deliberate
+        choice even though the lattice would be more general. The lattice is the
+        one array in the pipeline you least want to hold: at `Stock` it is ~58
+        points per output pixel (see `_lattice_np`). This is one plane per
+        channel at working resolution.
+        """
+        key = (
+            h, w, float(y0), float(x0), gcell, gcell_max, variable,
+            int(p["seed"]), p["global_smooth"], p["global_chroma"],
+            str(self.device),
+        )
+        hit = self._gg_cache.get(key)
+        if hit is not None:
+            self._gg_cache.move_to_end(key)
+            self.gg_hits += 1
+            return hit
+        self.gg_misses += 1
+
+        def field(seed_off: int, nfields: int) -> torch.Tensor:
+            if variable:
+                return _variable_cell_noise(
+                    h, w, y0, x0, gcell, gcell_max,
+                    int(p["seed"]) + seed_off, self.device, nfields,
+                )
+            return _fbm(
+                h, w, y0, x0, gcell,
+                int(p["seed"]) + seed_off, nfields, 2, 0.5, self.device,
+            )
+
+        gg = field(7717, 1)
+        # Before the normalise-and-clamp, not after: the clamp is what
+        # gives the field its hard tails, and smoothing a clamped field
+        # would leave the plateaus it created and merely round their
+        # corners. Smoothed first, the clamp bites on a field that has
+        # already lost its extremes, so the rails are reached less often.
+        #
+        # Referenced against Max in the variable case: that is the field's
+        # own characteristic scale now (the base lattice pitch
+        # `_variable_cell_noise` places one point per cell of), where Min
+        # was the reference for the old single-size field. Smoothness on
+        # the variable field mostly softens the base-lattice boundary
+        # rather than a value-noise quilt -- there is no axis-aligned quilt
+        # here to begin with, since the points are jittered off-grid.
+        gg = _smooth_noise(gg, gcell_max if variable else gcell, p["global_smooth"])
+        gg = gg * 2.0 - 1.0
+
+        # Chroma: decorrelate the three channels without touching the
+        # monochrome field.
+        #
+        # The obvious construction is `_grain_field`'s -- draw three
+        # independent fields, take their rescaled mean as the monochrome
+        # component and blend outward. It is not used here for two reasons.
+        # It would replace the single field this layer has always been built
+        # from, rerolling every existing preset's global grain at chroma 0;
+        # and that blend does not hold amplitude, because the mean and the
+        # per-channel fields are correlated -- measured pre-clamp, it dips
+        # to 88.8% of its own strength at chroma 0.5 and returns to 99.9% by
+        # 1.0, so the slider quietly moves loudness as well as colour.
+        #
+        # Instead the mono field `m` is kept exactly as it was and a
+        # *mean-zero* deviation `d` is added on top, from its own seed.
+        # Because `d` sums to zero across channels its statistics are fixed
+        # -- var 2/3 and covariance -1/3 of a single field -- and the two
+        # coefficients can be solved rather than guessed:
+        #
+        #     g_c = A*m + B*d_c,   A = sqrt(1 - 2/3 c),  B = sqrt(c)
+        #
+        # gives unit variance and cross-channel correlation exactly `1 - c`
+        # at every setting. Measured: correlation 1.000 / 0.501 / 0.001 at
+        # chroma 0 / 0.5 / 1, pre-clamp amplitude flat to 0.6%, and chroma 0
+        # bit-identical to the old layer (max channel spread 0.0).
+        #
+        # The one thing that does move is the clamp below. Mixing in `d`
+        # gaussianises the field, so it reaches the rails less often --
+        # clipping falls 25.4% -> 22.8% across the slider -- and since a
+        # clipped sample sits at exactly +-1 rather than wherever it was
+        # headed, less clipping means slightly less measured sigma. Rendered
+        # amplitude therefore drifts 100% -> 96.8% from chroma 0 to 1. That
+        # is the hard tails doing their job, not the blend, and it is a
+        # third of the wobble the other construction has.
+        gc = p["global_chroma"]
+        if gc > 0.001:
+            # Same construction as `gg` above (fBm or variable-cell,
+            # whichever `variable` selected), through the same closure --
+            # the decorrelation below only needs `gs` to be a second field
+            # of comparable amplitude, but sharing the geometry generator
+            # means a variable-size chroma field reuses each grain's own
+            # position and radius across channels and only randomises its
+            # per-channel brightness, which is what gives a coloured grain
+            # its speckle without moving its shape from channel to channel.
+            gs = field(3391, 3)
+            gs = _smooth_noise(gs, gcell_max if variable else gcell, p["global_smooth"])
+            gs = gs * 2.0 - 1.0
+            gd = gs - gs.mean(dim=1, keepdim=True)
+            gg = gg * math.sqrt(1.0 - (2.0 / 3.0) * gc) + gd * math.sqrt(gc)
+
+        gg = (gg / _GNORM).clamp(-1.0, 1.0)
+
+        # LRU insert. An entry larger than the whole budget is returned without
+        # being cached rather than immediately evicting itself -- otherwise a
+        # single-tile render of a large frame would thrash the cache empty on
+        # every pass and pay the bookkeeping for nothing.
+        nbytes = gg.element_size() * gg.nelement()
+        if nbytes <= _GG_CACHE_BYTES:
+            self._gg_cache[key] = gg
+            self._gg_bytes += nbytes
+            while self._gg_bytes > _GG_CACHE_BYTES and len(self._gg_cache) > 1:
+                _, old = self._gg_cache.popitem(last=False)
+                self._gg_bytes -= old.element_size() * old.nelement()
+        return gg
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _grade(img: torch.Tensor, p: dict, scale: float) -> torch.Tensor:
+        """Colour grading, step -1: the only block above pre-blur.
+
+        Everything below this models an emulsion. This models the *decision*
+        about what the photograph is before any of that runs -- which is why it
+        sits at the very top and why the LUT is last within it: white balance,
+        exposure and the tonal adjustments set the light and the tonal range,
+        then the LUT reads the picture it was meant to read.
+
+        Written to be cheap, which was the explicit ask, and two of the twelve
+        stages are the only ones that are not free: everything else is pure
+        per-pixel arithmetic with no kernel and no neighbourhood at all, so it
+        costs a couple of passes over the frame and adds nothing to ``pad_for``.
+        Clarity needs a blurred copy to find its band, and it is a
+        *single-channel* blur rather than three because the detail it extracts is
+        added back to all three channels equally. Highlight reconstruction needs
+        two three-channel blurs to find what the light was doing around a blown
+        region -- the one stage here that was accepted as expensive on purpose,
+        because the alternative is losing the highlight.
+
+        Tile independence comes for free everywhere except those two, for the
+        same reason: nothing here reads a statistic of the region. The LUT is a
+        fixed table, temperature/tint are constant vectors, exposure is a
+        constant multiply, and the tone, contrast, black-point, vibrance and
+        saturation stages are all curves or gains on each pixel's own level.
+        Both blurs are kernels like any other and are paid for in ``pad_for``.
+
+        Clamping happens **once**, after the tone stage, and not after each
+        stage. That is load-bearing rather than tidy: white balance and exposure
+        can push a value out of the cube, and clipping it there is precisely
+        what made the highlight control a brightness shift over an already-flat
+        patch instead of a recovery.
+        """
+        temp = p["grade_temp"]
+        tint = p["grade_tint"]
+        ev = p["grade_exposure"]
+        sh = p["grade_shadows"]
+        hl = p["grade_highlights"]
+        ct = p["grade_contrast"]
+        bp = p["grade_black_point"]
+        cl = p["grade_clarity"]
+        vib = p["grade_vibrance"]
+        sat = p["grade_saturation"]
+        rec = p["grade_recover"]
+        lut = p.get("lut")
+        mix = p["lut_amount"]
+
+        # -1z. Highlight reconstruction, above everything including white
+        #      balance -- the only stage in this section that adds information
+        #      rather than rearranging it.
+        #
+        #      First because every stage below reads the picture and this
+        #      changes what the picture *is*: white balance multiplying a
+        #      channel that is sitting on the ceiling multiplies a wrong number,
+        #      exposure raises a plateau as a plateau, and the tone curve can
+        #      only roll off what it was given. Restore the channel first and
+        #      all three are working on the scene instead of on the file's
+        #      ceiling.
+        #
+        #      The one kernel here besides Clarity, and `pad_for` carries it.
+        if rec > 0.001:
+            img = _reconstruct_highlights(
+                img, rec, max(1.0, p["grade_recover_radius"] * scale),
+            )
+
+        # -1a. White balance: temperature (blue/amber) and tint (green/magenta),
+        #      in linear light.
+        #
+        #      A white balance is a change in the *illuminant*, so it multiplies
+        #      light -- and gamma-encoded values are not light. Done encoded the
+        #      same gain moves the shadows much further than the highlights,
+        #      which is what makes a naive slider read as a tint laid over the
+        #      picture instead of a different lamp. Same argument as
+        #      `pre_blur`'s, and gated the same way so the transfer round trip
+        #      costs nothing when both stages are off.
+        #
+        #      One round trip for both axes, not two: a change of illuminant
+        #      moves along both at once, so temperature and tint are one
+        #      physical operation rather than two, and the combined gain vector
+        #      is normalised by its own luma exactly once so the control stays
+        #      colour-only -- warming or tinting a frame must not also expose
+        #      it, or every other tonal control in the app is being fought by
+        #      this one.
+        if abs(temp) > 0.001 or abs(tint) > 0.001:
+            gt = _GRADE_TEMP_GAIN * temp
+            gn = _GRADE_TINT_GAIN * tint
+            gain = [1.0 + gt + gn, 1.0 - gn, 1.0 - gt + gn]
+            norm = sum(w * c for w, c in zip(_LUMA, gain))
+            gain = torch.tensor(
+                [c / norm for c in gain], device=img.device, dtype=img.dtype,
+            ).view(1, 3, 1, 1)
+            # Deliberately not clamped here. A clamp would clip whichever
+            # channel the new illuminant raises, which both breaks the hue it
+            # was setting and throws away the headroom the tone stage below
+            # exists to recover; the section clamps once, after that stage.
+            img = _linear_to_srgb(_srgb_to_linear(img) * gain)
+
+        # -1b. Exposure, in linear light, ahead of every luma-keyed mask below --
+        #      Shadows, Highlights, Clarity, Vibrance and Saturation all measure
+        #      *this* image, so raising exposure first means they read the frame
+        #      at the light level actually being graded rather than the one that
+        #      arrived. Same construction as Tone Response's Brightness: a
+        #      stops multiply that lets the sRGB encoding roll the highlights
+        #      off on the way back, instead of a display-referred stretch that
+        #      would clip them flat.
+        #
+        #      Not clamped, for the same reason white balance above is not: a
+        #      stop of exposure that clips here is a stop of highlight the
+        #      recovery curve below can never give back, and clipping it is
+        #      exactly the "no recovery, just a brightness shift" failure this
+        #      section had. The over-range value survives to the tone stage,
+        #      which rolls it back inside the cube with its detail intact -- or
+        #      to the single clamp after it, which is bit-identical to clamping
+        #      here when the tone controls are off.
+        if abs(ev) > 0.001:
+            img = _linear_to_srgb(_srgb_to_linear(img) * (2.0 ** ev))
+
+        # -1c/d. Shadows and highlights, display-referred: tone *recovery*, not
+        #        a brightness shift over the region that happens to be bright.
+        #
+        #        Two decisions, and each fixes something the share-of-headroom
+        #        version above them got wrong.
+        #
+        #        **The curve is `_tone_roll`, which is monotone by algebra.**
+        #        The previous formula scaled its own strength by the pixel's
+        #        level through a steep quintic, and in the recovering
+        #        directions -- Shadows up, Highlights down, the two anyone
+        #        actually reaches for -- that term overwhelmed the identity and
+        #        the transfer inverted: slope **-0.21 across 16% of the range**
+        #        at full travel. A control that reverses tonal order does not
+        #        recover a highlight, it flattens it into exactly the
+        #        textureless patch it was supposed to rescue, which is what was
+        #        reported. Here the rail is an asymptote instead, so the whole
+        #        of ``[knee, infinity)`` folds into ``[knee, rail)`` with
+        #        ordering intact -- over-range data from reconstruction, from
+        #        exposure or from a bright source becomes *visible detail*
+        #        rather than a clip.
+        #
+        #        **It keys on the channel maximum and scales all three
+        #        together.** The value, not the luma, is the right question for
+        #        a control about clipping: a saturated red at (1, 0, 0) has a
+        #        channel hard against the ceiling while its luma is 0.21, and
+        #        the old luma key called that a shadow. And because the whole
+        #        pixel is scaled by one factor, hue and HSV saturation are
+        #        preserved *exactly* rather than approximately -- a uniform
+        #        scale cannot move a ratio -- while gamut safety is structural:
+        #        the curve's output is bounded by the rail, so every channel,
+        #        being at or below the maximum, is too.
+        #
+        #        The two halves need no shared reference and no ordering rule.
+        #        Highlights only touches ``v > knee`` and cannot push a value
+        #        below it; Shadows only touches ``v < knee`` and cannot push one
+        #        above. Their supports are disjoint, so they are independent by
+        #        construction -- a stronger version of what one shared luma was
+        #        buying, and it cannot be got wrong by a later edit.
+        if abs(sh) > 0.001 or abs(hl) > 0.001:
+            v = img.amax(dim=1, keepdim=True)
+            vt = v
+            if abs(hl) > 0.001:
+                d = 1.0 - _GRADE_TONE_KNEE
+                t = ((vt - _GRADE_TONE_KNEE) / d).clamp_min(0.0)
+                vt = torch.where(
+                    vt > _GRADE_TONE_KNEE,
+                    _GRADE_TONE_KNEE + d * _tone_roll(t, -hl),
+                    vt,
+                )
+            if abs(sh) > 0.001:
+                d = _GRADE_TONE_KNEE
+                t = ((_GRADE_TONE_KNEE - vt) / d).clamp_min(0.0)
+                vt = torch.where(
+                    vt < _GRADE_TONE_KNEE,
+                    _GRADE_TONE_KNEE - d * _tone_roll(t, sh),
+                    vt,
+                )
+            img = img * (vt / v.clamp_min(1e-4))
+
+        # The section's one gamut clamp, and it is *here* rather than after each
+        # stage above so that white balance and exposure can hand their
+        # over-range result to the tone stage instead of having it clipped away
+        # first. That is the difference between "recover the highlight" and
+        # "recover what is left of the highlight after we threw it away": raise
+        # exposure a stop and pull Highlights back, and the picture comes back,
+        # because nothing between the two ever rounded it off to white.
+        #
+        # With both tone controls at 0 this lands on exactly the old behaviour,
+        # since a monotone brightening followed by a clamp is the same picture
+        # whichever end the clamp sits at -- and it is bit-exactly a no-op on
+        # in-gamut input, which is what keeps the neutral render untouched.
+        img = img.clamp(0.0, 1.0)
+
+        # -1e. Contrast: a two-way pivot about the same middle grey the
+        #      (deferred) film characteristic curve uses, done directly rather
+        #      than through a toe and shoulder.
+        #
+        #      The gain is floored at 0 so no setting inverts the picture
+        #      through grey -- at -1 the spread is a tenth of the original
+        #      rather than crossing zero. Unlike the film curve, nothing here
+        #      asymptotes, so a strong positive setting clips outright: that is
+        #      what a quick contrast control is expected to do, and it runs
+        #      after Shadows/Highlights precisely so the clip-free version is
+        #      available first.
+        if abs(ct) > 0.001:
+            gain_ct = max(0.0, 1.0 + _GRADE_CONTRAST_GAIN * ct)
+            img = (_MID_GREY + (img - _MID_GREY) * gain_ct).clamp(0.0, 1.0)
+
+        # -1f. Black point: the blunt Levels-style remap, not a masked lift.
+        #
+        #      Every value at or below `bp` is driven to 0 and 1 stays exactly
+        #      at 1, so this genuinely crushes shadow detail rather than easing
+        #      it -- the opposite trade from Shadows above, and the reason both
+        #      exist. One-directional: there is nothing below 0 to lift from.
+        if bp > 0.001:
+            img = ((img - bp) / max(1.0 - bp, 1e-4)).clamp(0.0, 1.0)
+
+        # -1g. Clarity: two-way local contrast on one band.
+        #
+        #      The band is the luma's own high-pass at the chosen radius, added
+        #      back to all three channels. Doing it on luminance rather than per
+        #      channel is both the cheaper and the better choice -- one blur
+        #      instead of three, and because the same signed amount goes to R, G
+        #      and B the hue is held exactly, so a saturated area cannot be
+        #      pushed out of gamut by a control that is meant to be about
+        #      structure.
+        #
+        #      The negative side is capped at gain 1.0 while the positive side
+        #      gets _GRADE_CLARITY_GAIN. That asymmetry is deliberate: at gain 1
+        #      a setting of -1 subtracts exactly the band it measured, i.e. the
+        #      local contrast is gone. Past that it does not keep flattening, it
+        #      reverses -- a dark halo on the light side of every edge, which is
+        #      an artifact rather than a look. There is no such ceiling going
+        #      the other way.
+        if abs(cl) > 0.001:
+            r = max(0.5, p["grade_clarity_radius"] * scale)
+            lum_c = _luma(img)
+            detail = lum_c - _blur(lum_c, r)
+            gain_c = cl * (_GRADE_CLARITY_GAIN if cl > 0 else 1.0)
+            img = (img + gain_c * detail).clamp(0.0, 1.0)
+
+        # -1h. Vibrance: saturation weighted against how saturated a pixel
+        #      already is, so muted colour comes up while colour that is
+        #      already strong is left alone. Identical construction to Tone
+        #      Response's own Vibrance, kept as its own parameter because this
+        #      section runs before the film pipeline and the two must stay
+        #      independent -- see params.py for why sharing one slider would be
+        #      wrong. Saturation is chroma-over-value, the HSV definition, so a
+        #      deep, dark red still reads as fully saturated.
+        if abs(vib) > 0.001:
+            mx = img.amax(dim=1, keepdim=True)
+            mn = img.amin(dim=1, keepdim=True)
+            s_ = (mx - mn) / mx.clamp_min(1e-4)
+            lum_v = _luma(img)
+            gain_v = (1.0 + vib * (1.0 - s_)).clamp_min(0.0)
+            img = (lum_v + (img - lum_v) * gain_v).clamp(0.0, 1.0)
+
+        # -1i. Saturation: a flat multiply about the same luma axis, unweighted
+        #      by how saturated a pixel already is -- the blunt control
+        #      Vibrance is deliberately not. -1 lands exactly on the luma
+        #      (monochrome), +1 doubles chroma.
+        if abs(sat) > 0.001:
+            lum_s = _luma(img)
+            gain_s = max(0.0, 1.0 + sat)
+            img = (lum_s + (img - lum_s) * gain_s).clamp(0.0, 1.0)
+
+        # -1j. The 3D LUT, last in the section, on the graded frame.
+        #
+        #      Applied display-referred because that is the space a .cube is
+        #      authored in -- its axes are code values, not light. Mixed as a
+        #      straight cross-fade, which is the honest reading of "50% of this
+        #      LUT" and is what every grading application means by it.
+        #
+        #      `lut` is absent from `p` unless a request resolved one, and the
+        #      service zeroes `lut_amount` when it could not, so this gate and
+        #      `params.is_neutral` can never disagree about whether the stage
+        #      runs.
+        if lut is not None and mix > 0.001:
+            graded = _apply_lut(img, lut).clamp(0.0, 1.0)
+            img = graded if mix >= 0.999 else img + (graded - img) * mix
+
+        return img
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _blue_guard(
+        lin: torch.Tensor, amount: float, level: float, falloff: float,
+        shift: float,
+    ) -> torch.Tensor:
+        """Strengthen blue in linear light, before the halation wash lands.
+
+        Three things have to agree before a pixel is compensated, and the
+        third is the one that took a correction from the user to get right:
+
+        * **It is blue** -- a hue window around ``_BLUE_HUE``.
+        * **It has colour to strengthen** -- weighted by existing saturation,
+          the same principle as ``vibrance`` and for the same reason: it must
+          strengthen blue that is *there* and never invent it in something
+          grey, or every neutral shadow in the frame picks up a cast.
+        * **It is light enough to have been damaged.** The wash only reaches
+          what is near the light. Measured up a sky gradient away from the
+          sun, saturation loss is 23% at the bright end and flat *zero* below
+          about half brightness -- so compensating a deep blue is pure
+          overshoot, and at amount 2.0 it drove an untouched sky from 0.872
+          saturation to 1.000, i.e. a channel clamped to black. That is not a
+          setting to avoid, it is a missing term in the mask.
+
+        Knee and falloff are separate controls. Deriving the width from the
+        knee would make moving one change the other, and a sky is precisely
+        the broad smooth gradient that shows up a hard switch-on -- which is
+        also why the ramp is quintic, like the luminance band's.
+
+        Both operations are weighted by the mask *inside* themselves rather
+        than blended toward a fully-processed copy. A hue rotation of ``m *
+        shift`` degrees is the identity at ``m = 0``; cross-fading toward a
+        fully rotated colour instead would mix two different hues and lose a
+        little saturation in the middle of the ramp, which is exactly the
+        artifact this stage exists to fix.
+        """
+        h, sat = _hue_sat(lin)
+        d = (h - _BLUE_HUE).abs()
+        d = torch.minimum(d, 360.0 - d)  # the wheel wraps
+        m = (1.0 - _smoothstep(0.0, _BLUE_RANGE, d)) * _smoothstep(
+            0.0, _BLUE_SAT_FLOOR, sat
+        )
+        # Brightness gate, read display-referred so the slider means the same
+        # thing as every other luminance control in the app. Linear luma would
+        # crush an ordinary sky down to 0.05 and make the top nine tenths of
+        # the slider useless.
+        #
+        # Encode first, *then* take the luma. Taking the luma of the linear
+        # image and encoding that single number is cheaper and wrong: the
+        # transfer curve is non-linear, so it does not commute with a weighted
+        # sum. Measured, it reads a deep sky 23% brighter than it is, which
+        # would put this slider on a different scale from the Luminance
+        # Response knees it is meant to match.
+        lum_d = _luma(_linear_to_srgb(lin))
+        m = m * _smootherstep(max(0.0, level - falloff), level, lum_d)
+
+        if abs(shift) > 0.5:
+            lin = _rotate_hue(lin, m * shift)
+        if amount > 0.001:
+            lum_b = _luma(lin)
+            lin = lum_b + (lin - lum_b) * (1.0 + amount * m)
+        # The rotation can put a channel marginally below zero on a very
+        # saturated colour; halation adds to this and sRGB encoding assumes
+        # non-negative.
+        return lin.clamp_min(0.0)
+
+    # ------------------------------------------------------------------ #
+    def _antialias(
+        self, lin: torch.Tensor, p: dict, scale: float,
+    ) -> torch.Tensor:
+        """Take stair-stepping off hard edges without softening them.
+
+        A stair-step is a *pixel-scale wobble along* a contour, not a hard
+        transition across one -- so the cure is to filter along the isophote
+        tangent and never across it. Averaging across is what a blur does, and
+        it would take the edge with it; that is the whole reason this is a
+        directional filter rather than a soften.
+
+        It overlaps `edge_sand` in mechanism and is deliberately not the same
+        control, on three counts. **Position**: this runs at step 1c on the
+        source, in the optical block, where the aliasing that came in with the
+        file lives; sanding runs at 8b to polish roughness the *jitter stage
+        just added*, and cannot reach back to fix the input. **Scale**: three
+        taps at about a pixel against sanding's five to +/-2 sigma, because
+        the two are removing different wavelengths -- measured, 92% of a
+        jittered contour's roughness sits above 8px, while a stair-step is one
+        pixel by definition. **Gate**: this one fires on the luma *step*, so
+        it finds hard borders and leaves texture alone, where sanding follows
+        wherever the grit is dialled.
+
+        In linear light, with the block it sits in. It averages light, and
+        averaging gamma-encoded values holds the encoded mean rather than the
+        light's -- the same reason `pre_blur` does its transfer round trip.
+
+        Above strength 1 the filter is **repeated** rather than widened, up to
+        ``_AA_PASSES``. One three-tap pass is a gentle thing -- 35% of a
+        stair-step -- and a single pass was reported as doing "little to none".
+        Reaching further is the wrong lever for the reason the taps are short in
+        the first place: a stair-step is one pixel wide by definition, so a
+        longer filter starts averaging away the shape the contour has rather
+        than the wobble on it. Repeating attacks only the wobble, and because
+        each pass re-estimates the tangent from the frame it is handed, it
+        re-aims along a curving edge where one wide pass cuts the corner. Same
+        idiom, and same reasoning, as ``edge_sand``'s ``_SAND_PASSES``.
+        """
+        st = p["aa_strength"]
+        radius = max(0.2, p["aa_radius"] * scale)
+        edge_only = p["aa_edge_only"]
+
+        # Whole passes plus a fractional last one, so the control stays
+        # continuous and strength <= 1 is bit-for-bit the single pass it always
+        # was. Capped: pad_for reserves for _AA_PASSES exactly.
+        passes = min(_AA_PASSES, int(math.ceil(st - 1e-6)))
+
+        for i in range(passes):
+            # The last pass carries the remainder -- strength 2.5 is two full
+            # passes and one at half. Earlier passes are full strength.
+            amt = min(1.0, st - i)
+
+            # Display-referred for the detector, encode-then-luma rather than
+            # the other way round: the transfer curve does not commute with a
+            # weighted sum, and the step thresholds below are shared with edge
+            # softening, which measures the same quantity the same way.
+            #
+            # Re-measured every pass, on the current frame rather than the
+            # original. That is the entire value of iterating: the tangent
+            # follows the contour as the previous pass left it, so a curve gets
+            # followed instead of chorded.
+            lum_d = _luma(_linear_to_srgb(lin))
+            tx, ty, mag = _isophote(lum_d, max(_AA_DIR_MIN, _AA_DIR_K * radius))
+            # Fade out where the tangent is meaningless -- see _isophote.
+            # Without it a flat region's direction swings on float noise and
+            # tiled and untiled renders disagree by a scatter of single pixels.
+            m = _smoothstep(0.0, _SAND_MIN_GRAD, mag)
+
+            # The aliasing gate: how far the luma actually steps across this
+            # neighbourhood. `_STEP_LO`/`_STEP_HI` already separate a real
+            # transition from fine texture -- fine texture measures an order of
+            # magnitude below a hard border -- so a jagged border is found and
+            # fabric is left alone. Reused rather than re-derived: two constants
+            # for one discrimination would be two things to keep in step.
+            if edge_only > 0.001:
+                # Measured exactly as edge softening measures it -- same
+                # high-pass, same radius convention, no scale factor. The
+                # thresholds are calibrated against that quantity, so a fudge
+                # here would silently put this control on a different scale from
+                # the constants it borrows. An earlier ×2 did precisely that and
+                # left the gate firing on fabric.
+                step = (lum_d - _blur(lum_d, radius)).abs()
+                hard = _smoothstep(_STEP_LO, _STEP_HI, step)
+                # Smoothed, or the mask is as ragged as the staircase it is
+                # selecting and the filter switches on and off down the edge.
+                hard = _blur(hard, radius * 0.6)
+                # At 0 the filter runs everywhere, at 1 only on hard edges. A
+                # mix rather than a switch, because a CG render aliases on
+                # gentler steps than a photograph does.
+                m = m * ((1.0 - edge_only) + edge_only * hard)
+
+            out = None
+            wsum = 0.0
+            for offv, wgt in _AA_TAPS:
+                tap = (
+                    lin if offv == 0.0
+                    else _warp(lin, tx * (offv * radius), ty * (offv * radius))
+                )
+                out = tap * wgt if out is None else out + tap * wgt
+                wsum += wgt
+            # Normalised from the weights actually used, not trusted to the
+            # table.
+            out = out / wsum
+            lin = lin + (out - lin) * (amt * m)
+
+        return lin
+
+    # ------------------------------------------------------------------ #
+    def _scatter(
+        self, x: torch.Tensor, h: int, w: int, y0: float, x0: float,
+        p: dict, scale: float,
+    ) -> torch.Tensor:
+        """Displace a share of the pixels onto their neighbours, without averaging.
+
+        A blur and this stage model the same physics from opposite ends. Light
+        diffusing through the emulsion is a stochastic process: a photon either
+        goes straight or is deflected onto a neighbouring grain. Average over
+        infinitely many photons and you get a convolution -- ``micro_blur``,
+        which is smooth because it is an expectation. Resolve the deflections
+        individually and you get this: detail lands somewhere it was not,
+        every value survives intact, and the result is *disordered* rather
+        than smoothed. That is the whole reason the stage exists. A digital
+        frame softened with a blur reads as out of focus because the blur
+        removes the micro-contrast along with the edge; scatter removes
+        neither, and takes the exactness instead.
+
+        Three properties follow from never averaging, and all three are why
+        this is not just another kernel:
+
+        * **No value is invented.** Every output pixel is a bit-exact copy of
+          some input pixel, so the frame's histogram, its grit and its noise
+          come through untouched. Sampling is nearest-neighbour on whole-pixel
+          offsets specifically to keep that true -- bilinear at a fractional
+          offset would quietly turn each sample into a 2x2 average.
+        * **Amount is coverage, not opacity.** ``scatter`` moves the threshold
+          on a uniform field, so it sets *how many* pixels travel. Cross-fading
+          a displaced pixel with the one it left would be an average by
+          another name, and at 0.5 it would read as exactly the blur this
+          replaces.
+        * **It masks itself.** Displacing a pixel whose neighbours already
+          match it changes nothing, so smooth sky, skin and studio backdrops
+          come out untouched with no mask anywhere in the code. The stage acts
+          only where there is detail to disorder, which is the inverse of
+          ``micro_blur``'s failure mode -- that one takes texture down first
+          and edges second.
+
+        There is deliberately no frequency split here, and I built one before
+        working out why it was pointless -- see the note in CLAUDE.md. The
+        stage is already frequency-selective by construction: a displacement
+        can only change a pixel by as much as the picture varies over the
+        distance travelled, so structure coarser than the reach survives for
+        free and ``scatter_radius`` is the frequency control.
+        """
+        amt = p["scatter"]
+        reach = max(0.5, p["scatter_radius"] * scale)
+        # Cells finer than a working pixel cannot be resolved; below that the
+        # nearest-neighbour read just aliases between them.
+        cell = max(1.0, p["scatter_cell"] * scale)
+        pattern = int(round(p["scatter_pattern"])) % len(_SCATTER_STENCILS)
+
+        n = _cell_noise(h, w, y0, x0, cell, int(p["seed"]) + 3301, 3, self.device)
+        sel, mag_n, gate = n[:, 0:1], n[:, 1:2], n[:, 2:3]
+
+        # Direction and distance, on the stencil, in whole pixels -- whole so
+        # the gather stays a copy rather than an interpolation. Reach Spread:
+        # 0 puts every displaced pixel on the shape's edge (detail hollows
+        # out), 1 fills it inward.
+        dx, dy = _scatter_offsets(
+            sel, mag_n, reach, p["scatter_spread"], pattern
+        )
+        # Coverage: a uniform field thresholded at the amount, so `amt` is
+        # literally the fraction of the frame that moves. Applied after the
+        # rounding so a pixel that is not travelling gets a displacement of
+        # exactly zero and reads itself back.
+        move = (gate < amt).to(x.dtype)
+        dx, dy = dx * move, dy * move
+
+        return _warp(x, dx, dy, mode="nearest")
+
+    # ------------------------------------------------------------------ #
     def render(
         self, img: torch.Tensor, p: dict, scale: float = 1.0,
         y0: float = 0.0, x0: float = 0.0,
@@ -567,9 +2501,45 @@ class GrainEngine:
         hp_r = max(0.3, p["highpass_radius"] * scale)
         mb = p["micro_blur"] * scale
 
-        # 0. Pre-sharpen, on the untouched input.
+        # -1. Colour grading, above everything -- temperature, shadows,
+        #     highlights, clarity, then the 3D LUT. See _grade.
         #
-        #    Placed before everything so it sharpens the *photograph* and
+        #     Above `pre_blur` rather than anywhere else because this is the
+        #     decision about what the photograph *is*; every stage below it is
+        #     the emulsion's response to that photograph. Putting it after the
+        #     film stages would mean grading grain, halation and dust along with
+        #     the picture, and a LUT built to be fed a photograph would be being
+        #     fed a rendered negative instead.
+        img = self._grade(img, p, scale)
+
+        # 0. Pre-blur, on the untouched input, in linear light.
+        #
+        #    The same gaussian as `micro_blur` and a different stage, because
+        #    a blur's effect here is not only what it does to the pixels:
+        #
+        #    * It runs before `lum_ref` is taken, so the edge mask, the
+        #      hard-edge step mask and the smooth-area guard all measure the
+        #      *softened* frame. Micro-blur is deliberately excluded from that
+        #      -- the masks read the untouched tile input so diffusing the
+        #      frame cannot quietly talk the grain amount down. Here that
+        #      coupling is the point: soften the source and the grain follows
+        #      the softer edges and backs off where detail has gone.
+        #    * It runs before the pre-sharpen below, so a broad radius here
+        #      against a tight one there is a detail-killing pair the pipeline
+        #      could not otherwise express. The other order would just throw
+        #      the sharpening away.
+        #
+        #    In linear light for micro-blur's reason: a blur is light spreading
+        #    sideways, and averaging gamma-encoded values instead darkens every
+        #    edge it crosses. Gated so the transfer round trip costs nothing
+        #    when the stage is off.
+        pb = p["pre_blur"] * scale
+        if pb >= 0.05:
+            img = _linear_to_srgb(_blur(_srgb_to_linear(img), pb)).clamp(0.0, 1.0)
+
+        # 0b. Pre-sharpen, on the input.
+        #
+        #    Placed before every film stage so it sharpens the *photograph* and
         #    nothing else -- there is no grain yet to amplify. It is not
         #    cosmetic to put it here rather than at the end: every mask
         #    downstream is measured from this image, so sharpening now makes
@@ -588,8 +2558,61 @@ class GrainEngine:
         # looks like a painted-on glow rather than light.
         lin = _srgb_to_linear(img)
 
-        # 1. Light diffusing sideways through the gel layers.
+        # 1. Diffusion resolved as discrete deflections rather than as an
+        #    average -- see _scatter for why that is a different operation and
+        #    not a slower blur. In linear light because it happens to the light,
+        #    before the emulsion records anything.
+        #
+        #    **Ahead of micro-blur, and the order is deliberate** (changed
+        #    2026-08-03, on request). Both model the same physical event from
+        #    opposite ends, and which runs first changes the result a long way --
+        #    measured on separate plates at scatter 0.85 / reach 3 / blur 1px,
+        #    against the same stages alone:
+        #
+        #    | | fine texture | hard edge |
+        #    |---|---|---|
+        #    | scatter alone | 100% | 100% |
+        #    | micro-blur alone | 28% | 34% |
+        #    | blur then scatter (old) | 28% | **60%** |
+        #    | scatter then blur (new) | 32% | **28%** |
+        #
+        #    The edge column is the whole story, and the old order's number is
+        #    the surprising one: **scatter was undoing the blur.** Displacing a
+        #    blurred gradient by whole pixels drops a hard step back into it, so
+        #    the pair came out *harder* on borders than the blur alone -- 60%
+        #    against 34% -- which is not a thing either stage claims to do.
+        #
+        #    This way round each stage does its own job. Scatter gets the
+        #    source's own detail at full contrast and shreds the border into
+        #    raggedness; the blur then averages that raggedness into a genuinely
+        #    soft transition, ending *below* blur-alone at 28%. Fine texture
+        #    barely notices the swap (28% -> 32%) because scatter does not touch
+        #    texture sigma either way. It is also the physical order: light
+        #    deflects off a grain and then goes on diffusing.
+        #
+        #    Note the masks below are measured from the *untouched* tile input,
+        #    so scattering the frame does not talk the edge mask or the
+        #    smooth-area guard into turning grain down -- the same independence
+        #    micro-blur has, and for the same reason.
+        if p["scatter"] > 0.001:
+            lin = self._scatter(lin, h, w, y0, x0, p, scale)
+
+        # 1b. Light diffusing sideways through the gel layers, as an average.
+        #     Last in the light path -- see above.
         lin = _blur(lin, mb)
+
+        # 1c. Anti-aliasing -- stair-stepping off the incoming file's hard
+        #     edges, filtered along the contour so the edge itself stays put.
+        #
+        #     Here rather than at the top of the pipeline because an
+        #     anti-alias filter is an *optical* element: on a camera it is a
+        #     birefringent plate in front of the sensor, so it belongs in the
+        #     light path beside the other two optical stages and ahead of
+        #     anything the emulsion does. It also has to run before the masks
+        #     are measured, or the grain would keep keying on the jaggies this
+        #     just removed.
+        if p["aa_strength"] > 0.001:
+            lin = self._antialias(lin, p, scale)
 
         # 2. Halation: light reaching the film base reflects and re-exposes the
         #    emulsion from behind, blooming warm around bright highlights.
@@ -600,6 +2623,44 @@ class GrainEngine:
             lum0 = _luma(lin)
             hi = ((lum0 - thr_lin) / max(1.0 - thr_lin, 0.02)).clamp(0.0, 1.0)
             glow = _blur(hi, max(1.0, p["halation_radius"] * scale))
+
+            # 2a. Blue compensation, applied to the image the wash is about to
+            #     land on rather than to the result.
+            #
+            #     Halation adds warm light, and *adding light desaturates
+            #     whatever it lands on* -- that is not a side effect to be
+            #     tuned out, it is what addition does. A red-tinted bloom
+            #     lifts a blue sky's red channel by the full glow and its blue
+            #     channel by a tenth of it, so the sky loses colour and drifts
+            #     toward grey and then toward purple.
+            #
+            #     Correcting afterwards was the obvious alternative and is
+            #     worse for two measured reasons. It has no brake: the wash
+            #     eats a fixed share of anything added *before* it, so
+            #     compensating here self-limits -- everything from amount 1.0
+            #     to 3.0 lands 3% past the untouched sky's own saturation --
+            #     where the identical correction applied *after* is 9% past by
+            #     0.5 and by 1.0 has driven a channel to black and pinned the
+            #     sky at fully saturated. And it cannot tell blue
+            #     that was unfairly washed from blue the bloom is *supposed*
+            #     to be sitting on, so re-saturating there fights the glow you
+            #     paid for -- it would need the glow field carried out of this
+            #     block to know the difference. Here the question never
+            #     arises: this changes what was recorded, and halation then
+            #     does its job to it. That is also the physical order --
+            #     a punchier blue layer or a polariser, not retouching.
+            #
+            #     Deliberately after `glow` is computed, so compensation
+            #     cannot move the bloom: the two controls stay independent and
+            #     `verify.py` pins it. Purely per-pixel, so `pad_for` is
+            #     unaffected.
+            blue = p["halation_blue"]
+            bshift = p["halation_blue_shift"]
+            if blue > 0.001 or abs(bshift) > 0.5:
+                lin = self._blue_guard(
+                    lin, blue, p["halation_blue_level"],
+                    p["halation_blue_falloff"], bshift,
+                )
             # Tint from a full hue wheel rather than the old red-to-amber
             # ramp, which spanned about 25 degrees and could not desaturate.
             # Real halation is red -- that is what the antihalation layer and
@@ -610,7 +2671,91 @@ class GrainEngine:
                 _hsv_to_rgb(p["halation_hue"], p["halation_sat"]),
                 device=lin.device, dtype=lin.dtype,
             ).view(1, 3, 1, 1)
-            lin = lin + glow * tint * (hal * 0.9)
+            add = glow * tint * (hal * 0.9)
+
+            # 2b. Highlight recovery: add the bloom into the headroom that is
+            #     actually there, instead of adding it flat and letting the
+            #     total clip.
+            #
+            #     The stage exists because halation adds light in linear space
+            #     with no ceiling until display space, so a highlight already
+            #     near white gets pushed the rest of the way to a flat,
+            #     textureless clip -- reported as halation burning highlights
+            #     out. Holding the *glow* back was the first answer and it is
+            #     the wrong one: it buys headroom by deleting the bloom, so the
+            #     highlights stop burning because the effect stopped happening
+            #     there. It also cannot restore anything, because two pixels
+            #     that both clipped are still both at 1.0 afterwards.
+            #
+            #     What this does instead is meter the light against the room
+            #     that is actually left. With ``H = 1 - lin`` the headroom each
+            #     channel still has,
+            #
+            #         add' = add * (H + add * (1 - r)) / (H + add)
+            #
+            #     which at ``r = 1`` is ``add * H / (H + add)``. Three
+            #     properties, and each is why it is this expression and not one
+            #     of the others tried:
+            #
+            #     * **Free where there is room.** For ``add << H`` it is ``add``
+            #       to first order, so an ordinary highlight with headroom to
+            #       spare gets the whole bloom at full strength and the control
+            #       costs nothing there. Only a pixel being asked to take more
+            #       light than it can hold is metered at all.
+            #     * **Cannot reach white at r = 1**, since ``add' < H`` strictly.
+            #     * **Strictly increasing in ``lin``**: d(out)/d(lin) =
+            #       ``1 - r * a^2 / (H + a)^2``, bounded below by ``1 - r`` and
+            #       positive throughout. Nothing flattens, so nothing is lost.
+            #
+            #     An exponential soft-add -- ``lin + H(1 - exp(-add/H))``, the
+            #     obvious tone-mapping answer -- was built and measured first
+            #     and is *worse*, which is worth recording because it looks
+            #     better on paper. It bends from the origin, so it compresses
+            #     hard even where the bloom was modest: on a bright plate
+            #     carrying real fine texture it held only 51% of that texture
+            #     against this expression's 60%, at less bloom retained. Bending
+            #     late beats bending smoothly when what you are protecting is
+            #     local contrast rather than the peak value.
+            #
+            #     Measured on that plate (mean 0.93, fine texture, halation 0.9
+            #     at threshold 0.6), against holding the glow back at the same
+            #     setting -- highlight texture kept / bloom light kept:
+            #
+            #     | recovery | hold the glow back | meter against headroom |
+            #     |---|---|---|
+            #     | 0.5 | 56% / 82% | 53% / 91% |
+            #     | 1.0 | 55% / 52% | **60% / 68%** |
+            #
+            #     At full strength it is better on both axes at once, which is
+            #     the whole claim: more of the highlight's detail survives *and*
+            #     more of the bloom does.
+            #
+            #     Keyed on real per-channel headroom rather than on `hi`, the
+            #     threshold field the old version used. `hi` answers "is this
+            #     pixel bright enough to bloom", which is not the question: a
+            #     saturated highlight can sit far above the threshold in luma
+            #     while one of its channels still has most of its range free,
+            #     and only that channel's own headroom knows so.
+            #
+            #     What is left on the table, measured: the remaining loss is
+            #     compression, not clipping, and it is forced -- red here is
+            #     asked to absorb 0.63 of linear light into 0.15 of headroom, so
+            #     no metering can be free. The way past it is not a better curve
+            #     but a better *model*: real halation is light that *left* the
+            #     highlight to re-expose its surroundings, so an
+            #     energy-conserving bloom would darken the core as it lights the
+            #     halo and the core's texture would survive intact. That is a
+            #     change to what halation *is* rather than to this dial, and it
+            #     would move every preset that uses the stage, so it is not done
+            #     here.
+            #
+            #     Still purely per-pixel, so `pad_for` is unaffected -- same as
+            #     blue compensation above.
+            recover = p["halation_recovery"]
+            if recover > 0.001:
+                head = (1.0 - lin).clamp_min(1e-4)
+                add = add * (head + add * (1.0 - recover)) / (head + add)
+            lin = lin + add
 
         # ---- DEVELOPMENT STAGE (density / display space) ------------------
         base = _linear_to_srgb(lin)
@@ -809,14 +2954,7 @@ class GrainEngine:
                 # two tilings hand the gradient marginally different values.
                 # Estimating direction over a window comparable to the reach
                 # keeps it coherent and the result tile-independent.
-                gl = _blur(lum, max(0.6, _SAND_DIR_K * sr))
-                px_ = F.pad(gl, (1, 1, 0, 0), mode="replicate")
-                gx_ = (px_[..., 2:] - px_[..., :-2]) * 0.5
-                py_ = F.pad(gl, (0, 0, 1, 1), mode="replicate")
-                gy_ = (py_[..., 2:, :] - py_[..., :-2, :]) * 0.5
-                mag = (gx_ * gx_ + gy_ * gy_).sqrt().clamp_min(1e-6)
-                # Tangent is the gradient turned 90 degrees.
-                tx, ty = -gy_ / mag, gx_ / mag
+                tx, ty, mag = _isophote(lum, max(0.6, _SAND_DIR_K * sr))
                 # Where the gradient vanishes the tangent is a ratio of two
                 # near-zero numbers and its direction is meaningless -- it
                 # will swing on floating-point noise alone, and a filter
@@ -925,17 +3063,40 @@ class GrainEngine:
         #     the print stock and the scan itself rather than from the
         #     negative -- so it reaches exactly the areas the masks protect.
         #
-        #     Monochrome, and on its own seed offset: sharing the main grain's
-        #     seed would lay it directly on top of the same clumps and read as
-        #     nothing more than a louder version of the same field.
+        #     On its own seed offset: sharing the main grain's seed would lay it
+        #     directly on top of the same clumps and read as nothing more than a
+        #     louder version of the same field. Monochrome unless
+        #     `global_chroma` asks otherwise -- see below for why that is built
+        #     as a separate mean-zero field rather than by the main grain's
+        #     recipe.
+        #
+        #     `global_size_max` (2026-08-04, on request) is the one thing here
+        #     that is not just another knob on this same field -- it swaps the
+        #     construction entirely. Reported as "too digital a job": `_fbm`
+        #     stacks octaves of a *single* clump size, so no matter how rough or
+        #     how many octaves, every grain is the same diameter. Above Min,
+        #     `_variable_cell_noise` replaces it with discrete points that each
+        #     draw their own radius uniformly between Min and Max, which is
+        #     what makes clumps genuinely differ from their neighbours rather
+        #     than all sharing one stacked structure. See that function for the
+        #     construction and `pad_for` for why its reach is Max, not Min.
         gi = p["global_intensity"]
         go = p["global_opacity"]
         if gi > 0.01 and go > 0.001:
-            gg = _fbm(
-                h, w, y0, x0, max(_MIN_CELL, p["global_size"] * scale),
-                int(p["seed"]) + 7717, 1, 2, 0.5, self.device,
+            gcell = max(_MIN_CELL, p["global_size"] * scale)
+            # Max can never pull the effective ceiling *below* Min: clamped up
+            # to it rather than swapped with it, so a preset that raises Min
+            # alone (global_size_max still at its own untouched default) can
+            # never accidentally cross into the variable-size construction --
+            # the two are not a symmetric pair the way the light-leak sizes
+            # are, because Min already has an established meaning on its own
+            # and Max is purely "how much further can it stretch".
+            gcell_max = max(gcell, p["global_size_max"] * scale)
+            variable = (gcell_max - gcell) > 1e-3
+
+            gg = self._global_grain_field(
+                h, w, y0, x0, p, gcell, gcell_max, variable,
             )
-            gg = ((gg * 2.0 - 1.0) / _GNORM).clamp(-1.0, 1.0)
             out = out + gg * ((gi / 100.0) * _AMP_SCALE * go)
 
         # 14. Output sharpening -- deliberately the last thing in the pipeline.
@@ -994,144 +3155,156 @@ class GrainEngine:
         area = None if full_hw is None else max(full_hw[0] * full_hw[1], 1.0)
 
         # -- light leak ---------------------------------------------------
-        # Fogging from light that got in at the edges of the frame, so it is
-        # anchored to the frame rather than floating in the image, and it is
-        # added in linear light because it is light.
+        # Light that got past a seal, so it is anchored to the frame rather
+        # than floating in the image, and it is added in linear light because
+        # it is light.
+        #
+        # Drawn as a handful of discrete *beams*, which is the whole shape of
+        # this stage and the thing it got wrong before. The old version was a
+        # falloff from the nearest border gated by a slow noise field along it:
+        # every leak was therefore a soft inward wash with no direction, no
+        # length and no edge, present on all four borders at once -- a chewed-up
+        # vignette. Real leaks are streaks with a definite edge limiting their
+        # reach; they come from one or two places on the frame, they lean
+        # across it, and they stop somewhere.
+        #
+        # So each leak is a beam: a source on the perimeter, a depth it
+        # penetrates (`leak_size_*`), a lean (`shear`), a width that fans out
+        # as it travels, and one hard edge where the obstruction's shadow is.
+        # Noise now *perturbs* that shape instead of being it.
         ll = p["light_leak"]
         if ll >= 1.0 and full_hw is not None:
-            fh, fw = max(full_hw[0], 1.0), max(full_hw[1], 1.0)
-            ys = (torch.arange(h, device=dev, dtype=torch.float32) + y0) / fh
-            xs = (torch.arange(w, device=dev, dtype=torch.float32) + x0) / fw
-            Y, X = torch.meshgrid(ys, xs, indexing="ij")
-            # Distance to the nearest frame edge: 0 at the border, 0.5 centre.
-            edge_d = torch.minimum(
-                torch.minimum(X, 1.0 - X), torch.minimum(Y, 1.0 - Y)
-            )
-            edge_d = edge_d.unsqueeze(0).unsqueeze(0)
-            # A very slow field decides which stretches of border actually
-            # leak, so it is not a uniform vignette.
-            # Cell well under a frame width, or there is only ever one leak
-            # -- and one leak cannot look non-uniform against anything. At
-            # 700px on a 1200px frame this produced a single region, which is
-            # the same trap the hair gate fell into. ~240 gives three or four
-            # along a border, which is what a leaky back actually looks like.
-            # Two washes, each varying only *along* its border and constant
-            # going inward, picked by whichever border a pixel is nearest.
-            #
-            # A single isotropic field cannot do this job: it varies with depth
-            # as well as along the edge, so it shut the leak off a little way
-            # in no matter how much reach it had. That is what made leaks look
-            # small -- the size control was fighting the gate, not the falloff.
-            wcell = max(40.0, 240.0 * scale)
-            long_cell = max(4000.0, 40000.0 * scale)
-            wash_h = _value_noise(
-                h, w, y0, x0, wcell, seed + 8101, 1, dev, cell_y=long_cell
-            )
-            wash_v = _value_noise(
-                h, w, y0, x0, long_cell, seed + 8103, 1, dev, cell_y=wcell
-            )
-            near_horizontal = (
-                torch.minimum(Y, 1.0 - Y) < torch.minimum(X, 1.0 - X)
-            ).unsqueeze(0).unsqueeze(0)
-            wash = torch.where(near_horizontal, wash_h, wash_v)
+            fh = max(float(full_hw[0]), 1.0)
+            fw = max(float(full_hw[1]), 1.0)
+            Ypx = (torch.arange(h, device=dev, dtype=torch.float32)
+                   + float(y0)).view(1, 1, h, 1)
+            Xpx = (torch.arange(w, device=dev, dtype=torch.float32)
+                   + float(x0)).view(1, 1, 1, w)
 
-            # Three decorrelated fields, addressed at leak scale so each is
-            # near-constant across one leak and differs between leaks. Without
-            # them every leak reached the same distance, fell off at the same
-            # rate and arrived at the same strength -- which is what made a
-            # frame of them look stamped rather than accidental.
-            #
-            # `var` scales all three away to nothing, so 0 reproduces the old
-            # uniform behaviour exactly rather than being merely close to it.
             var = p["leak_variation"]
-            # Slightly coarser than the wash so a variation value spans a
-            # whole leak rather than shifting across one.
-            vy = _value_noise(
-                h, w, y0, x0, max(56.0, 340.0 * scale), seed + 8102, 3, dev
-            )
-            v_reach = _spread(vy[:, 0:1])
-            v_halo = _spread(vy[:, 1:2])
-            v_op = _spread(vy[:, 2:3])
+            # Swapped if given the wrong way round, so dragging either slider
+            # past the other never makes the leaks vanish.
+            s_lo = min(p["leak_size_min"], p["leak_size_max"]) * scale
+            s_hi = max(p["leak_size_min"], p["leak_size_max"]) * scale
+            # Cap at half the frame's short side over the warp's headroom:
+            # that is the depth at which the falloff dies exactly in the
+            # middle of the frame, and past it a leak leaves a floor over the
+            # whole picture -- centre fog, which reads as a bad exposure
+            # rather than as a leak. Geometric, not a taste constant.
+            reach_cap = 0.5 * min(fh, fw) / _LEAK_REACH_SAFETY
+            # The along-border edges want a softness as a 0..1, and the honest
+            # 0..1 is the feather measured against the sizes asked for -- a
+            # 50px feather is a rim on a 400px leak and a wash on an 80px one.
+            # Derived from the parameters alone, never from the field, so it
+            # is a constant per render and tiles cannot disagree about it.
+            soft = min(1.0, p["leak_feather"] / max(
+                0.5 * (p["leak_size_min"] + p["leak_size_max"]), 1.0))
+            bw_soft = 0.12 + 0.75 * soft
 
-            # How far into the frame each leak pushes. `edge_d` runs 0 at the
-            # border to 0.5 at the centre, so a size of 1.0 reaches the middle
-            # of the frame and beyond -- which is what a bad light seal does.
-            size = p["leak_size"]
-            # Inward reach is deliberately capped low and saturates by size 1.
-            # `edge_d` runs 0 at the border to 0.5 at the centre, so even at
-            # the cap a leak dies well before the middle of the frame. Light
-            # gets in at the edges; a leak that washes the centre reads as a
-            # bad exposure rather than a leak.
-            reach = (_LEAK_REACH_MAX * min(size, 1.0)
-                     * (1.0 + var * 0.80 * (v_reach * 2.0 - 1.0)))
-            reach = reach.clamp_min(0.015)
-            # Corners bloom further in than edge midpoints -- that is where the
-            # cassette mouth and the film gate actually let light past, and it
-            # is most of what makes a leak read as a leak.
-            corner_d = torch.sqrt(
-                torch.minimum(X, 1.0 - X) ** 2 + torch.minimum(Y, 1.0 - Y) ** 2
-            ).unsqueeze(0).unsqueeze(0)
-            corner = 1.0 - (corner_d / 0.5).clamp(0.0, 1.0)
-            reach = reach * (1.0 + _LEAK_CORNER * corner)
-            # The exponent is the feather, and it matters more than the reach:
-            # a high exponent drops the leak away immediately past the border,
-            # so a leak with plenty of reach still reads as a thin bright rim.
-            # Feather 0 is that tight rim (exponent 4), feather 1 is a broad
-            # wash that barely falls off at all (exponent 0.5).
-            feather = p["leak_feather"]
-            base_expo = 4.0 - 3.5 * feather
-            expo = (base_expo * (1.0 + var * 0.45 * (v_halo * 2.0 - 1.0)))
-            expo = expo.clamp_min(0.25)
-            falloff = (1.0 - (edge_d / reach).clamp(0.0, 1.0)).clamp_min(1e-4) ** expo
-            # Size past 1 spreads the leak *along* the border rather than
-            # deeper into the frame -- it used to lift a floor under the whole
-            # leak, which is exactly the centre-invading wash this must not do.
-            # Handled below by widening the gate.
+            expo_lin = _srgb_to_linear(out)
+            # Per-channel exposure, accumulated over the beams. Light adds, so
+            # two leaks overlapping is brighter than either -- and it has to be
+            # per channel rather than a scalar times one tint, because each
+            # leak carries its own hue.
+            expos = torch.zeros(1, 3, h, w, device=dev, dtype=torch.float32)
 
-            # Per-leak edge hardness. Inlined rather than using _smoothstep
-            # because the thresholds are fields here, not constants.
-            # Leaks live on the border, so they are counted against the
-            # perimeter rather than the area: a frame holds perimeter/cell of
-            # them, not area/cell^2.
-            perim = 2.0 * (fh + fw)
-            cells = max(perim / wcell, 1.0)
-            # Both ends of the gate from the count, with a floor on the band's
-            # width. Deriving `hi` as a fraction of the remaining headroom made
-            # the band collapse at low counts -- the threshold sits high, so
-            # there was almost no headroom left -- and a collapsed band is a
-            # hard edge. Leaks came out as solid shapes with no falloff at all,
-            # which is the one thing a light leak must never look like.
-            lk_a = _threshold_for(min(0.30, max(ll, 0.0) * 2.5 / cells))
-            lk_b = _threshold_for(min(0.30, max(ll, 0.0) * 0.4 / cells))
-            # Feather widens the along-border transition too. The radial
-            # falloff and this gate are the leak's two visible edges, and
-            # softening only one of them still reads as hard.
-            lk_b = max(lk_b, lk_a + _LEAK_MIN_BAND * (0.5 + 2.5 * feather))
-            # Size above 1 opens more of the border instead of reaching in.
-            if size > 1.0:
-                grow = min((size - 1.0) / 9.0, 1.0)
-                lk_a = max(0.0, lk_a - 0.30 * grow)
-            # Vary the band's *centre* and *width* rather than its two ends
-            # independently. Moving the ends separately let the variation push
-            # `hi` below `lo` for some leaks -- an inverted band, which
-            # _smoothstep resolves as a hard step, so those leaks came out as
-            # solid shapes with a one-pixel cliff at the border. Width is
-            # clamped positive, so a leak can be crisper or softer but never
-            # switch to a step.
-            centre = 0.5 * (lk_a + lk_b) - var * 0.10 * (v_halo * 2.0 - 1.0)
-            half = (0.5 * (lk_b - lk_a)) * (1.0 + var * 0.9 * (v_halo * 2.0 - 1.0))
-            half = half.clamp_min(_LEAK_MIN_BAND * 0.5)
-            lo, hi = centre - half, centre + half
-            tt = ((wash - lo) / (hi - lo).clamp_min(1e-3)).clamp(0.0, 1.0)
-            gate = tt * tt * (3.0 - 2.0 * tt)
+            for k, st in enumerate(_leak_sites(ll, seed, var)):
+                border, s0 = _leak_anchor(st["pos"], fh, fw)
+                # `u` is the perpendicular depth from this leak's own border
+                # and `s` runs along it. Keeping the obliquity in a shear on
+                # `s` rather than rotating the whole frame is what lets a leak
+                # lean hard across the picture while `reach` stays exactly the
+                # depth the slider promises.
+                if border == 0:
+                    u, s, blen = Ypx, Xpx, fw
+                elif border == 1:
+                    u, s, blen = fh - Ypx, Xpx, fw
+                elif border == 2:
+                    u, s, blen = Xpx, Ypx, fh
+                else:
+                    u, s, blen = fw - Xpx, Ypx, fh
 
-            leak = falloff * gate * (1.0 - var * 0.65 * (1.0 - v_op))
-            hue = p["leak_hue"]
-            tint = torch.tensor(
-                [1.0, 0.30 + 0.50 * hue, 0.10 + 0.30 * hue],
-                device=dev, dtype=out.dtype,
-            ).view(1, 3, 1, 1)
-            out = _linear_to_srgb(_srgb_to_linear(out) + leak * tint * 0.55)
+                reach = min(s_lo + (s_hi - s_lo) * st["reach_t"], reach_cap)
+                # How far the leak runs *along* its border. Measured against
+                # the border, not against the reach -- and that is the second
+                # thing the old shape got wrong. A seal fails along a seam, so
+                # the leak is a band that runs a long way sideways and comes in
+                # a modest depth; sizing its length off its depth instead makes
+                # every leak roughly as long as it is deep, which is a blob.
+                # Floored against the reach because light through a slot cannot
+                # be much narrower than it is deep.
+                hw0 = max(blen * st["width"], 0.55 * reach)
+
+                # Two octaves of domain warp. The coarse one wanders the whole
+                # beam, the fine one frays its edge; between them the outline is
+                # organic while still being an outline -- which is the inversion
+                # that matters here. Noise used to *be* the shape and the result
+                # was fog; now it perturbs a shape that has a definite edge.
+                # The depth amplitudes sum to exactly `_LEAK_WARP * reach`,
+                # which is what the reach cap was sized against.
+                wn = _value_noise(h, w, y0, x0, max(16.0, 0.80 * reach),
+                                  seed + 9137 + k * 37, 3, dev)
+                wf = _value_noise(h, w, y0, x0, max(6.0, 0.25 * reach),
+                                  seed + 9701 + k * 37, 2, dev)
+                warp = (wn[:, 0:1] - 0.5) * 1.5 + (wf[:, 0:1] - 0.5) * 0.5
+                # Clamped at zero: the warp may pull the beam *inward*, and
+                # the falloff below has to stay defined at the border.
+                du = (u + warp * _LEAK_WARP * reach).clamp_min(0.0)
+                lat = (wn[:, 1:2] - 0.5) * 1.5 + (wf[:, 1:2] - 0.5) * 0.5
+                dv = (s - s0) - st["shear"] * du + lat * 0.18 * hw0
+
+                # Along the beam: the same feather-to-exponent mapping the
+                # pixel sizes have always used. Solving (1 - hl/reach)^e = 0.5
+                # gives e = ln(0.5) / ln(1 - hl/reach), so the feather is a
+                # visible distance -- short is a tight bright rim on the
+                # border, half the reach is a straight ramp, most of the reach
+                # is a broad wash. Scalars per leak now rather than fields,
+                # since a beam has one of each.
+                hl = (p["leak_feather"] * scale) * (
+                    1.0 + var * 0.45 * (2.0 * st["halo"] - 1.0))
+                hl = min(max(hl, 0.5), reach * 0.95)
+                expo = math.log(0.5) / math.log1p(-min(hl / reach, 0.95))
+                # Floored at *zero*, not at an epsilon: raising a 1e-4 floor
+                # to a small exponent gives 0.12, not something small, and
+                # that is a fog over the whole beam's footprint.
+                along = (1.0 - (du / reach).clamp(0.0, 1.0)).clamp_min(0.0) ** expo
+
+                # Across the beam: narrow at the source and fanning inward,
+                # which is what a shaft through a gap does and is most of why
+                # this reads as a beam rather than as a band.
+                hwid = (hw0 * (0.75 + st["flare"] * du / reach)).clamp_min(1.0)
+                q = dv.abs() / hwid
+                # One edge is the obstruction's shadow and is much harder than
+                # the other. Both soft is haze; both hard is a painted shape.
+                bw_hard = max(0.03, bw_soft * (1.0 - 0.95 * st["hard"]))
+                on_hard = (dv * st["hard_side"] >= 0.0).to(dv.dtype)
+                bw = bw_soft + (bw_hard - bw_soft) * on_hard
+                tt = ((1.0 + bw - q) / (2.0 * bw)).clamp(0.0, 1.0)
+                across = tt * tt * (3.0 - 2.0 * tt)
+
+                # A beam is not uniform inside itself either -- dust in the
+                # chamber, an uneven gap. Mean 1.0, so it modulates without
+                # changing the strength the leak was drawn with.
+                dens = 0.72 + 0.56 * wn[:, 2:3]
+
+                hue = min(max(p["leak_hue"] + st["hue"], 0.0), 1.0)
+                tint = torch.tensor(
+                    [1.0, 0.16 + 0.46 * hue, 0.04 + 0.18 * hue],
+                    device=dev, dtype=torch.float32,
+                ).view(1, 3, 1, 1)
+                expos = expos + (along * across * dens * st["strength"]) * tint
+
+            # Saturating response, per channel and per dye layer. A leak's core
+            # is *white* with the colour only in its falloff, and no amount of
+            # adding a fixed warm ratio can do that -- a fixed ratio stays the
+            # same colour at every strength, which is exactly why the old wash
+            # read as flat tan everywhere. Each layer saturating separately
+            # gives the real progression: deep red where only the red-sensitive
+            # layer caught enough light, through orange and yellow, to white
+            # where all three are at the top. It also self-limits at 1.0 in
+            # linear light, so a hot leak cannot drive a channel past white.
+            added = -torch.expm1(-expos * (p["leak_strength"] * _LEAK_GAIN))
+            out = _linear_to_srgb(expo_lin + added.to(out.dtype))
 
         # -- scratches ----------------------------------------------------
         # A gouge through the emulsion lets the light straight through, so on
@@ -1330,33 +3503,117 @@ class GrainEngine:
         integrating down gives clumps genuine partial pixel coverage. Costs
         ss^2 in time and memory, and it is the single biggest realism win in
         the pipeline.
+
+        **`master_opacity` is applied here, and the position is the whole
+        point.** It cross-fades the finished frame back over the untouched
+        input, so it has to see an input that has been through nothing at all
+        -- and inside ``render`` there is no such thing at ss > 1, because what
+        that method receives is already a bicubic *upsample*. Blending there
+        and pooling down would make opacity 0 return the up-then-down round
+        trip, which is measurably 1.0e-01 softer than the source on hard edges
+        (see ``params.is_neutral``): "no effect" would quietly cost sharpness.
+        Blending after the pool, against ``img``, is bit-exact at both ends at
+        every supersample.
+
+        Sitting here also means every entry point inherits it -- ``render_image``
+        for the export, ``render_view`` for the preview -- so the two cannot
+        disagree about what half strength looks like. It is per-pixel against
+        the tile's own input, so it touches no statistic of the region and
+        ``pad_for`` is unchanged.
         """
+        op = p["master_opacity"]
+        # Nothing of the render survives, so do not pay for it. The early exit
+        # matters most on the slider itself: dragging toward 0 gets cheaper
+        # rather than costing a full render to throw away.
+        if op <= 0.0:
+            return img
+
         if ss <= 1:
-            return self.render(img, p, scale, y0, x0, full_hw)
-        h, w = img.shape[-2:]
-        up = F.interpolate(
-            img, size=(h * ss, w * ss), mode="bicubic", align_corners=False
-        ).clamp(0.0, 1.0)
-        # Working resolution and tile offset both scale, so the noise lattice
-        # still resolves to the same global full-resolution coordinates.
-        # Frame size scales with the working resolution exactly as the tile
-        # offset does, so a normalised frame position resolves the same.
-        fh = None if full_hw is None else (full_hw[0] * ss, full_hw[1] * ss)
-        r = self.render(up, p, scale * ss, y0 * ss, x0 * ss, fh)
-        return F.avg_pool2d(r, ss)
+            r = self.render(img, p, scale, y0, x0, full_hw)
+        else:
+            h, w = img.shape[-2:]
+            up = F.interpolate(
+                img, size=(h * ss, w * ss), mode="bicubic", align_corners=False
+            ).clamp(0.0, 1.0)
+            # Working resolution and tile offset both scale, so the noise
+            # lattice still resolves to the same global full-resolution
+            # coordinates. Frame size scales with the working resolution
+            # exactly as the tile offset does, so a normalised frame position
+            # resolves the same.
+            fh = None if full_hw is None else (full_hw[0] * ss, full_hw[1] * ss)
+            r = self.render(up, p, scale * ss, y0 * ss, x0 * ss, fh)
+            r = F.avg_pool2d(r, ss)
+
+        # Cross-faded display-referred, where both images already live, rather
+        # than round-tripping through linear. This is a compositing control --
+        # "how much of the edit do I keep" -- not a physical average of light,
+        # so the reasoning that puts `pre_blur` and halation in linear does not
+        # carry over.
+        #
+        # The two are not interchangeable and the difference is not where you
+        # would guess. Measured on a grained frame at half strength: mean
+        # deviation 5.4e-04 and overall brightness within +0.05%, but a
+        # worst-case 0.146 on individual pixels -- concentrated in the shadows,
+        # where the transfer curve is steepest. That is exactly why encoded
+        # wins here. Blending in the space the eye reads makes the slider
+        # linear in *visible* deviation, so 0.5 is half the grain everywhere;
+        # in linear the same 0.5 would take more than half out of the shadows
+        # and less out of the highlights, which is an opacity control that
+        # changes the look's balance as you dial it back. It also costs no
+        # transfer round trip.
+        if op < 1.0:
+            r = img + (r - img) * op
+        return r
 
     # ------------------------------------------------------------------ #
     def pad_for(self, p: dict, scale: float) -> int:
         """Overlap needed so a rendered region matches the full-image render.
 
-        Must cover every blur kernel in the pipeline: the high-pass chain, the
-        acutance blur (the widest at 1.5x), the micro-blur, the edge-softening
-        blur, the output sharpening blur and halation, plus the jitter warp's
-        displacement. Miss one and tiled exports seam along its radius -- which
-        no preview will ever show.
+        Must cover every blur kernel in the pipeline: the clarity high-pass at
+        the very top, the high-pass chain, the
+        acutance blur (the widest at 1.5x), the pre-blur and micro-blur, the
+        edge-softening blur, the global-grain smoothing blur, the output
+        sharpening blur and halation, plus the
+        displacement of every stage that *reads* a pixel from somewhere else
+        rather than blurring in place -- the jitter warp, the sanding taps and
+        scatter. Miss one and tiled exports seam along its radius -- which no
+        preview will ever show.
         """
         hp_r = max(0.3, p["highpass_radius"] * scale)
-        mb = p["micro_blur"] * scale
+        # Pre-blur and micro-blur are two kernels in series, not alternatives:
+        # micro-blur reads pixels the pre-blur has already spread, so their
+        # reaches add rather than the widest winning.
+        mb = (p["micro_blur"] + p["pre_blur"]) * scale
+        # Clarity's high-pass and highlight reconstruction's neighbourhood are
+        # the only two kernels in the whole colour-grading section -- the other
+        # ten stages are per-pixel and reserve nothing. Both are real reaches
+        # even though the section runs first, and for the same reason: what they
+        # measure over their radius feeds a value that then propagates through
+        # every stage below, so a tile that cannot see far enough is wrong from
+        # the top of the pipeline down rather than only at its own border.
+        #
+        # Summed rather than the widest winning: they are stages in series, and
+        # reconstruction runs *above* clarity, so clarity's band is measured on
+        # pixels reconstruction has already changed from up to its own radius
+        # away.
+        clar = (
+            p["grade_clarity_radius"] * scale
+            if abs(p["grade_clarity"]) > 0.001 else 0.0
+        )
+        if p["grade_recover"] > 0.001:
+            # Two kernels in series inside the one stage: the chromaticity
+            # estimate reads `radius`, and its own weight field is then blurred
+            # again by `radius * _RECON_ROLL_GATE_FRAC` to gate the roll. The
+            # second reads pixels the first already spread, so they add.
+            # Three kernels in series inside the one stage: the chromaticity
+            # estimate reads `radius`, then its weight field is dilated by
+            # `radius * _RECON_ROLL_GATE_FRAC` and feathered by the same again to
+            # gate the roll. Each reads pixels the previous one already spread,
+            # so all three add. The dilation is a hard reach like a warp rather
+            # than a kernel, but it is counted in here with the others because it
+            # sits between two blurs and the sum is what has to be covered.
+            rr = max(1.0, p["grade_recover_radius"] * scale)
+            clar += rr * (1.0 + 2.0 * _RECON_ROLL_GATE_FRAC)
         halo = p["halation_radius"] * scale if p["halation"] > 0.01 else 0.0
         soft = p["edge_soften_radius"] * scale if p["edge_soften"] > 0.01 else 0.0
         shr = p["sharpen_radius"] * scale if p["sharpen"] > 0.01 else 0.0
@@ -1374,14 +3631,78 @@ class GrainEngine:
                         * max(0.4 * p["scratch_width"] * scale, 0.6))
         if p["hair"] >= 1.0:
             tex_r = max(tex_r, p["hair_soften"] * 3.0 * max(scale, 0.25))
+        # Anti-aliasing reads two ways at once and both have to be counted:
+        # its taps travel a radius along the tangent (a displacement, like the
+        # warps below), and it derives that tangent -- and its step gate --
+        # from blurred luma, which is a kernel.
+        #
+        # Both terms are multiplied by the pass count, for the reason sanding
+        # documents below: each pass resamples the previous pass's output, so tap
+        # travel accumulates, and each pass re-derives its direction from a fresh
+        # blurred luma, so that reach accumulates too. Pinned at _AA_PASSES
+        # rather than recomputed from the strength, because pad_for is called at
+        # the un-supersampled scale and would otherwise disagree with the
+        # renderer about the count.
+        aa_r = 0.0
+        aa_tap = 0.0
+        if p["aa_strength"] > 0.001:
+            aa_rad = max(0.2, p["aa_radius"] * scale)
+            aa_r = _AA_PASSES * max(
+                max(_AA_DIR_MIN, _AA_DIR_K * aa_rad), aa_rad * 1.5)
+            aa_tap = _AA_PASSES * aa_rad
+        # Global-grain smoothing is a blur on the noise field, so it reaches
+        # like every other kernel here. It is gated on the layer being on --
+        # with intensity or opacity at zero the field is never built.
+        #
+        # Referenced against the *effective* cell -- max(Min, Max) after the
+        # same up-clamp `render()` applies -- not against Min alone. Above Min,
+        # the field itself is built on a lattice pitched at Max, and the blur
+        # is measured against that same reference, so a tile computed here
+        # with only Min in view would under-reserve and the export would seam
+        # exactly where Max exceeds Min.
+        gsm = 0.0
+        # Same floored min and up-clamped max render() computes, not the raw
+        # slider values -- matched exactly, including the floor, so this gate
+        # and render()'s own `variable` decision can never disagree about
+        # whether the field switched construction.
+        gcell_lo = max(_MIN_CELL, p["global_size"] * scale)
+        g_eff = max(gcell_lo, p["global_size_max"] * scale)
+        variable_gate = (g_eff - gcell_lo) > 1e-3
+        if (p["global_intensity"] > 0.01 and p["global_opacity"] > 0.001
+                and p["global_smooth"] > 0.001):
+            gsm = p["global_smooth"] * _SMOOTH_MAX * g_eff
+        # `_variable_cell_noise` reads lattice cells up to `_VARCELL_RINGS` away
+        # from a pixel's own -- a real read reach, not merely an addressing
+        # convenience, because the render pipeline only ever hands it a padded
+        # window rather than the whole image. Under-reserve this and a pixel
+        # near a tile edge silently substitutes a clamped boundary cell for the
+        # true neighbour, which two different tile splits do differently --
+        # invisible in a single preview, a seam in a tiled export.
+        varcell_r = 0.0
+        if (p["global_intensity"] > 0.01 and p["global_opacity"] > 0.001
+                and variable_gate):
+            varcell_r = _VARCELL_RINGS * g_eff
         mask_r = max(1.0, 3.0 * scale)
+        # Scatter reads a pixel up to its full reach away. It displaces rather
+        # than blurring, so it belongs with the warps below and not in the
+        # kernel sum.
+        #
+        # Reach *plus one pixel*: dx and dy are rounded to whole pixels
+        # independently, so two half-pixel roundings the same way lengthen the
+        # vector by up to sqrt(2)/2. It would fit inside the +4 at the end of
+        # this function either way, but a stage that silently depends on
+        # another term's slack is a seam waiting for somebody to tighten it.
+        sca = (
+            max(0.5, p["scatter_radius"] * scale) + 1.0
+            if p["scatter"] > 0.001 else 0.0
+        )
         # Jitter warps the image rather than blurring it, so it reads pixels
         # displaced by up to its peak -- which at _JITTER_MAX is no longer the
         # sub-pixel rounding error it was at 0.6.
         # Both the jitter warp and the sanding filter read displaced pixels
         # rather than blurring in place, so the overlap has to cover how far
         # each of them travels.
-        jit = _JITTER_MAX * p["edge_jitter"] * max(scale, 0.25)
+        jit = _JITTER_MAX * p["edge_jitter"] * max(scale, 0.25) + sca
         if p["edge_sand"] > 0.01:
             # Sanding compounds in two ways at once, and both have to be
             # counted or a tiled export seams while every preview looks fine.
@@ -1398,8 +3719,82 @@ class GrainEngine:
             dir_reach = 3.0 * max(0.6, _SAND_DIR_K * sr)
             jit += _SAND_PASSES * (2.0 * sr + dir_reach)
         return int(
-            math.ceil(3.0 * (hp_r * 3.3 + mb + halo + soft + shr + tex_r + mask_r) + jit)
+            math.ceil(
+                3.0 * (hp_r * 3.3 + mb + clar + halo + soft + shr + tex_r
+                       + mask_r + gsm + aa_r + varcell_r)
+                + jit + aa_tap
+            )
         ) + 4
+
+    # ------------------------------------------------------------------ #
+    def tile_for(
+        self, p: dict, scale: float, h: int, w: int, ss: int,
+    ) -> int:
+        """Largest tile whose working set fits the memory budget.
+
+        Tiling is pure overhead: `pad_for` overlap is read, rendered and thrown
+        away on all four sides, so a smaller tile does strictly more work for the
+        same output. Measured on a 2400x1600 `Stock` proxy at supersample 2,
+        fresh process each, best of 3:
+
+        | tile | tiles | overdraw | time  |
+        |------|-------|----------|-------|
+        | 1024 |   6   |  1.59x   | 4.46s |
+        | 1536 |   4   |  1.32x   | 3.70s |
+        | 2048 |   2   |  1.15x   | 3.30s |
+        | 4096 |   1   |  1.00x   | 2.77s |
+
+        Interior *export* tiles are the worst case, since they pad on all four
+        sides: 1024 + 2*178 = 1380 square rendered for 1024 square kept, 1.82x.
+
+        **So why not simply always use one tile?** Because memory is the binding
+        constraint and it is the thing this codebase's own "quality beats speed"
+        licence does not cover -- an out-of-memory render is not slow, it is
+        broken. Peak driver-allocated memory on the sweep above went 6.0GB at
+        tile 1536 to 8.0GB at 2048. On an 8GB machine that swaps or dies, and an
+        8GB machine is exactly where the tiling matters most.
+
+        Hence a budget rather than a constant. Note the coupling this creates
+        with `pad_for`, which is the right one and which the old hard-coded 1024
+        and 1536 got wrong in both directions: a wide-kernel preset pads more, so
+        it *gets a smaller tile*, because its working set per tile is larger for
+        the same nominal tile.
+
+        `_WORKING_BYTES_PER_PX` is measured, not guessed -- see its comment. The
+        answer is clamped into `_TILE_MIN`..`_TILE_MAX` and never exceeds what
+        the image actually needs, so a small frame still renders in one pass.
+        """
+        pad = self.pad_for(p, scale)
+        budget = _render_budget_bytes()
+        ss = max(1, int(ss))
+        longest = max(h, w)
+
+        def fits(tile: int) -> bool:
+            # The padded read window is *clamped to the image* (see
+            # `render_image`), so the worst tile is bounded by the frame, not by
+            # `tile + 2 * pad`. Solving the square upper bound in closed form
+            # instead over-predicts badly once the tile approaches the image
+            # size -- it wanted 2 tiles for a proxy that comfortably fits in one.
+            th = min(h, min(tile, h) + 2 * pad)
+            tw = min(w, min(tile, w) + 2 * pad)
+            return (th * ss) * (tw * ss) * _WORKING_BYTES_PER_PX <= budget
+
+        # Descending search rather than closed form: `fits` is monotonic in
+        # `tile`, the candidate list is short, and this keeps the memory model in
+        # one readable place instead of inverted through algebra.
+        tile = _TILE_MIN
+        for cand in range(min(_TILE_MAX, longest), _TILE_MIN, -128):
+            if fits(cand):
+                tile = cand
+                break
+        # Never below _TILE_MIN even if the budget says so: there the overlap
+        # dominates the useful area so completely that the extra work costs more
+        # than the memory it saves, and every supported backend can hold a tile
+        # this size.
+        tile = max(_TILE_MIN, tile)
+        # No point in a tile larger than the image -- `render_image`
+        # short-circuits to a single untiled pass when `tile >= max(h, w)`.
+        return min(tile, longest)
 
     def render_view(
         self, arr: np.ndarray, p: dict, box: tuple[int, int, int, int],
@@ -1473,16 +3868,28 @@ class GrainEngine:
     def render_image(
         self, arr: np.ndarray, p: dict, scale: float = 1.0,
         tile: int = 1024, supersample: int = 2, progress=None,
+        should_cancel=None,
     ) -> np.ndarray:
         """Render a whole image, tiling when it is larger than ``tile``.
 
         ``arr`` is HxWx3 float32 in 0..1. Returns the same shape.
+
+        ``should_cancel``, if given, is polled once per tile and once before the
+        single-tile path; returning true raises `RenderCancelled`. Tile
+        granularity is deliberate: it needs no plumbing inside `render`, and it
+        bounds the wasted work at one tile. It matters because the caller cannot
+        interrupt this any other way -- a Starlette threadpool worker runs to
+        completion whatever the client does, so an abandoned preview would
+        otherwise keep the render lock for its full duration and every request
+        behind it would queue on work nobody is waiting for.
         """
         # Nothing switched on: hand the input straight back. Not merely an
         # optimisation -- see params.is_neutral for why rendering it would
         # *not* return the input.
         if P.is_neutral(p):
             return arr
+        if should_cancel is not None and should_cancel():
+            raise RenderCancelled()
         ss = max(1, int(supersample))
         h, w, _ = arr.shape
         if max(h, w) <= tile:
@@ -1503,6 +3910,8 @@ class GrainEngine:
         done = 0
         for ty in range(ny):
             for tx in range(nx):
+                if should_cancel is not None and should_cancel():
+                    raise RenderCancelled()
                 y_a, y_b = ty * tile, min((ty + 1) * tile, h)
                 x_a, x_b = tx * tile, min((tx + 1) * tile, w)
                 # padded read window, clamped to the image

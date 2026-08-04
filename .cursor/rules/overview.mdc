@@ -1,0 +1,46 @@
+---
+description: What this project is, its scope, priorities, and file layout
+alwaysApply: true
+---
+
+# Film grain engine — overview
+
+A web app that applies **organic film grain** to still photos. Python/PyTorch
+image service behind a React UI, shipped as a **single FastAPI service** that
+serves the built client. Deep reference lives in `CLAUDE.md` and `TOPIC.md`.
+
+## In scope (the point of the app)
+
+Detail destruction, edge softening/noising, grain, halation, chromatic edge
+fringing. These are what the pipeline exists to do.
+
+## Deferred — do NOT tune without asking
+
+Colour grading in general: tone curves, contrast, toe/shoulder, split toning,
+highlight desaturation, base fog, `vibrance`, `brightness`. The engine
+implements them and exposes sliders, but they **ship neutral (0)** so the
+pipeline is a colour pass-through. Do not fold them into presets or tune them.
+
+## Quality beats speed — an explicit user decision
+
+Latency is accepted. Do **not** clamp octaves, lattice density, blur radii,
+supersampling or preview resolution for performance alone. If a quality/speed
+trade-off appears, take quality and expose speed as opt-in.
+
+## Layout
+
+```
+server/params.py   parameter schema -- SINGLE SOURCE OF TRUTH for engine + UI
+server/engine.py   the pipeline (module docstring states the invariants)
+server/imageio.py  decode/encode, incl. a hand-written 16-bit RGB PNG encoder
+server/main.py     FastAPI service
+web/src/App.tsx    UI; slider panel generated from GET /api/params
+web/src/api.ts     typed client
+tests/verify.py    engine invariant checks -- run after touching engine.py
+presets/           preset library -- .json files, not code
+run.sh / dev.sh    production-from-source / hot-reload dev
+build.sh           compiles a distribution into build/
+```
+
+`TOPIC.md` was originally Gemini-generated and is **not authoritative**; it has
+been rewritten to match what was actually built.

@@ -30,28 +30,322 @@ class Param:
     #: to be rescaled when a preset authored on one image size is applied to
     #: another. See ``rescale``.
     spatial: bool = False
+    #: Names for a *discrete* parameter, indexed by the value. Non-empty turns
+    #: the control into a menu instead of a slider -- the value is still a
+    #: number, so nothing else in the schema, the engine or a preset file has
+    #: to know the difference. Only for genuine either/or choices: a stencil
+    #: shape has no midpoint between "cross" and "diagonal", and a slider that
+    #: pretends otherwise invites you to leave it at 2.5.
+    choices: tuple[str, ...] = ()
 
 
 # Groups are rendered in this order by the client.
 GROUPS: list[str] = [
+    "Colour Grading",
+    "Pre Blur",
     "Pre Sharpen",
     "Grain Structure",
-    "Luminance Response",
     "Edge Destruction",
-    "Halation",
-    "Optical",
-    "Color",
-    "Tone Response",
+    "Anti Aliasing",
     "Global Grain",
     "Sharpening",
+    "Luminance Response",
+    "Halation",
+    "Tone Response",
     "Film Texture",
+    "Output",
 ]
 
 
 PARAMS: list[Param] = [
+    # ------------------------------------------------------- colour grading
+    # Step -1: the only block above pre-blur, and the whole section runs on the
+    # source before anything films it. Ships at 0, so the pipeline is still a
+    # colour pass-through until something here is asked for.
+    #
+    # Panel order matches pipeline order, the way Edge Destruction's does:
+    # highlight reconstruction, white balance, exposure, the tonal range,
+    # contrast and black point, clarity, then vibrance and saturation, then the
+    # LUT they all feed. The LUT *file* is not a parameter -- see server/lut.py
+    # for why a name cannot be an index -- so it travels beside these values and
+    # the client renders its picker directly above `lut_amount`.
+    Param(
+        "grade_recover", "Highlight Reconstruction", "Colour Grading",
+        0.0, 1.0, 0.01, 0.0, "",
+        "Rebuilds a blown highlight's clipped channels from the ones that "
+        "survived, so the detail comes back instead of being dimmed. An 8-bit "
+        "file clips per *channel*, not per pixel: a warm highlight hits the "
+        "ceiling in red long before green and well before blue, so across a "
+        "blown cloud red is a flat plateau while green and blue are still "
+        "recording the scene's own gradient. This reads the colour of the light "
+        "around the blown area from wherever it was still measurable and uses "
+        "it to work out what the flattened channel was doing -- putting the "
+        "value back above white, where it really was.\n"
+        "\n"
+        "The recovered value is above white, so the stage then rolls it back "
+        "into view -- but only where it actually repaired something, so the rest "
+        "of the frame is untouched. That makes this a self-contained repair: "
+        "raise it and blown highlights regain their texture, with nothing else "
+        "to set up. Highlights below still stacks on top if you want a broader, "
+        "stronger roll across the whole top of the range.\n"
+        "\n"
+        "Only ever raises a clipped channel, never darkens anything, and it is "
+        "a no-op on a photograph with nothing blown in it. Where *every* "
+        "channel is at the ceiling -- a specular hit, a blown sky at noon -- "
+        "there is genuinely nothing left in the file to work from and it leaves "
+        "the pixel alone rather than inventing texture. The one expensive "
+        "stage in this section: it costs two blurs of the frame. 0 = off.",
+    ),
+    Param(
+        "grade_recover_radius", "Reconstruction Radius", "Colour Grading",
+        4.0, 200.0, 1.0, 32.0, "px",
+        "How far Highlight Reconstruction looks for a valid measurement of a "
+        "clipped channel, at full resolution. This is the size of the blown "
+        "area it can work across: a highlight wider than the radius has no "
+        "surviving sample of its own colour anywhere in reach, so the estimate "
+        "fades out toward the middle of it rather than being extrapolated from "
+        "nothing. Larger reaches across bigger blown regions and costs more, "
+        "and it borrows the local colour from further away -- which is only "
+        "right while the light out there is the same light.\n"
+        "\n"
+        "It also sets how softly the repair blends into the surrounding frame.\n"
+        "\n"
+        "**This is by far the most expensive control in the app, and the cost "
+        "grows faster than the number does** -- the tile overlap grows with it "
+        "too, so a large radius spends most of its time rendering overlap it "
+        "throws away. Measured on a 2400px proxy against a render that costs "
+        "0.57s with this off: 1.6s at the 32px default, 3.6s at 80px, and 14s at "
+        "200px. A full-resolution export multiplies all of that. Reach for the "
+        "smallest radius that covers your blown areas, not the largest.",
+        spatial=True,
+    ),
+    Param(
+        "grade_temp", "Temperature", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "White balance, as a warm/cool shift. Positive is warmer (more red, "
+        "less blue), negative cooler. Done as channel gains in *linear* light, "
+        "which is where a white balance physically happens -- the same reason "
+        "Pre Blur does its transfer round trip. Applied in gamma-encoded space "
+        "instead it drags the shadows further than the highlights and reads as "
+        "a tint painted over the picture rather than a different light.\n"
+        "\n"
+        "The gains are normalised against the luma weights, so warming a frame "
+        "does not also brighten it -- measured, overall luminance holds to "
+        "within 1% across the whole slider. Use it to set the light before the "
+        "LUT below sees it; a LUT built for daylight has nothing sensible to do "
+        "with a tungsten frame, and correcting afterwards fights the look. "
+        "0 = off.",
+    ),
+    Param(
+        "grade_tint", "Tint", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "The other half of white balance: green against magenta, at right "
+        "angles to Temperature's blue/amber axis. Positive pushes toward "
+        "magenta (red and blue up, green down), negative toward green. Same "
+        "construction as Temperature and applied in the very same linear-light "
+        "round trip -- a change of illuminant is a shift on both axes at once, "
+        "so this and Temperature are one physical operation split across two "
+        "sliders rather than two separate operations paying for the transfer "
+        "twice.\n"
+        "\n"
+        "The gain is normalised against the luma weights the same way "
+        "Temperature's is, so tinting a frame does not also expose it. "
+        "0 = off.",
+    ),
+    Param(
+        "grade_exposure", "Exposure", "Colour Grading",
+        -2.0, 2.0, 0.01, 0.0, "EV",
+        "A stops-based exposure multiply in linear light, ahead of Shadows "
+        "and Highlights so their masks measure the frame at the light level "
+        "actually being graded rather than the one that arrived -- raise this "
+        "first and the two knees below still read the picture correctly. +1 "
+        "is twice the light, -1 is half, and the sRGB encoding on the way "
+        "back rolls the highlights off by itself rather than stretching them "
+        "into a flat clip.\n"
+        "\n"
+        "Same construction as Tone Response's own Brightness, and kept as a "
+        "separate control here rather than shared with it: that section is "
+        "deferred and ships at 0, and this one exists so the light can be set "
+        "before the film pipeline -- and the LUT below -- ever sees the "
+        "picture. 0 = off.",
+    ),
+    Param(
+        "grade_shadows", "Shadows", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "Opens or crushes the bottom half of the tonal range. Positive opens "
+        "the shadows; negative takes them down toward black.\n"
+        "\n"
+        "Opening is a genuine recovery, not a brightness shift over the region "
+        "that happens to be dark. The curve makes black an *asymptote*, so the "
+        "whole of the range below the knee -- including anything that had "
+        "already gone under zero on the way here -- is folded back into view "
+        "with its tonal order intact, and two tones that differed before still "
+        "differ after. It is strictly monotone at every setting, which is the "
+        "property that separates recovering shadow detail from flattening it "
+        "into a grey patch.\n"
+        "\n"
+        "It cannot clip and it cannot break a hue: the curve's output is bounded "
+        "by the rail it approaches, and the whole pixel is scaled by one factor "
+        "so hue and saturation are held exactly rather than approximately. It "
+        "keys on the pixel's brightest channel, and it and Highlights touch "
+        "opposite sides of the knee, so the two cannot reach into each other's "
+        "range at all. 0 = off.",
+    ),
+    Param(
+        "grade_highlights", "Highlights", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "The same control for the top half of the range, and negative is the "
+        "direction that matters: it is the highlight recovery for the whole "
+        "app. White becomes an asymptote instead of a wall, so everything from "
+        "the knee upward -- including values *above* white, whether they came "
+        "from Highlight Reconstruction, from Exposure, or from a bright source "
+        "-- is rolled back into the visible range monotonically. Nothing "
+        "flattens: two highlights that differed by a hair still differ "
+        "afterwards, which is exactly what a clip destroys and what dimming a "
+        "clipped patch cannot give back. Positive pushes highlights up instead.\n"
+        "\n"
+        "**This is the stage that makes Highlight Reconstruction visible.** "
+        "Reconstruction puts the clipped channel's real value back above white; "
+        "this is what brings it inside the range you can see. Reach for the "
+        "pair together when a highlight is blown, and for this alone when it is "
+        "merely bright.\n"
+        "\n"
+        "Gamut-safe, monotone and hue-exact for the same reasons Shadows is. "
+        "0 = off.",
+    ),
+    Param(
+        "grade_contrast", "Contrast", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "Steepness of the tonal range about the same middle grey the "
+        "(deferred) film characteristic curve pivots on, but two-way and "
+        "applied directly here rather than through a toe and shoulder: "
+        "positive steepens, negative flattens toward the pivot. The gain is "
+        "floored at 0 so no setting can invert the picture through grey -- at "
+        "-1 the spread is reduced to a tenth of the original rather than "
+        "crossing zero.\n"
+        "\n"
+        "Unlike the film curve further down, nothing here rolls off "
+        "asymptotically, so a strong positive setting will clip highlights "
+        "and shadows outright -- that is what a quick contrast control is "
+        "expected to do, and Shadows/Highlights above exist for the clip-free "
+        "version. 0 = off.",
+    ),
+    Param(
+        "grade_black_point", "Black Point", "Colour Grading",
+        0.0, 0.3, 0.005, 0.0, "",
+        "Where the black clips. Unlike Shadows above, which is a broad, "
+        "clip-free lift, this is the blunt Levels-style remap: every value at "
+        "or below the chosen point is driven to 0 and 1 stays exactly at 1, "
+        "so it genuinely crushes shadow detail rather than easing it -- that "
+        "is the point of a black-point control. Deliberately one-directional: "
+        "there is nothing below 0 to lift from, and a floor lift belongs to "
+        "Shadows or to the (deferred) Base Fog instead.\n"
+        "\n"
+        "Reach for Shadows for a gentle, reversible lift and this for a hard, "
+        "printable black. 0 = off.",
+    ),
+    Param(
+        "grade_clarity", "Clarity", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "Two-way local contrast: positive adds it, negative takes it away. "
+        "Above 0 it is the usual mid-frequency punch -- structure and texture "
+        "come forward without the edge halos a small-radius sharpen leaves. "
+        "Below 0 it flattens that same band, which reads as the soft, hazy, "
+        "lifted look of light bouncing around inside the lens. Both are one "
+        "band at one radius, so this is a different thing from Pre Blur (which "
+        "destroys detail outright) and from Edge Softening (which only touches "
+        "hard transitions).\n"
+        "\n"
+        "The two directions are deliberately not the same strength. Negative "
+        "stops at exactly the point where the band is *gone*: -1 removes 100% "
+        "of the local contrast at this radius and no setting can push past it "
+        "into inverted contrast, which would put dark halos on the light side "
+        "of every edge. Positive is free to go further and does. It runs on "
+        "luminance only -- the detail it adds or removes goes to all three "
+        "channels equally -- so it holds hue exactly and cannot drive a "
+        "saturated area out of gamut, and it costs one single-channel blur "
+        "instead of three. 0 = off.",
+    ),
+    Param(
+        "grade_clarity_radius", "Clarity Radius", "Colour Grading",
+        2.0, 80.0, 0.5, 14.0, "px",
+        "Which band Clarity works on, as a radius at full resolution. Small is "
+        "fine texture and starts competing with the grain further down the "
+        "pipeline; large is broad shaping that reads as light rather than as "
+        "detail. This is the one length in this section, so it scales with the "
+        "photo like every other radius in the app -- and it is the only thing "
+        "here that needs tile overlap, which is why Clarity is the only part of "
+        "this section that costs anything measurable.",
+        spatial=True,
+    ),
+    Param(
+        "grade_vibrance", "Vibrance", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "The same saturation-weighted-against-itself construction as Tone "
+        "Response's own Vibrance -- muted colour comes up, colour that is "
+        "already strong is left alone -- kept as its own control here because "
+        "this section runs before the film pipeline and the two have to stay "
+        "independent: grading the picture and grading the negative are "
+        "different jobs done at different points, and sharing one slider "
+        "between them would mean the (deferred) Tone Response section could "
+        "never be switched on later without re-touching a grade that was "
+        "already finished. Negative drains the muted colour and leaves the "
+        "vivid, which reads as bleached. 0 = off, and the pipeline stays a "
+        "colour pass-through.",
+    ),
+    Param(
+        "grade_saturation", "Saturation", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "A flat saturation scale about each pixel's own luma. Unlike "
+        "Vibrance, every pixel gains or loses the same proportion regardless "
+        "of how saturated it already is, which is the classic blunt "
+        "saturation control -- it will push an already-vivid area out of "
+        "gamut before a muted one has caught up. -1 is fully neutral "
+        "(equivalent to a monochrome conversion at this point in the "
+        "pipeline), +1 doubles the existing chroma. Reach for Vibrance "
+        "instead when skin and sky need to stay untouched while muted colour "
+        "comes up. 0 = off.",
+    ),
+    Param(
+        "lut_amount", "LUT Mix", "Colour Grading",
+        0.0, 1.0, 0.01, 0.0, "",
+        "How much of the selected 3D LUT is mixed in, as a straight cross-fade "
+        "between the graded frame and its LUT'd self. 1 is the LUT as its "
+        "author built it; part-way is the standard way to use a film LUT that "
+        "is stronger than the photograph wants.\n"
+        "\n"
+        "0 = off, and with no LUT selected this does nothing whatever it says "
+        "-- the server zeroes it in that case so 'show me the original' stays "
+        "bit-exact. Picking a LUT raises it to 1 for you if it was sitting at "
+        "0, because a picker that appears to do nothing is worse than one that "
+        "commits.\n"
+        "\n"
+        "The LUT is applied display-referred, on the source, before every film "
+        "stage -- which is what a LUT expects, and it means the grain, halation "
+        "and texture below all land on the graded picture rather than being "
+        "graded themselves.",
+    ),
+    # ------------------------------------------------------------- pre blur
+    # The very first thing that touches the image -- ahead of pre-sharpen and
+    # of every film stage. See step 0 in engine.render().
+    Param(
+        "pre_blur", "Pre Blur", "Pre Blur",
+        0.0, 10.0, 0.05, 0.0, "px",
+        "Gaussian blur on the source, at the top of the pipeline: before "
+        "pre-sharpen and before anything films it. Radius at full resolution. "
+        "It is not a second Micro-Blur despite being the same kernel -- this "
+        "one runs before the masks are measured, so it also tells the grain "
+        "where the detail went: edges read as softer, the smooth-area guard "
+        "sees more smooth frame, and grain backs off with them. Micro-Blur is "
+        "deliberately invisible to those masks. Use this to take a "
+        "digital-sharp source down before the emulsion goes on, and pair it "
+        "with Pre Sharpen at a tighter radius to put the bite back only where "
+        "you want it. 0 = off.",
+        spatial=True,
+    ),
     # ---------------------------------------------------------- pre sharpen
-    # Runs before everything, on the untouched input -- see step 0 in
-    # engine.render().
+    # Runs before every film stage, on the (optionally pre-blurred) input --
+    # see step 0b in engine.render().
     Param(
         "pre_sharpen", "Pre Sharpen", "Pre Sharpen",
         0.0, 30.0, 0.01, 0.0, "",
@@ -117,6 +411,18 @@ PARAMS: list[Param] = [
         0.0, 0.08, 0.002, 0.0, "",
         "Minimum density of the film base. There is no true black on film.",
     ),
+    Param(
+        "warm_highlights", "Warm Highlights", "Tone Response",
+        0.0, 1.0, 0.01, 0.0, "",
+        "Cross-channel bias pushing highlights warm, as the three dye layers "
+        "reach saturation at different rates.",
+    ),
+    Param(
+        "cool_shadows", "Cool Shadows", "Tone Response",
+        0.0, 1.0, 0.01, 0.0, "",
+        "Complementary cool cast in the shadows. Together with warm "
+        "highlights this is most of what reads as a film colour palette.",
+    ),
     # ---------------------------------------------------------------- grain
     Param(
         "intensity", "Intensity", "Grain Structure",
@@ -160,6 +466,20 @@ PARAMS: list[Param] = [
         "nothing; 1 = every octave weighs the same and the grain goes visibly "
         "clumpy and mottled. Total grain strength stays put either way -- this "
         "moves structure around, Intensity sets how much of it there is.",
+    ),
+    Param(
+        "chroma_grain", "Chroma Grain", "Grain Structure",
+        0.0, 1.0, 0.01, 0.35, "",
+        "0 = monochrome grain shared across channels. 1 = independent dye "
+        "cloud noise per layer.",
+    ),
+    Param(
+        "seed", "Seed", "Grain Structure",
+        0.0, 9999.0, 1.0, 1234.0, "",
+        "Deterministic seed for the grain lattice. Every other noise field in "
+        "the pipeline -- the global layer, the edge envelope, the jitter "
+        "displacement, the film-texture marks -- is offset from this one, so "
+        "moving it rerolls the whole frame without changing any look.",
     ),
     # ------------------------------------------------------------ luminance
     Param(
@@ -221,6 +541,13 @@ PARAMS: list[Param] = [
         0.0, 1.0, 0.01, 0.5, "",
         "Modulates existing micro-detail by the grain field so grain erodes "
         "edge structure rather than sitting on top of it.",
+    ),
+    Param(
+        "edge_chroma", "Edge Colour Fringing", "Edge Destruction",
+        0.0, 1.0, 0.01, 0.5, "",
+        "Runs edge erosion independently per colour layer, so eroded edges "
+        "pick up coloured speckle. 0 = neutral erosion, 1 = full dye-layer "
+        "fringing. It modulates the slider above and does nothing without it.",
     ),
     Param(
         "acutance", "Acutance", "Edge Destruction",
@@ -311,6 +638,34 @@ PARAMS: list[Param] = [
         "Luminance above which highlights start to bloom.",
     ),
     Param(
+        "halation_recovery", "Highlight Recovery", "Halation",
+        0.0, 1.0, 0.01, 0.0, "",
+        "Adds the bloom into the headroom that is actually there, instead of "
+        "adding it flat and letting the total clip. The bloom is added as light, "
+        "with nothing stopping it, so a highlight already near white gets "
+        "pushed the rest of the way to a flat, textureless patch -- the usual "
+        "complaint that halation burns highlights out.\n"
+        "\n"
+        "The bloom is metered against the room each channel has left, so a "
+        "highlight with headroom to spare still gets the whole thing at full "
+        "strength and only one being asked to take more light than it can hold "
+        "is held back at all. At 1.0 no channel can be driven to white by the "
+        "bloom, and the sum stays strictly ordered -- two highlights that "
+        "differed by a hair before still differ after, which is exactly what a "
+        "clip destroys and what dimming a flat patch cannot give back.\n"
+        "\n"
+        "**This is not a strength control.** Measured on a bright plate "
+        "carrying fine texture, 1.0 keeps 60% of that texture against 40% with "
+        "recovery off, and does it while keeping 68% of the bloom's light -- "
+        "more detail *and* more bloom than simply turning Halation down to the "
+        "same effect. Measured per channel, so a saturated highlight far over "
+        "the threshold in luma but with most of one channel still free gets "
+        "that channel's full share.\n"
+        "\n"
+        "0 = off, and the bloom burns exactly as much as Halation and Halation "
+        "Threshold alone say it should.",
+    ),
+    Param(
         "halation_hue", "Halation Hue", "Halation",
         0.0, 360.0, 1.0, 11.0, "deg",
         "Colour of the bloom, as a hue angle. 0 = red, 30 = amber, 60 = "
@@ -320,6 +675,64 @@ PARAMS: list[Param] = [
         "here because this is a look tool. Was a 0-1 red-to-amber ramp that "
         "only spanned 25 degrees.",
     ),
+    # Blue compensation. Applied to the image *before* the wash lands, so the
+    # blue is strengthened on clean data and the wash is left alone -- see
+    # step 2a in engine.render() for why that beats correcting afterwards.
+    Param(
+        "halation_blue", "Blue Compensation", "Halation",
+        0.0, 3.0, 0.01, 0.0, "",
+        "Strengthens blue *before* the bloom lands on it, so it survives the "
+        "wash instead of being greyed by it. Halation adds warm light, and "
+        "adding light to a colour desaturates it -- a red bloom over a blue "
+        "sky lifts the red channel far more than the blue one, so the sky "
+        "loses its colour and drifts toward grey. This puts the colour back "
+        "in the exposure rather than repainting it afterwards, which is what "
+        "a punchier blue-sensitive stock or a polariser would do.\n"
+        "\n"
+        "It is self-limiting, which is the main reason it runs here rather "
+        "than after the wash: whatever you add, the wash eats the same share "
+        "of it, so the recovered saturation flattens off instead of running "
+        "away. Measured on a sky the bloom had cost 16% of its colour, 0.5 "
+        "puts it back to within 1% of untouched and everything from 1.0 "
+        "upward sits at 3% past it -- 3.0 included. The same correction "
+        "applied *after* the wash has no such brake: it is 9% past by 0.5 and "
+        "by 1.0 it has driven a channel to black, pinning the sky at fully "
+        "saturated. Only does anything while Halation is above 0: with no "
+        "wash there is nothing to compensate for, and this is not a grading "
+        "control. 0 = off.",
+    ),
+    Param(
+        "halation_blue_level", "Blue Level", "Halation",
+        0.0, 1.0, 0.005, 0.45, "",
+        "How light a blue has to be before it is worth saving. The wash only "
+        "reaches what is near the light, so pale sky loses colour and deep "
+        "sky loses none -- measured on a sky gradient, the loss is 23% at the "
+        "bright end and flat 0% below about half brightness. Compensating "
+        "everything regardless is what makes a deep blue go lurid: it was "
+        "never damaged, so every bit of the correction is overshoot. Blue "
+        "above this brightness is compensated and blue below it is left as "
+        "it was. Read on the picture's own brightness scale, the same one the "
+        "Luminance Response knees use.",
+    ),
+    Param(
+        "halation_blue_falloff", "Blue Level Falloff", "Halation",
+        0.02, 0.5, 0.005, 0.25, "",
+        "How wide the fade is below the level, so the change from saved to "
+        "left-alone is a ramp rather than a line across the sky. Independent "
+        "of the level itself on purpose -- deriving the width from the knee "
+        "would mean moving the knee also changed the softness, and a sky is "
+        "exactly the smooth gradient that shows up a hard switch-on.",
+    ),
+    Param(
+        "halation_blue_shift", "Blue Hue Shift", "Halation",
+        -45.0, 45.0, 1.0, 0.0, "deg",
+        "Rotates the selected blue before the wash. Saturation alone cannot "
+        "fix the *hue*: measured, a red bloom swings an ordinary sky about 6 "
+        "degrees toward purple, and scaling saturation about the luma axis "
+        "leaves that swing exactly where it is. Negative turns the sky toward "
+        "cyan, which is the direction that cancels a warm bloom. Applied only "
+        "where Blue Range selects, so the rest of the frame keeps its hue.",
+    ),
     Param(
         "halation_sat", "Halation Saturation", "Halation",
         0.0, 1.0, 0.01, 0.86, "",
@@ -328,44 +741,165 @@ PARAMS: list[Param] = [
         "Lower it when halation is strong and the tint starts to read as a "
         "colour cast rather than as light.",
     ),
-    # -------------------------------------------------------------- optical
+    # ----------------------------------------------------- edge destruction
+    # (scatter and micro-blur -- formerly their own "Optical" group, merged in
+    # here 2026-08-04 on request; the engine's step numbering is unaffected,
+    # this is a UI grouping only.)
+    #
+    # Scatter first, micro-blur last, in the panel and in the pipeline alike --
+    # see step 1 in engine.render(). The order is the point: scatter gets the
+    # source's own detail to take apart, and the blur then averages what is
+    # left rather than handing scatter a frame that is already smooth.
+    #
+    # Scatter: diffusion resolved as discrete deflections instead of as an
+    # average. See _scatter for why that is not a blur.
     Param(
-        "micro_blur", "Micro-Blur", "Optical",
-        0.0, 3.0, 0.01, 0.45, "px",
-        "Light diffusion through the gel layers. Applied to the base image "
-        "before grain injection so grain stays sharp against a soft base.",
+        "scatter", "Scatter", "Edge Destruction",
+        0.0, 1.0, 0.01, 0.0, "",
+        "Spreads detail into the neighbouring pixels *without* averaging "
+        "anything, so the picture loses its digital exactness while keeping "
+        "its bite. Every displaced pixel is an exact copy of a real pixel "
+        "nearby -- no in-between values are invented, so contrast, grit and "
+        "texture come through at full strength where a blur of the same reach "
+        "would have flattened them. The number is the fraction of the frame "
+        "that moves: 0.3 relocates three pixels in ten and leaves the rest "
+        "exactly where they were. It is deliberately a coverage, not a blend "
+        "-- blending a moved pixel with its original *is* averaging, and that "
+        "is the one thing this stage must never do. Smooth regions are "
+        "untouched for free: shuffling pixels that already match their "
+        "neighbours changes nothing, so skies and skin stay clean while "
+        "detail is the only thing that comes apart. 0 = off.",
+    ),
+    Param(
+        "scatter_radius", "Scatter Reach", "Edge Destruction",
+        0.5, 24.0, 0.1, 3.0, "px",
+        "How far a displaced pixel travels, at full resolution. Small reads "
+        "as an emulsion that will not quite resolve; large tears detail into "
+        "streaks and crumbs. It is also what decides *which* structure comes "
+        "apart, because moving a pixel only changes anything where the "
+        "picture varies over the distance travelled: a short reach disorders "
+        "fine texture and leaves shapes standing, a long one starts taking "
+        "the shapes with it.",
         spatial=True,
     ),
-    # ---------------------------------------------------------------- color
     Param(
-        "chroma_grain", "Chroma Grain", "Color",
-        0.0, 1.0, 0.01, 0.35, "",
-        "0 = monochrome grain shared across channels. 1 = independent dye "
-        "cloud noise per layer.",
+        "scatter_pattern", "Scatter Pattern", "Edge Destruction",
+        0.0, 8.0, 1.0, 0.0, "",
+        "Where a displaced pixel is allowed to land -- the stencil. Restricting "
+        "the choice is what makes the result read as a *structure* rather than "
+        "as noise: detail smears the way the shape says and nowhere else.\n"
+        "\n"
+        "Any is isotropic and reads as plain diffusion. Cross, Diagonal and Box "
+        "are the 4-, 45- and 8-neighbour stencils. Diamond keeps every angle "
+        "but reaches furthest along the axes and pulls in on the diagonals, so "
+        "detail spreads as a rhombus rather than a disc. Donut holds a hole "
+        "open in the middle -- nothing lands near where it started, so detail "
+        "is thrown outward and hollowed out, and it stays hollow whatever Reach "
+        "Spread is set to. Star is eight spokes with every other one running "
+        "short, which is the shape a cross filter flares into. Horizontal and "
+        "Vertical are the extreme case, a one-axis slip that leaves edges "
+        "running along that axis completely untouched.",
+        choices=("Any", "Cross", "Diagonal", "Box", "Diamond", "Donut",
+                 "Star", "Horizontal", "Vertical"),
     ),
     Param(
-        "edge_chroma", "Edge Colour Fringing", "Color",
-        0.0, 1.0, 0.01, 0.5, "",
-        "Runs edge erosion independently per colour layer, so eroded edges "
-        "pick up coloured speckle. 0 = neutral erosion, 1 = full dye-layer "
-        "fringing.",
+        "scatter_spread", "Reach Spread", "Edge Destruction",
+        0.0, 1.0, 0.01, 1.0, "",
+        "Whether every displaced pixel travels the full reach or a share of "
+        "it. 0 is a shell -- everything lands on the edge of the pattern's "
+        "shape, which hollows detail out into an outline and is the harshest "
+        "setting here. 1 fills the shape inward, with distances spread evenly "
+        "from nothing up to the reach, which reads as diffusion rather than as "
+        "an outline. Donut is the exception by design: it holds its hole open "
+        "at any setting, so this only decides how thick its ring is.",
     ),
     Param(
-        "warm_highlights", "Warm Highlights", "Color",
+        "scatter_cell", "Scatter Clump", "Edge Destruction",
+        0.1, 5.0, 0.1, 1.0, "px",
+        "How big a piece of the picture moves as one. At 1 every pixel "
+        "chooses for itself and the image crumbles; larger values move whole "
+        "tiles of detail intact, so structure survives the trip and lands "
+        "somewhere else. Past about 4px the tiles start reading as tiles -- "
+        "which is a look, a shattered plate rather than a soft one, but it is "
+        "no longer subtle. Held in full-res pixels like every other length.\n"
+        "\n"
+        "Below one *working* pixel there is nothing left to resolve -- one "
+        "choice per pixel is already the finest this can be -- so the bottom "
+        "of the range is only reachable through supersampling, which is what "
+        "makes a working pixel smaller than a real one. At supersample 2 that "
+        "puts the floor at 0.5; below it every setting renders identically.",
+        spatial=True,
+    ),
+    Param(
+        "micro_blur", "Micro-Blur", "Edge Destruction",
+        0.0, 3.0, 0.01, 0.45, "px",
+        "Light diffusion through the gel layers, as an average: every pixel "
+        "is mixed with its neighbours. That is the smooth half of diffusion, "
+        "and it costs texture along with the edges -- Scatter above is the "
+        "same physics without the averaging. Last in the light path, so it "
+        "averages whatever scatter has already pulled apart rather than "
+        "handing scatter a frame that is smooth before it starts. Applied to "
+        "the base image before grain injection so grain stays sharp against a "
+        "soft base.",
+        spatial=True,
+    ),
+    # -------------------------------------------------------- anti aliasing
+    # Step 1c, in the optical block -- an anti-alias filter is a plate in the
+    # light path, not a retouch. Ships at 0 like every other optional stage.
+    Param(
+        "aa_strength", "AA Strength", "Anti Aliasing",
+        0.0, 3.0, 0.01, 0.0, "",
+        "Removes stair-stepping from hard edges in the source -- the ragged "
+        "diagonal you get from an upscaled JPEG, a screenshot or a CG render. "
+        "It filters *along* each edge rather than across it, so the jaggies "
+        "average out while the edge stays as sharp as it was. That is what "
+        "separates it from Micro-Blur and Edge Softening, which both work "
+        "across the edge and cost sharpness. 0 = off.\n"
+        "\n"
+        "Past 1 it runs the filter again, re-aiming along the contour each "
+        "time, which is what makes it bite on aliasing a single pass barely "
+        "touches: measured on a deliberately-aliased diagonal, 1 removes 34% "
+        "of the contour's raggedness, 2 removes 52% and 3 removes 64%, while "
+        "across-edge sharpness falls only from 86% to 70% over that whole "
+        "range. Repeating is the right lever rather than a longer AA Radius -- "
+        "a stair-step is one pixel wide by definition, so reaching further "
+        "averages away the shape the contour actually has instead of the "
+        "wobble on it. Whole numbers are whole passes and anything between "
+        "fades the last one in.",
+    ),
+    Param(
+        "aa_radius", "AA Radius", "Anti Aliasing",
+        0.2, 4.0, 0.05, 1.0, "px",
+        "How far along the edge each pixel is averaged, at full resolution. "
+        "A stair-step is one pixel by definition, so around 1 is the honest "
+        "setting and the default. Larger values start rounding off genuine "
+        "corners and small detail along with the jaggies -- useful if the "
+        "source was upscaled and its steps are several pixels wide, wrong "
+        "otherwise.",
+        spatial=True,
+    ),
+    Param(
+        "aa_edge_only", "Edge Only", "Anti Aliasing",
+        0.0, 1.0, 0.01, 0.7, "",
+        "How strictly the filter is held to hard edges. At 1 it only touches "
+        "borders that step a long way in brightness, so fabric, foliage and "
+        "grain are untouched -- fine texture measures an order of magnitude "
+        "below a real border, which is the gap this keys on. At 0 it runs "
+        "everywhere, which suits a CG render that aliases on gentle steps and "
+        "will visibly soften a photograph's texture.",
+    ),
+    Param(
+        "global_smooth", "Global Smoothness", "Anti Aliasing",
         0.0, 1.0, 0.01, 0.0, "",
-        "Cross-channel bias pushing highlights warm, as the three dye layers "
-        "reach saturation at different rates.",
-    ),
-    Param(
-        "cool_shadows", "Cool Shadows", "Color",
-        0.0, 1.0, 0.01, 0.0, "",
-        "Complementary cool cast in the shadows. Together with warm "
-        "highlights this is most of what reads as a film colour palette.",
-    ),
-    Param(
-        "seed", "Seed", "Color",
-        0.0, 9999.0, 1.0, 1234.0, "",
-        "Deterministic seed for the grain lattice.",
+        "Softens the blockiness of the Global Grain layer. That noise is "
+        "built on an axis-aligned lattice, so at large Global Sizes its cells "
+        "read as rectangles; this blurs the layer by up to half a clump, "
+        "which measurably removes 82% of that grid and leaves rounded clumps. "
+        "Strength is held constant as you raise it -- it changes the shape of "
+        "the grain, not how much there is -- so it is free to use. Scaled to "
+        "Global Size, so one setting stays right as you resize the clumps. "
+        "Here rather than under Global Grain because it is the same job as "
+        "the sliders above it: taking the pixel grid back out.",
     ),
     # --------------------------------------------------------- global grain
     # Applied last and masked by nothing -- see step 13 in engine.render().
@@ -382,12 +916,51 @@ PARAMS: list[Param] = [
         "sigma against 3.5% there. 5-20 is the usable range.",
     ),
     Param(
-        "global_size", "Global Size", "Global Grain",
-        0.1, 10.0, 0.05, 1.6, "px",
-        "Clump diameter of the global layer, at full resolution. Set it apart "
-        "from Clump Size and the two layers read as separate structures; match "
-        "them and it just thickens the main grain.",
+        "global_size", "Global Size Min", "Global Grain",
+        0.1, 20.0, 0.05, 1.6, "px",
+        "Clump diameter of the global layer, at full resolution -- the "
+        "smallest a clump can be once Global Size Max is raised above this, "
+        "and the only size that exists while Max stays at or below it. Set it "
+        "apart from Clump Size and the two layers read as separate "
+        "structures; match them and it just thickens the main grain. Past "
+        "about 8px the noise lattice starts to show as rectangular blocks -- "
+        "that is the field, not the setting, and Global Smoothness is the "
+        "cure.",
         spatial=True,
+    ),
+    Param(
+        "global_size_max", "Global Size Max", "Global Grain",
+        0.1, 20.0, 0.05, 1.6, "px",
+        "The largest a global-grain clump can be. At or below Global Size Min "
+        "this does nothing -- every clump renders at exactly Min, bit-for-bit "
+        "the field this layer has always drawn. Raised above it, each clump "
+        "independently draws its own diameter somewhere between the two, so "
+        "the layer stops reading as one uniform grain size and starts reading "
+        "as real crystals of differing sizes scattered through the frame -- "
+        "the fix for Global Grain looking too even and digital. This is not a "
+        "gradual blend: the moment Max moves past Min the layer switches from "
+        "smooth stacked noise to discrete randomly-sized particles, which is "
+        "a change in *kind*, not just in range. A wide gap can leave visible "
+        "clear patches between clumps -- real grain has them too, but back "
+        "the gap off if it reads as too sparse. Ships equal to Min, so no "
+        "existing preset changes.",
+        spatial=True,
+    ),
+    Param(
+        "global_chroma", "Global Chroma Grain", "Global Grain",
+        0.0, 1.0, 0.01, 0.0, "",
+        "The same job as Chroma Grain under Grain Structure, for this layer: "
+        "0 = one monochrome field shared by all three channels, 1 = an "
+        "independent field per channel so the layer carries colour speckle "
+        "rather than pure luminance noise. Unlike that slider this one holds "
+        "the layer's amplitude to within 3% across its whole range, so it "
+        "changes colour without changing loudness. Its own slider because the "
+        "two "
+        "layers model different things -- the main grain is the negative's "
+        "emulsion, where the dye layers are genuinely separate, while this one "
+        "stands in for print stock and scanner noise and is often wanted "
+        "neutral over a chromatic main grain. Ships at 0, which is what this "
+        "layer has always been.",
     ),
     Param(
         "global_opacity", "Global Opacity", "Global Grain",
@@ -523,34 +1096,67 @@ PARAMS: list[Param] = [
         "Counted against the perimeter rather than the area, because that "
         "is where they happen. Added in linear light so it behaves like "
         "light falling on the emulsion, not a gradient painted over the "
-        "picture. 0 = none.",
+        "picture. 0 = none -- and so is anything below 1, because you "
+        "cannot render a fraction of a leak. A hand-edited file holding "
+        "0.05 here renders nothing at all rather than a faint leak.",
     ),
     Param(
-        "leak_size", "Leak Size", "Film Texture",
-        0.05, 10.0, 0.05, 0.55, "",
-        "How much of the frame edge a leak takes up. Up to 1 it also reaches "
-        "a little further in; past 1 it spreads *along* the border and into "
-        "the corners instead of deeper, because a leak that washes the middle "
-        "of the frame stops reading as a leak and starts reading as a bad "
-        "exposure. Corners bloom further than edge midpoints either way -- "
-        "that is where the cassette mouth and the film gate let light past.",
+        "leak_strength", "Leak Strength", "Film Texture",
+        0.0, 3.0, 0.01, 1.0, "",
+        "How much light each leak lets in. The response saturates one dye "
+        "layer at a time, so this is not just an opacity: a faint leak is deep "
+        "red because only the red-sensitive layer caught enough light, and "
+        "pushing it up takes the core through orange and yellow to white while "
+        "leaving the colour in the falloff. Past about 1.5 most leaks have a "
+        "blown white core, which is the 'sun got in the back' look.",
+    ),
+    Param(
+        "leak_size_min", "Leak Size Min", "Film Texture",
+        5.0, 3000.0, 1.0, 250.0, "px",
+        "How far the *smallest* leak reaches in from the frame edge, at full "
+        "resolution. Each leak picks its own reach somewhere between this and "
+        "the maximum, so the two together are what makes a frame of leaks look "
+        "accidental rather than stamped -- set them equal and every leak comes "
+        "in exactly as far as the next.",
+        spatial=True,
+    ),
+    Param(
+        "leak_size_max", "Leak Size Max", "Film Texture",
+        5.0, 3000.0, 1.0, 850.0, "px",
+        "How far the *largest* leak reaches in. Given below the minimum the "
+        "two simply swap, so you can drag either one past the other without "
+        "the leaks disappearing. Corners bloom further than edge midpoints "
+        "whatever this says -- that is where the cassette mouth and the film "
+        "gate actually let light past. Reach is capped at half the frame's "
+        "short side, which is the distance at which a leak just dies in the "
+        "middle: past that it would leave a floor over the whole frame, and a "
+        "leak that fogs the centre reads as a bad exposure rather than a leak.",
+        spatial=True,
     ),
     Param(
         "leak_feather", "Leak Feather", "Film Texture",
-        0.0, 1.0, 0.01, 0.6, "",
-        "How softly a leak fades, on both of its edges: the radial falloff "
-        "coming in from the border and the transition along the border where "
-        "one leak ends. 0 is a hard-edged rim, 1 is a broad wash that hardly "
-        "falls off at all. This is usually the control you want when a leak "
-        "looks like a painted shape rather than light.",
+        1.0, 1500.0, 1.0, 180.0, "px",
+        "How far in from the border a leak has faded to *half* strength, at "
+        "full resolution -- so it is a distance you can see rather than an "
+        "abstract softness. Small against the size gives a tight bright rim "
+        "hugging the edge; around half the size gives a straight ramp; most of "
+        "the way to the size gives a broad wash that hardly falls off until it "
+        "ends. Because it is absolute, the same feather is a wash on a small "
+        "leak and a rim on a large one, which is what stops a frame of "
+        "differently-sized leaks looking like one shape at several scales.\n"
+        "\n"
+        "It softens the leak's *other* edge too -- the transition along the "
+        "border where one leak stops. A leak has two visible edges and "
+        "softening only one still reads as a painted shape.",
+        spatial=True,
     ),
     Param(
         "leak_variation", "Leak Variation", "Film Texture",
         0.0, 1.0, 0.01, 0.7, "",
-        "How much one leak differs from the next -- how far it reaches into "
-        "the frame, how broad or tight its halo is, how hard its edge is, and "
-        "how strong it arrives. 0 makes every leak identical, which is what "
-        "gives a frame of them that stamped look; 1 is a wide spread. Light "
+        "How much one leak differs from the next in everything *except* size, "
+        "which Leak Size Min and Max now set directly: how hard its edge is, "
+        "how broad or tight its halo is, and how strong it arrives. 0 makes "
+        "every leak identical in those respects; 1 is a wide spread. Light "
         "gets in through whatever gap it finds, and no two gaps are alike.",
     ),
     Param(
@@ -565,6 +1171,24 @@ PARAMS: list[Param] = [
         "Re-rolls where every mark lands. Separate from the grain Seed on "
         "purpose: you will want to reshuffle the damage without disturbing "
         "grain you have already dialled in.",
+    ),
+    # --------------------------------------------------------------- output
+    # The master blend, applied after literally everything -- and after the
+    # supersample pool, which is the only place it can be bit-exact at 0.
+    # Defaults to 1.0, so it is the one parameter whose neutral value is not
+    # zero and the one that must stay out of NEUTRAL_ZERO.
+    Param(
+        "master_opacity", "Overall Opacity", "Output",
+        0.0, 1.0, 0.01, 1.0, "",
+        "How much of the finished result is laid over the untouched photo. "
+        "1 = the full effect, 0 = the original returned bit for bit, and "
+        "anything between is a straight cross-fade -- so it dials back "
+        "everything at once: grain, halation, softening, marks, the lot. "
+        "Reach for it when a preset is right in character but too strong, "
+        "instead of walking a dozen sliders down together.\n"
+        "\n"
+        "Not to be confused with Global Opacity under Global Grain, which "
+        "only mixes that one noise layer. This one is the whole pipeline.",
     ),
 ]
 
@@ -586,13 +1210,26 @@ DEFAULTS: dict[str, float] = {p.key: p.default for p in PARAMS}
 # a worse failure than any of them being over-zealous. `verify.py` renders with
 # these and asserts the output is the input.
 NEUTRAL_ZERO: tuple[str, ...] = (
-    "pre_sharpen",
+    # Colour grading. `lut_amount` belongs here and the LUT *name* deliberately
+    # does not: this list is what "Original" applies, and it has to be a set of
+    # numbers the engine can be handed. Zeroing the mix switches the LUT off as
+    # completely as unselecting it would, so the name can stay put and be there
+    # again when the section is switched back on -- the same reasoning that
+    # keeps sizes, radii and seeds out of this list. `grade_clarity_radius` and
+    # `grade_recover_radius` are radii, not amounts, so they stay out for the
+    # same reason -- as does `grade_black_point`'s partner-in-spirit `base_fog`
+    # below.
+    "grade_recover",
+    "grade_temp", "grade_tint", "grade_exposure", "grade_shadows",
+    "grade_highlights", "grade_contrast", "grade_black_point", "grade_clarity",
+    "grade_vibrance", "grade_saturation", "lut_amount",
+    "pre_blur", "pre_sharpen",
     "contrast", "toe", "shoulder", "highlight_desat", "brightness",
     "vibrance", "base_fog",
     "intensity",
     "edge_erosion", "acutance", "edge_soften", "edge_sand", "edge_jitter",
-    "halation",
-    "micro_blur",
+    "halation", "halation_blue", "halation_recovery",
+    "micro_blur", "scatter", "aa_strength",
     "warm_highlights", "cool_shadows",
     "global_intensity",
     "sharpen",
@@ -628,7 +1265,14 @@ def rescale(values: dict[str, float], k: float) -> dict[str, float]:
     * Mark counts (dust, scratches, hair, leaks). Those already resolve against
       the frame's area inside the engine, so 50 specks is 50 specks whatever
       the resolution -- which is what keeps the look constant.
-    * ``leak_size``, which is a fraction of the frame rather than a length.
+    * Discrete choices (``scatter_pattern``). It is an index into a list of
+      stencils, not a quantity -- scaling it would silently swap the shape.
+
+    Leak sizes and the leak feather *are* rescaled, because they became
+    lengths in pixels. They used to be fractions of the frame and so were
+    exempt; a preset written against the old fraction will read its number as
+    pixels and produce a hairline leak, which is why the shipped ones were
+    migrated in place.
 
     Values are clamped back into range afterwards, so a large upscale can
     saturate a parameter rather than escaping its slider.
@@ -778,9 +1422,15 @@ def load_presets() -> list[dict]:
         if not isinstance(values, dict):
             values = raw
         ref = raw.get("reference_mp") or DEFAULT_REFERENCE_MP
+        lut = raw.get("lut")
         out.append({
             "name": f.stem,
             "values": sanitize(values),
+            # Which 3D LUT the look wants, by name. A sibling key rather than a
+            # value, for the reason server/lut.py sets out -- it is a resource,
+            # not a quantity. Unresolvable names (a renamed file, an upload from
+            # a previous run) degrade to no LUT rather than erroring.
+            "lut": lut if isinstance(lut, str) and lut else None,
             # Size the preset was dialled in on, so it can be rescaled onto a
             # different photo. Absent in older files -> no scaling, which is
             # the pre-existing behaviour rather than a guess.

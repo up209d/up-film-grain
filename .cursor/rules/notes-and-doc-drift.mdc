@@ -1,0 +1,41 @@
+---
+description: Cursor's own scan notes and known documentation drift (read when doc/code claims disagree)
+alwaysApply: false
+---
+
+# Scan notes & known doc drift
+
+Observations from reading the code directly, beyond what `CLAUDE.md` states.
+Trust the **code** over any prose when they disagree.
+
+## Known drift
+
+- **`_GNORM` comment is stale.** `engine.py` still says "field std ~0.27, clips
+  ~3.6%". `CLAUDE.md` records this was re-measured to **std ~0.45, clips ~18%**
+  and the old note was simply wrong. The constant (0.55) is correct; only the
+  inline justification is outdated.
+- **"79 checks" is a runtime count.** `verify.py` has ~67 static `check()` call
+  sites; the higher figure counts checks inside loops.
+- **`edge_jitter` default drift.** `params.py` help says default 0.3 wanders
+  "±0.4px" while some prose says "±0.227px typical" — the 0.227 figure referred
+  to the *old* 0.6px cap; current `_JITTER_MAX=3.0`, so the code/help is right.
+
+## Confirmed architecture facts (useful shortcuts)
+
+- Renders are **serialised** behind `_RENDER_LOCK` in `main.py` — one GPU, and
+  the UI only needs the newest preview.
+- Endpoints doing tensor work are sync `def` (not `async`) on purpose, so
+  Starlette runs them in a threadpool and one slow render can't block the loop.
+- Uploads/jobs live **in process memory** (12-upload LRU, `_reap()`); `/api/source`
+  PNG is encoded once per upload and cached.
+- Preview tile size is **1536** (amortises fixed overlap); export uses **1024**.
+- Input: **JPEG/PNG only, 30MB max**; MPO (multi-frame JPEG) accepted, frame 0
+  read. TIFF dropped, RAW not implemented (needs rawpy/LibRaw).
+
+## Not converted from Claude config
+
+- `.claude/settings.local.json` is a **permission allowlist** (bash/read globs).
+  It has no direct Cursor project equivalent here; Cursor CLI permissions live
+  in `~/.cursor/cli-config.json` (global). Left as-is — ask before migrating.
+- `CLAUDE.md` / `TOPIC.md` / `README.md` are kept as the **deep reference**;
+  these `.mdc` rules are the fast-catchup layer distilled from them.

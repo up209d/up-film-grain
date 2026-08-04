@@ -53,7 +53,7 @@ cd ..
 
 # ---------------------------------------------------------------- assemble --
 say "Assembling $OUT/"
-rm -rf "${OUT:?}/server" "${OUT:?}/web" "${OUT:?}/presets"
+rm -rf "${OUT:?}/server" "${OUT:?}/web" "${OUT:?}/presets" "${OUT:?}/luts"
 mkdir -p "$OUT/web"
 
 # Server package only -- no tests, no dev scripts, no client sources.
@@ -70,6 +70,19 @@ if compgen -G "presets/*.json" > /dev/null; then
   say "Bundled $(ls -1 presets/*.json | wc -l | tr -d ' ') preset(s)"
 else
   say "No presets to bundle (presets/ is empty)"
+fi
+
+# 3D LUTs, same reasoning: runtime data the server reads by name, so a
+# distribution without the folder has an empty LUT menu and a preset that names
+# a .cube quietly grades nothing. The folder is created either way so it is
+# obvious where LUTs go. These are large -- a 64-cube is ~7MB of text -- so the
+# count and total are reported rather than left to surprise you.
+mkdir -p "$OUT/luts"
+if compgen -G "luts/*.cube" > /dev/null; then
+  cp luts/*.cube "$OUT/luts/"
+  say "Bundled $(ls -1 luts/*.cube | wc -l | tr -d ' ') LUT(s), $(du -sh luts | cut -f1)"
+else
+  say "No LUTs to bundle (luts/ is empty)"
 fi
 
 # Freeze dependencies from the lock file so the distribution pins exactly what
@@ -157,10 +170,10 @@ fi
 say "Done: $OUT/"
 du -sh "$OUT" 2>/dev/null | sed 's/^/    /'
 echo
-echo "  Run it:   cd $OUT && ./run.sh"
-[ "$WITH_VENV" = 1 ] || cat <<'NEXT'
+echo "  Run it:   ./$OUT/run.sh   (or: cd $OUT && ./run.sh)"
+[ "$WITH_VENV" = 1 ] || cat <<NEXT
   First run needs an environment:
-      cd build && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+      cd $OUT && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
   or reuse this project's:
-      cd build && FILM_GRAIN_PYTHON=../.venv/bin/python ./run.sh
+      FILM_GRAIN_PYTHON=../.venv/bin/python ./$OUT/run.sh
 NEXT
