@@ -245,7 +245,9 @@ def main() -> int:
     import torch  # noqa: E402
 
     from server import lut as lutlib  # noqa: E402
-    from server.engine import _blur, _luma  # noqa: E402
+    from server.engine import (  # noqa: E402
+        _blur, _luma, _linear_to_srgb, _srgb_to_linear, _MID_GREY,
+    )
 
     def cube(fn) -> lutlib.Lut:
         """A LUT built from ``fn(r, g, b) -> (R, G, B)`` over an 8-cube.
@@ -338,6 +340,53 @@ def main() -> int:
         f"({100 * (lw / lum0 - 1):+.1f}% / {100 * (lc / lum0 - 1):+.1f}%)",
     )
 
+    # Tint. The other white-balance axis, at right angles to temperature:
+    # green against magenta. Same two properties, and the same round trip --
+    # the check is that its own constant was tuned smaller than temperature's
+    # to land in the same level-holding envelope, not that it is identical.
+    magenta = graded({"grade_tint": 1.0}, plate)
+    green = graded({"grade_tint": -1.0}, plate)
+    lm = float((magenta * np.array([0.2126, 0.7152, 0.0722], np.float32)).sum(-1).mean())
+    lg = float((green * np.array([0.2126, 0.7152, 0.0722], np.float32)).sum(-1).mean())
+    check(
+        "tint moves green against red and blue",
+        magenta[..., 1].mean() < plate[..., 1].mean()
+        and magenta[..., 0].mean() > plate[..., 0].mean()
+        and magenta[..., 2].mean() > plate[..., 2].mean()
+        and green[..., 1].mean() > plate[..., 1].mean()
+        and green[..., 0].mean() < plate[..., 0].mean()
+        and green[..., 2].mean() < plate[..., 2].mean(),
+        f"magenta G {plate[..., 1].mean():.3f}->{magenta[..., 1].mean():.3f}, "
+        f"green G {plate[..., 1].mean():.3f}->{green[..., 1].mean():.3f}",
+    )
+    check(
+        "tint holds the level",
+        abs(lm / lum0 - 1.0) < 0.02 and abs(lg / lum0 - 1.0) < 0.02,
+        f"luma {lum0:.4f} -> {lm:.4f} magenta, {lg:.4f} green "
+        f"({100 * (lm / lum0 - 1):+.1f}% / {100 * (lg / lum0 - 1):+.1f}%)",
+    )
+
+    # Exposure. A stops multiply in linear light, ahead of every luma-keyed
+    # mask below it -- so the check is an exact match against a direct linear
+    # 2x, not merely a mean brightness change the sRGB encoding could fake.
+    ev1 = graded({"grade_exposure": 1.0}, plate)
+    t = torch.from_numpy(plate).permute(2, 0, 1).unsqueeze(0)
+    want_ev1 = (
+        _linear_to_srgb(_srgb_to_linear(t) * 2.0).clamp(0.0, 1.0)
+        .squeeze(0).permute(1, 2, 0).numpy()
+    )
+    d = float(np.abs(ev1 - want_ev1).max())
+    check(
+        "exposure is an exact linear-light stop", d < 1e-5,
+        f"max delta from a direct 2x linear multiply: {d:.2e}",
+    )
+    evm2 = graded({"grade_exposure": -2.0}, plate)
+    check(
+        "exposure -2 is markedly darker",
+        float(evm2.mean()) < float(plate.mean()) * 0.6,
+        f"mean {float(plate.mean()):.3f} -> {float(evm2.mean()):.3f}",
+    )
+
     # Shadows and highlights. Two properties: each end only moves its own end,
     # and neither can leave the cube at any setting -- the lift is a share of
     # the headroom that is there, not an addition that then needs a clamp.
@@ -365,6 +414,43 @@ def main() -> int:
         ds_lo > 0.15 and abs(ds_hi) < 0.02 and dh_hi < -0.15 and abs(dh_lo) < 0.02,
         f"shadows +1: {ds_lo:+.3f} low / {ds_hi:+.3f} high; "
         f"highlights -1: {dh_lo:+.3f} low / {dh_hi:+.3f} high",
+    )
+
+    # Contrast. Unlike Shadows/Highlights above, this one is allowed to clip --
+    # the check is that the pivot itself never moves and that the gain floors
+    # at 0 rather than crossing into an inversion.
+    mg = np.full((8, 8, 3), _MID_GREY, np.float32)
+    mg_hi = graded({"grade_contrast": 1.0}, mg)
+    mg_lo = graded({"grade_contrast": -1.0}, mg)
+    d_piv = max(float(np.abs(mg_hi - _MID_GREY).max()), float(np.abs(mg_lo - _MID_GREY).max()))
+    check(
+        "contrast pivots exactly at the mid grey it claims",
+        d_piv < 1e-4, f"a flat mid-grey field moves by {d_piv:.2e} at +-1",
+    )
+    c_hi = graded({"grade_contrast": 1.0}, ramp)
+    c_lo = graded({"grade_contrast": -1.0}, ramp)
+    std0 = float(ramp[:, :, 0].std())
+    std_hi, std_lo = float(c_hi[:, :, 0].std()), float(c_lo[:, :, 0].std())
+    check(
+        "contrast steepens the spread and floors it, never inverts",
+        std_hi > std0 * 1.3 and 0.0 < std_lo < std0 * 0.15,
+        f"std {std0:.3f} -> {std_hi:.3f} at +1, {std_lo:.3f} at -1 "
+        f"(gain floor is 0.1x, measured {std_lo / std0:.3f}x)",
+    )
+
+    # Black point. Deliberately the odd one out in this section: it is
+    # *supposed* to clip, so the check is that it clips exactly at the chosen
+    # level and nowhere else, and holds white untouched.
+    lvl = 0.2  # lands exactly on ramp index 51 (51/255 == 0.2)
+    bp1 = graded({"grade_black_point": lvl}, ramp)
+    below = float(bp1[:, :52].max())
+    white = float(bp1[16, -1, 0])
+    mono_bp = bool(np.all(np.diff(bp1[16, 52:, 0]) >= -1e-6))
+    check(
+        "black point clips at and below the chosen level, holds white",
+        below < 1e-5 and white > 0.999 and mono_bp,
+        f"max at/below {lvl}: {below:.2e}, white holds at {white:.5f}, "
+        f"monotonic above it: {mono_bp}",
     )
 
     # Clarity. The band is measured at the stage's own radius, so the metric
@@ -406,6 +492,57 @@ def main() -> int:
         f"channel differences move by {d:.2e}",
     )
 
+    # Saturation. A flat scale about each pixel's own luma, so chroma -- each
+    # channel's offset from that luma -- must scale by *exactly* the gain,
+    # which is a stronger and more precise claim than a saturation-ratio test
+    # can make (that ratio also moves because the max channel shifts).
+    def chroma(a: np.ndarray) -> np.ndarray:
+        return a.max(-1) - a.min(-1)
+
+    c0 = chroma(plate)
+    s_hi = graded({"grade_saturation": 1.0}, plate)
+    s_lo = graded({"grade_saturation": -1.0}, plate)
+    d_sat = float(np.abs(chroma(s_hi) - 2.0 * c0).max())
+    check(
+        "saturation scales chroma exactly by its gain",
+        d_sat < 1e-4, f"max deviation from an exact 2x chroma at +1: {d_sat:.2e}",
+    )
+    check(
+        "saturation -1 is exactly monochrome",
+        float(chroma(s_lo).max()) < 1e-4,
+        f"max chroma remaining: {float(chroma(s_lo).max()):.2e}",
+    )
+
+    # Vibrance. The same saturation-weighted-against-itself construction as
+    # Tone Response's own vibrance, on its own key -- the check is the same
+    # defining property: gain must fall as starting saturation rises.
+    import colorsys as _cs2  # noqa: E402
+    gsats = [0.15, 0.35, 0.55, 0.75, 0.95]
+    gsw = np.zeros((32, 32 * len(gsats), 3), np.float32)
+    for k, s_ in enumerate(gsats):
+        gsw[:, k * 32:(k + 1) * 32] = _cs2.hsv_to_rgb(0.05, s_, 0.75)
+    gsw = np.ascontiguousarray(gsw)
+
+    def gvib_sat_of(v: float) -> list[float]:
+        o = graded({"grade_vibrance": v}, gsw)
+        got = []
+        for k in range(len(gsats)):
+            px = o[16, k * 32 + 16]
+            mx, mn = float(px.max()), float(px.min())
+            got.append((mx - mn) / max(mx, 1e-4))
+        return got
+
+    gb0 = gvib_sat_of(0.0)
+    gd0 = max(abs(x - s_) for x, s_ in zip(gb0, gsats))
+    check("grade_vibrance neutral at 0", gd0 < 5e-3, f"max saturation drift {gd0:.2e}")
+    gup = gvib_sat_of(0.8)
+    ggains = [a / b - 1.0 for a, b in zip(gup, gb0)]
+    check(
+        "grade_vibrance weights muted over vivid",
+        all(ggains[k] > ggains[k + 1] for k in range(len(ggains) - 1)),
+        " > ".join(f"{g * 100:.0f}%" for g in ggains),
+    )
+
     # pad_for has to know about the one kernel in this section. Everything else
     # here is per-pixel and must reserve nothing.
     pad_off = eng.pad_for(P.sanitize({k: 0.0 for k in P.NEUTRAL_ZERO}), 1.0)
@@ -414,7 +551,10 @@ def main() -> int:
                     "grade_clarity": 1.0, "grade_clarity_radius": 40.0}), 1.0)
     pad_rest = eng.pad_for(
         P.sanitize({**{k: 0.0 for k in P.NEUTRAL_ZERO}, "grade_temp": 1.0,
+                    "grade_tint": 1.0, "grade_exposure": 1.0,
                     "grade_shadows": 1.0, "grade_highlights": -1.0,
+                    "grade_contrast": 1.0, "grade_black_point": 0.2,
+                    "grade_vibrance": 1.0, "grade_saturation": 1.0,
                     "lut_amount": 1.0}), 1.0)
     check(
         "pad_for reserves for clarity and nothing else here",
@@ -426,8 +566,11 @@ def main() -> int:
     # And the seam check that all of that is for: the whole section on, at
     # default everything else, tiled against a single pass.
     cg_all = P.sanitize({
-        "grade_temp": 0.5, "grade_shadows": 0.35, "grade_highlights": -0.4,
-        "grade_clarity": 0.8, "grade_clarity_radius": 24.0, "lut_amount": 1.0,
+        "grade_temp": 0.5, "grade_tint": -0.3, "grade_exposure": 0.4,
+        "grade_shadows": 0.35, "grade_highlights": -0.4,
+        "grade_contrast": 0.5, "grade_black_point": 0.1,
+        "grade_clarity": 0.8, "grade_clarity_radius": 24.0,
+        "grade_vibrance": 0.4, "grade_saturation": -0.3, "lut_amount": 1.0,
     })
     cg_all["lut"] = rot
     a = eng.render_image(img, cg_all, 1.0, tile=4096, supersample=2)
@@ -1809,6 +1952,92 @@ def main() -> int:
         f"pad_for unchanged at {eng.pad_for(P.sanitize(bl_hal), 1.0)}px",
     )
 
+    # -- 5e5. halation highlight recovery ------------------------------------
+    # The bloom is additive in linear light with no upper clamp until display
+    # space, so a highlight already close to white gets pushed the rest of
+    # the way to a flat clip -- reported as burning highlights out. Recovery
+    # holds the glow back in proportion to how little headroom the
+    # *receiving* pixel already has, reusing `hi`, the same per-pixel field
+    # the glow's own shape is built from.
+    print("\nhalation highlight recovery (hold the bloom back near white)")
+
+    def rec_iso(over: dict, im: np.ndarray) -> np.ndarray:
+        return eng.render_image(
+            im, P.sanitize({**{k: 0.0 for k in P.NEUTRAL_ZERO}, **over}),
+            1.0, supersample=1,
+        )
+
+    rh, rw = 48, 240
+    rx = np.linspace(0.55, 0.99, rw, dtype=np.float32)
+    rec_plate = np.ascontiguousarray(
+        np.repeat(np.repeat(rx[None, :, None], rh, 0), 3, 2).astype(np.float32)
+    )
+    rec_hal = {"halation": 0.9, "halation_threshold": 0.6, "halation_radius": 8.0}
+
+    def clipped_frac(a: np.ndarray) -> float:
+        return float((a >= 0.999).mean())
+
+    burned = clipped_frac(rec_iso(rec_hal, rec_plate))
+    half = clipped_frac(rec_iso({**rec_hal, "halation_recovery": 0.5}, rec_plate))
+    full = clipped_frac(rec_iso({**rec_hal, "halation_recovery": 1.0}, rec_plate))
+    check(
+        "recovery reduces the burned (clipped) fraction, monotonically",
+        burned > half > full,
+        f"clipped fraction {burned * 100:.1f}% at 0 -> {half * 100:.1f}% at 0.5 "
+        f"-> {full * 100:.1f}% at 1.0",
+    )
+    d = float(np.abs(
+        rec_iso({**rec_hal, "halation_recovery": 0.0}, rec_plate)
+        - rec_iso(rec_hal, rec_plate)
+    ).max())
+    check("recovery 0 is bit-exactly the old behaviour", d == 0.0, f"max delta {d:.2e}")
+
+    # A flat, meaningfully-above-threshold plate has a uniform `hi`, so the
+    # attenuation on the glow it adds must equal exactly (1 - recover * hi) --
+    # an exact claim rather than "less clipping", checked against the
+    # isolated glow contribution alone (rendered minus a halation-off render
+    # of the same flat field).
+    flat_val = 0.68
+    flat = np.full((32, 32, 3), flat_val, np.float32)
+    off = rec_iso({"halation": 0.0}, flat)
+    on0 = rec_iso(rec_hal, flat)
+    on1 = rec_iso({**rec_hal, "halation_recovery": 1.0}, flat)
+    added0 = on0 - off
+    added1 = on1 - off
+    thr_lin = ((rec_hal["halation_threshold"] + 0.055) / 1.055) ** 2.4
+    lum_lin = ((flat_val + 0.055) / 1.055) ** 2.4
+    hi_expected = min(1.0, max(0.0, (lum_lin - thr_lin) / max(1.0 - thr_lin, 0.02)))
+    ratio = float((added1 / np.clip(added0, 1e-6, None)).mean())
+    check(
+        "recovery attenuates the added glow by exactly (1 - recover * hi)",
+        abs(ratio - (1.0 - hi_expected)) < 0.02,
+        f"expected attenuation {1.0 - hi_expected:.3f}, measured {ratio:.3f}",
+    )
+
+    d = float(np.abs(
+        rec_iso({"halation": 0.0, "halation_recovery": 1.0, "micro_blur": 0.3}, rec_plate)
+        - rec_iso({"halation": 0.0, "micro_blur": 0.3}, rec_plate)
+    ).max())
+    check("inert with halation off", d == 0.0, f"max delta {d:.2e}")
+
+    check(
+        "costs no tile overlap",
+        eng.pad_for(P.sanitize({**rec_hal, "halation_recovery": 1.0}), 1.0)
+        == eng.pad_for(P.sanitize(rec_hal), 1.0),
+        f"pad_for unchanged at {eng.pad_for(P.sanitize(rec_hal), 1.0)}px",
+    )
+
+    a = eng.render_image(
+        rec_plate, P.sanitize({**rec_hal, "halation_recovery": 1.0}), 1.0,
+        tile=4096, supersample=1,
+    )
+    b = eng.render_image(
+        rec_plate, P.sanitize({**rec_hal, "halation_recovery": 1.0}), 1.0,
+        tile=64, supersample=1,
+    )
+    d = float(np.abs(a - b).max())
+    check("tile independence with recovery on", d < 2e-3, f"max delta {d:.2e}")
+
     # -- 5f. output sharpening cranks existing grain, invents none -----------
     # The stage is an unsharp mask placed last precisely so the detail it
     # amplifies is the grain. Two things have to hold: with grain on it must
@@ -2499,6 +2728,60 @@ def main() -> int:
     check("chunk CRCs", ok_crc, "all valid")
     check("bit depth", depth == 16 and ctype == 2, f"depth={depth} colourtype={ctype}")
     check("precision", d < 5e-5, f"roundtrip {d:.2e} (8-bit floor would be 2e-3)")
+
+    print("\nupscale (blow a render up to the source's own dimensions)")
+    # A small gradient plate rather than noise -- noise has no structure for a
+    # round trip to preserve, and a gradient can show an axis swap or an
+    # off-by-one a shape-only check would miss.
+    gy2, gx2 = np.mgrid[0:60, 0:90].astype(np.float32)
+    small_plate = np.stack(
+        [gx2 / 89.0, gy2 / 59.0, (gx2 + gy2) / 148.0], -1
+    ).astype(np.float32)
+    small_plate = np.ascontiguousarray(small_plate)
+
+    up_same = iio.upscale(small_plate, 60, 90)
+    check(
+        "a no-op at the target size returns the same array",
+        up_same is small_plate, "identity, not merely equal",
+    )
+
+    big = iio.upscale(small_plate, 240, 360)
+    check(
+        "upscale hits the exact requested size",
+        big.shape == (240, 360, 3), f"got {big.shape}",
+    )
+    check(
+        "upscale stays inside 0..1",
+        float(big.min()) >= 0.0 and float(big.max()) <= 1.0,
+        f"range {float(big.min()):.3f}..{float(big.max()):.3f} "
+        "(bicubic can ring past the source's own range without the clamp)",
+    )
+
+    # Matches a direct call with the same arguments -- pins the choice of
+    # bicubic/no-antialias/align_corners=False against a silent drift in any
+    # one of them, since a symmetric gradient could pass a looser check with
+    # any of the three wrong.
+    import torch.nn.functional as _F  # noqa: E402
+    t = torch.from_numpy(small_plate).permute(2, 0, 1).unsqueeze(0)
+    ref = _F.interpolate(t, size=(240, 360), mode="bicubic", align_corners=False)
+    ref = ref.clamp(0.0, 1.0).squeeze(0).permute(1, 2, 0).numpy()
+    d = float(np.abs(big - ref).max())
+    check(
+        "upscale matches a direct bicubic call", d < 1e-6,
+        f"max delta {d:.2e}",
+    )
+
+    # A downscale/upscale round trip cannot recover detail, but on a smooth
+    # gradient with no fine structure it should land close to the original --
+    # a coarse sanity check that nothing is transposed, flipped or scaled
+    # wrong, not a claim about image quality.
+    down = iio.downscale(small_plate, 0.5)
+    back_up = iio.upscale(down, 60, 90)
+    d = float(np.abs(back_up - small_plate).max())
+    check(
+        "a downscale/upscale round trip approximates a smooth plate",
+        d < 0.05, f"max delta {d:.2e}",
+    )
 
     print()
     if FAILURES:

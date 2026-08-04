@@ -172,7 +172,7 @@ export async function fetchSource(
 
 export interface ExportJob {
   id: string;
-  status: "queued" | "rendering" | "encoding" | "done" | "error";
+  status: "queued" | "rendering" | "upscaling" | "encoding" | "done" | "error";
   progress: number;
   filename: string;
   width: number;
@@ -181,11 +181,19 @@ export interface ExportJob {
   error?: string;
 }
 
-/** Which render the export writes. `"full"` is the source at 1:1; `"preview"`
- *  is the working proxy — the same render a slider change produces, so the
- *  grain sits on the proxy's pixel grid rather than being a downscale of the
- *  full-resolution one. They are different looks, not different sizes. */
-export type ExportScale = "full" | "preview";
+/** Which render the export writes.
+ *
+ *  - `"full"` is the source at 1:1.
+ *  - `"preview"` is the working proxy — the same render a slider change
+ *    produces, so the grain sits on the proxy's pixel grid rather than being
+ *    a downscale of the full-resolution one. A different look, not just a
+ *    different size.
+ *  - `"preview_full"` is that same proxy render, then blown back up to the
+ *    source's full pixel dimensions. It guarantees a pixel match to what is
+ *    on screen (just enlarged) — a fresh full-resolution render cannot,
+ *    because grain resolves on a different, finer grid at full scale. Adds
+ *    no detail; it is the proxy's look, magnified. */
+export type ExportScale = "full" | "preview" | "preview_full";
 
 export async function startExport(body: {
   id: string;

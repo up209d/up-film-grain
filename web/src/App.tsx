@@ -161,6 +161,14 @@ export default function App() {
   const [referenceMp, setReferenceMp] = useState<number | null>(null);
   const [scaleToRef, setScaleToRef] = useState(true);
 
+  /** Reroll `seed` and `texture_seed` whenever a photo is opened, so different
+   *  photos do not render with the identical grain and damage pattern -- both
+   *  are deterministic by design (that is what makes them re-orderable at
+   *  all), so left alone they are the *same* deterministic pattern on every
+   *  photo. On by default: a repeated seed is the surprising outcome, not the
+   *  wanted one. */
+  const [randomizeSeedOnOpen, setRandomizeSeedOnOpen] = useState(true);
+
   /** Available LUTs, and which one is selected. The selection is its own state
    *  rather than a value in `values` because it is a name, not a number — see
    *  LUT_ANCHOR_KEY. It travels with the values everywhere they go: into a
@@ -377,6 +385,7 @@ export default function App() {
       setRenderMs(0);
       setMeta(m);
       setJob(null);
+      if (randomizeSeedOnOpen) randomizeSeeds();
     } catch (e: any) {
       setError(String(e.message ?? e));
     }
@@ -486,6 +495,50 @@ export default function App() {
     setValues(next);
     setApplied(next);
     liveFor(k);
+  };
+
+  /** Reroll the grain and texture seeds for a freshly opened photo.
+   *
+   *  Deliberately *not* two `setValueNow` calls: each one independently reads
+   *  `valuesRef.current` and hands a whole replacement object to `setValues`,
+   *  so the second call's object is built without the first call's edit in it
+   *  and silently drops it -- the same stale-snapshot trap `setValueNow`'s own
+   *  comment documents for `commit()`. Both seeds are folded into one object
+   *  here instead.
+   *
+   *  And deliberately *not* `setValueNow` at all for a muted group: that
+   *  un-mutes on the reasoning that a real edit means "I want this section
+   *  live now," which does not hold for a reroll nobody asked for by name --
+   *  opening a photo silently switching a muted section back on would be a
+   *  far bigger surprise than a repeated seed. A muted group's kept snapshot
+   *  is updated in place instead, so the new seed is there and rendering the
+   *  moment the section is switched on by hand, same as any other value a
+   *  mute round trip is expected to preserve. */
+  const randomizeSeeds = () => {
+    const seedVal = Math.floor(Math.random() * 10000);
+    const textureVal = Math.floor(Math.random() * 10000);
+    const rolls: [string, string, number][] = [
+      ["seed", "Grain Structure", seedVal],
+      ["texture_seed", "Film Texture", textureVal],
+    ];
+
+    const liveNext: Values = {};
+    let mutedNext: Record<string, Values> | null = null;
+    for (const [key, group, val] of rolls) {
+      if (muted[group]) {
+        const base: Record<string, Values> = mutedNext ?? muted;
+        mutedNext = { ...base, [group]: { ...base[group], [key]: val } };
+      } else {
+        liveNext[key] = val;
+      }
+    }
+
+    if (mutedNext) setMuted(mutedNext);
+    if (Object.keys(liveNext).length) {
+      const next = { ...valuesRef.current, ...liveNext };
+      setValues(next);
+      setApplied(next);
+    }
   };
 
   /** One parameter's control, generated from the schema.
@@ -857,7 +910,7 @@ export default function App() {
             if (f) onFile(f);
           }}
         >
-          Open image
+          Open image (drop here)
           <input
             type="file"
             accept="image/jpeg,image/png"
@@ -871,6 +924,22 @@ export default function App() {
               if (f) onFile(f);
             }}
           />
+        </label>
+        <label
+          className="checkfield"
+          title={
+            "Reroll the grain Seed and Texture Seed whenever a photo is " +
+            "opened, so different photos don't render with the identical " +
+            "grain and damage pattern. Off keeps whatever seeds are " +
+            "currently dialled in."
+          }
+        >
+          <input
+            type="checkbox"
+            checked={randomizeSeedOnOpen}
+            onChange={(e) => setRandomizeSeedOnOpen(e.target.checked)}
+          />
+          With random seed
         </label>
         {meta && (
           <span className="meta">
@@ -1161,6 +1230,10 @@ export default function App() {
                 As previewed
                 {meta ? ` — ${meta.proxy_width}×${meta.proxy_height}` : ""}
               </option>
+              <option value="preview_full">
+                As previewed, full size
+                {meta ? ` — ${meta.width}×${meta.height}` : ""}
+              </option>
             </select>
             <select value={format} onChange={(e) => setFormat(e.target.value)}>
               <option value="jpeg">JPEG 95</option>
@@ -1173,14 +1246,18 @@ export default function App() {
             onClick={doExport}
             disabled={!meta}
           >
-            {exportScale === "preview" ? "Export as previewed" : "Export full size"}
+            {exportScale === "preview"
+              ? "Export as previewed"
+              : exportScale === "preview_full"
+              ? "Export as previewed, full size"
+              : "Export full size"}
           </button>
           {exportScale === "preview" && (
             <p className="hint">
               {meta && meta.proxy_width >= meta.width ? (
                 <>
-                  This photo is already smaller than the proxy, so both options
-                  render the same pixels.
+                  This photo is already smaller than the proxy, so every option
+                  renders the same pixels.
                 </>
               ) : (
                 <>
@@ -1189,6 +1266,26 @@ export default function App() {
                   frame, so at full size the same settings resolve finer, denser
                   grain; if the preview is the look you want, this is the file
                   that has it.
+                </>
+              )}
+            </p>
+          )}
+          {exportScale === "preview_full" && (
+            <p className="hint">
+              {meta && meta.proxy_width >= meta.width ? (
+                <>
+                  This photo is already smaller than the proxy, so every option
+                  renders the same pixels.
+                </>
+              ) : (
+                <>
+                  The proxy render above, enlarged to {meta?.width}×{meta?.height}
+                  — a pixel match to what is on screen, not a fresh full-resolution
+                  render. It adds no detail: zoomed in, the grain is the same
+                  softer proxy texture, just bigger, not the finer grain "Full
+                  size" would resolve at this scale. Reach for this when the
+                  preview's look is what you want to keep, in a file sized for
+                  printing or sharing at full size.
                 </>
               )}
             </p>

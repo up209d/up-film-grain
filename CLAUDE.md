@@ -17,10 +17,12 @@ Working and verified end to end as of 2026-07-31.
 edge noising, grain, halation, chromatic edge fringing.
 
 **In scope as of 2026-08-04:** a `Colour Grading` section at the very top of the
-pipeline — 3D LUTs plus temperature, shadows, highlights and a two-way clarity.
-Requested outright, so the "colour grading is deferred" note below no longer
-covers this one section. Everything in it still ships at 0, so the colour
-pass-through holds with nothing selected. See its own section further down.
+pipeline — 3D LUTs plus temperature, tint, exposure, shadows, highlights,
+contrast, black point, a two-way clarity, vibrance and saturation. Requested
+outright, so the "colour grading is deferred" note below no longer covers this
+one section. Everything in it still ships at 0, so the colour pass-through
+holds with nothing selected. See its own section further down (the six added
+after the first pass are in their own dated subsection).
 
 **Deferred — the user has a separate project planned:** colour grading
 *elsewhere in the pipeline*. `vibrance` and `brightness` were added on request
@@ -107,7 +109,7 @@ validity, the global-grain overlay with its smoothing, its chroma and its
 independently-sized-clump construction, anti-aliasing, the pre-blur, edge
 softening, edge jitter and its direction bias, edge sanding, scatter, output
 sharpening, the master opacity cross-fade, the colour-grading section with its
-3D LUT lookup and `.cube` parsing, and the film-texture section — 205
+3D LUT lookup and `.cube` parsing, and the film-texture section — 227
 checks. It exits non-zero on failure.
 
 Seventeen of those are the 2026-08-04 performance work, and they are a different
@@ -231,6 +233,67 @@ own resolution the proxy is soft, and a soft preview reads as a soft *result*.
 The stage shows a `proxy` badge whenever `eff > proxy_width / source_width`, and
 the panel says to Render 1:1 before judging grain. Do not remove those.
 
+### A third export tier: the preview's look, at the source's own size (2026-08-05)
+
+Requested: an export that guarantees a pixel match to the on-screen preview
+(just enlarged), for people who want *that specific look* -- the proxy's
+softer, coarser grain -- as a full-size file, rather than the finer grain a
+fresh full-resolution render would resolve at the same settings. Before
+building it, the two readings of "export what I'm looking at, at full
+resolution" were put to the user explicitly, because they are genuinely
+different features with different costs:
+
+* **Re-render at full resolution with the current settings.** This is what
+  `"full"` already is and always was -- it always uses whatever is currently
+  dialled in, it just does not pixel-match the proxy, because grain is
+  resolved on a finer grid at 1.0 scale. Free: no new code.
+* **Upscale the exact proxy image.** Guarantees the pixel match, at the cost
+  of adding no real detail -- zoomed in, the file shows the same soft texture
+  as the proxy, just enlarged.
+
+The user chose the second, so `scale: "preview_full"` is a new third value
+alongside `"full"`/`"preview"` on `/api/export`. It renders through the
+*identical* `_render_tier(up, p, ss, False, ...)` call `"preview"` already
+uses -- the same one-call-site discipline that keeps `"preview"` byte-for-byte
+the live preview -- and then a new `imageio.upscale(out, up.h, up.w, DEVICE)`
+blows the result up to the source's own dimensions with a plain bicubic
+resize.
+
+**`upscale` is deliberately not `downscale` run backwards.** `downscale` passes
+`antialias=True` because it is throwing samples away and aliasing is a real
+risk; `upscale` omits it, because there is nothing to alias against when
+*adding* samples -- the same plain bicubic `render_supersampled` already uses
+for its own upsample step, not `downscale`'s antialiased one. It returns the
+input array itself, not a copy, when the requested size already matches (the
+common case once a source is no bigger than the proxy long edge, where
+`"preview"` and `"preview_full"` render bit-identical pixels already).
+
+Two things needed to stay honest once a third tier existed:
+
+* **The filename has to say which kind of "same size as full" this is.**
+  `"preview_full"` writes the source's own pixel dimensions, so *size* alone
+  can no longer tell it apart from `"full"` in a folder -- unlike `"preview"`,
+  where the resolution tag already did that job. So `"preview_full"` tags the
+  filename `_grain_previewlook` instead of a pixel count, and both the pixel
+  tag and the look tag are skipped together whenever the source was never
+  bigger than the proxy in the first place (`proxy_scale >= 0.999`), where
+  every mode renders the same file and tagging one as different would be a
+  lie -- the same reasoning `"preview"`'s tag already followed, now shared by
+  a `downscaled` flag rather than checked inline twice.
+* **The UI has to say this file has no more detail than the preview.** The
+  hint text under the new option says so outright ("adds no detail... not a
+  fresh full-resolution render"), the same way the existing `"preview"` hint
+  already warns that full-size settings resolve finer grain than the proxy
+  shows -- this is that same honesty problem from the other direction.
+
+Verified end to end against a running server rather than by inspection alone:
+uploaded a source above the proxy threshold, requested `"preview_full"`, and
+confirmed the downloaded file's pixel dimensions equal the source's exactly
+and the filename carries `_grain_previewlook`; then repeated all three scales
+against a source *below* the threshold and confirmed all three collapse to
+the plain `_grain` tag and an identical byte size, matching the existing
+"both options render the same pixels" case extended to three.
+
 ## Pipeline order matters at both ends
 
 Six stages are placed by *position*, not by what they compute, and moving them
@@ -241,8 +304,8 @@ breaks their whole purpose:
   photograph *is* before any of that runs. Put it after the film stages and it
   grades grain, halation and dust along with the picture, and a LUT built to be
   fed a photograph is fed a rendered negative instead. Within the block the LUT
-  is last, after the four adjustments, because the adjustments exist to hand the
-  LUT the picture it was meant to read.
+  is last, after the ten adjustments ahead of it, because the adjustments exist
+  to hand the LUT the picture it was meant to read.
 * `pre_blur` (step 0) is before `lum_ref` is taken, which is the only thing
   separating it from `micro_blur` — same kernel, same linear light. See the
   section below.
@@ -432,6 +495,66 @@ maximum settings.
 Gated on `halation > 0.01`. With no wash there is nothing to compensate and the
 control would just be a blue grade, which is deferred — `verify.py` pins it at
 0.00e+00.
+
+## Halation highlight recovery: holding the bloom back near white (added 2026-08-05)
+
+Reported: halation "burns" highlights a lot. Real, and structural rather than a
+tuning problem — the glow is added in *linear* light with no upper clamp until
+display space (`_linear_to_srgb` at engine.py only does `clamp_min(0.0)`, no
+ceiling), and the first actual `.clamp(0, 1)` comes well after, in display
+space, after brightness, the characteristic curve, highlight desaturation,
+vibrance and the warm/cool cast have all had a chance to run on the
+still-unclamped value. So a highlight already close to white gets pushed the
+rest of the way to a flat, textureless clip rather than rolling off — the
+bloom does not know the receiving pixel had almost no headroom left.
+
+`halation_recovery` (0–1, ships at 0) holds the glow back in proportion to how
+little headroom the *receiving* pixel already has. It reuses `hi` — the exact
+per-pixel field `glow = _blur(hi, ...)` is already built from, "how far this
+pixel sits above `halation_threshold`, normalised 0..1" — rather than computing
+anything new:
+
+```python
+recover = p["halation_recovery"]
+if recover > 0.001:
+    glow = glow * (1.0 - recover * hi)
+```
+
+Three things worth being precise about:
+
+* **It is `hi`, not `glow`, that gates the attenuation — deliberately the
+  *unblurred*, per-receiving-pixel field.** `glow` has already been spread by
+  the blur, so at any output pixel it can carry bloom that bled in from a
+  neighbouring hot spot even where that pixel's own `hi` is low. Gating on the
+  receiving pixel's own `hi` means recovery protects headroom *at the pixel*,
+  regardless of where the light coming in originated — which is the right
+  question to ask, because a burned highlight is burned because of what is
+  left at that pixel, not because of where the bloom came from.
+* **It composes as a plain multiply on `glow`, before the tint and the master
+  amount.** `lin = lin + glow * tint * (hal * 0.9)` is unchanged in shape;
+  recovery only scales the one field both of those already multiply, so it
+  needs no copy of either and cannot fight them.
+* **The boundary condition is exact, not tuned.** At `hi = 0` (a pixel right at
+  `halation_threshold`, not yet blooming at all) the attenuation is `1.0` —
+  untouched — and at `hi = 1` (a pixel already at the very top of the range)
+  it is `1.0 - recover`, so `recover = 1.0` suppresses the incoming glow there
+  entirely. Nothing in between is a guess: `verify.py` checks it as an
+  equality on a flat, uniformly-lit plate (measured attenuation 0.856 against
+  an analytically expected 0.851 at `recover = 1.0`), not a "looks less
+  burned" judgement.
+
+Measured on a highlight gradient run through the same isolated harness as the
+other halation checks: the fraction of pixels driven to a flat clip (≥0.999)
+at `halation 0.9` / `halation_threshold 0.6` runs **21.7% → 15.8% → 3.5%** at
+recovery 0 / 0.5 / 1.0 — a large, monotonic reduction in exactly the failure
+mode reported.
+
+No new geometry, so nothing new to reserve: it is a plain per-pixel multiply
+on a field that already exists, same reasoning as blue compensation just above
+it (`pad_for` pinned unchanged), and `halation_recovery` is in `NEUTRAL_ZERO`
+alongside `halation`/`halation_blue` for the same reason both of those are —
+it is a modifier of a stage that is itself gated off at 0, so "Original" has
+to be able to zero it along with the rest.
 
 ## Scatter: diffusion without the average (added 2026-08-01)
 
@@ -1166,6 +1289,142 @@ variance here is ±1s on larger frames, so single-shot numbers are worthless):
   first. The pair is split into a pure half and a side-effecting half because a
   `setMuted` call inside a `setValues` updater would run twice under StrictMode.
 
+## Colour Grading grew six more sliders, all still before the LUT (added 2026-08-04)
+
+Requested: Tint after Temperature, Exposure above Shadows, Contrast, Black
+Point above Clarity, and Vibrance/Saturation after Clarity Radius — six new
+`grade_*` parameters, all "quick" per-pixel adjustments with no kernel, all
+still ahead of the LUT. Panel order and pipeline order both now read:
+Temperature, Tint, Exposure, Shadows, Highlights, Contrast, Black Point,
+Clarity, Clarity Radius, Vibrance, Saturation, LUT Mix — the same "panel order
+matches pipeline order" rule the section has followed since it was added.
+Every one ships at 0.
+
+**None of the six duplicate an existing parameter, even where the name does.**
+Tone Response already has a `contrast` and a `vibrance` — deferred, ships at 0,
+must not be touched per this file's own standing instruction. The new
+`grade_contrast` and `grade_vibrance` are separate keys with separate formulas,
+because the two sections cannot share a slider: grading the picture and
+grading the negative are different jobs done at different points in the
+pipeline, and folding them together would mean the deferred section could never
+be switched on later without re-touching a grade that was already finished.
+Same reasoning as `grade_exposure` existing alongside Tone Response's
+`brightness` — one physically identical formula (a stops multiply in linear
+light), two independent parameters, because one section is deferred and the
+other is not.
+
+### Tint is Temperature's other axis, and needed its own gain constant
+
+Temperature's gain (`_GRADE_TEMP_GAIN`, 0.40) applies to red and blue in
+opposite directions with green untouched, then normalises the whole vector
+against the luma weights so warming a frame does not also expose it. Tint is
+the same construction on the other white-balance axis — green against
+magenta — and the first version reused 0.40 outright on the reasoning that a
+change of illuminant is one physical adjustment resolved along two axes, so
+there was no reason for one axis to reach further than the other.
+
+That reasoning does not survive contact with the luma weights. Green carries
+0.7152 of them against red's 0.2126 and blue's 0.0722, so pushing green by the
+same amount temperature pushes red/blue costs far more level: measured on the
+same asymmetric plate the "temperature holds the level" check uses, 0.40 on
+tint drifted luma **−2.3%** against temperature's own **−1.8%** at its 0.40 —
+outside the 2% tolerance the existing check already holds temperature to.
+Tried a doubled-green formula first (`gain = [1+g+t, 1-2t, 1-g+t]`, balancing
+the raw pre-normalisation sum to zero) and it was worse, not better — doubling
+green's coefficient means the luma-weighted normaliser has to divide by a much
+smaller number, which amplifies red and blue far more on a non-grey pixel than
+the single-coefficient form does. Measured at the same 0.40, the doubled
+version drifted **−9.9%**. `_GRADE_TINT_GAIN` is **0.30** with the
+single-coefficient formula (`gain = [1+g, 1-g, 1+g]`), which brings the worst
+case to −1.4% — inside the same envelope Temperature's own check uses,
+verified on the same plate rather than assumed from the arithmetic.
+
+Applied in the *same* linear-light round trip as Temperature rather than a
+second one: both axes are one physical operation (a change of illuminant), so
+`abs(temp) > 0.001 or abs(tint) > 0.001` gates a single
+`_srgb_to_linear`/`_linear_to_srgb` pair with both gain vectors summed before
+the one normalisation, instead of paying the transfer cost twice for what the
+white balance actually is.
+
+### Exposure runs before every luma-keyed mask in the section
+
+Same formula as Tone Response's `brightness` — `2.0 ** ev` multiplied in
+linear light, so the sRGB encoding rolls the highlights off on the way back
+instead of a display-referred stretch clipping them flat — but a separate
+parameter and a separate stage, positioned directly ahead of Shadows. Every
+mask after it in `_grade` (Shadows, Highlights, Clarity, Vibrance, Saturation)
+measures `_luma(img)` on whatever `img` currently is, so raising exposure first
+means all of them read the frame at the light level actually being graded.
+Putting it anywhere later would mean, for instance, Shadows deciding what
+counts as shadow from a frame that is about to get brighter or darker
+underneath it. `verify.py` checks this one for an *exact* match against a
+direct linear 2× multiply (2.4e-07) rather than a mean brightness change, since
+a mean-only check cannot tell "did the right operation run" from "did some
+operation that also brightens the image run".
+
+### Contrast and Black Point are the clip-allowed pair Shadows/Highlights are not
+
+Both new, both deliberately *not* clip-free — that is the division of labour
+Shadows/Highlights already established: those two exist so a grade can move
+tonally without any risk of crossing 0 or 1, and Contrast/Black Point exist for
+when clipping is exactly what is wanted.
+
+* **Contrast** pivots about the same `_MID_GREY` (0.46) the deferred film
+  characteristic curve uses, but two-way and applied directly rather than
+  through a toe and shoulder — `x' = MID_GREY + (x - MID_GREY) * gain`, gain
+  `= 1 + _GRADE_CONTRAST_GAIN * contrast`, floored at 0. The floor is what
+  stops a strongly negative setting from crossing zero and inverting the
+  picture through grey; at −1 the gain is exactly 0.1, verified by pinning a
+  flat mid-grey field at bit-exact invariance (2.98e-08) and a ramp's standard
+  deviation at exactly 0.1× (measured 0.100×, not merely "close"). Deliberately
+  smaller than the film curve's own 1.1 (`_GRADE_CONTRAST_GAIN` is 0.9,
+  gain range 0.1–1.9): this control has no shoulder to catch what it steepens,
+  so +1 already clips a ramp's extremes rather than rolling them off, and a
+  gentler reach keeps that from happening immediately at the top of the
+  slider.
+* **Black Point** is the blunt Levels-style remap most photo tools mean by the
+  name: `x' = clamp((x - bp) / (1 - bp), 0, 1)`. Every value at or below `bp`
+  is driven to exactly 0 and 1 stays exactly at 1 — genuinely crushing shadow
+  detail rather than easing it, which is the point of a black point control and
+  the reason it is one-directional (range 0.0–0.3, not the two-way ±1 every
+  other new slider here gets): there is nothing below 0 to lift from, and a
+  floor lift is what Shadows or the deferred Base Fog are for. `verify.py`
+  checks the clip is exact (max at or below the chosen level is 0.00e+00) and
+  that white and monotonicity both hold above it.
+
+### Vibrance and Saturation: the same weighting Tone Response has, and the blunt version it deliberately does not
+
+`grade_vibrance` is bit-for-bit the same construction as Tone Response's own
+`vibrance` — saturation measured as chroma-over-value (the HSV definition),
+gain `= 1 + vib * (1 - sat)` clamped at zero — moved earlier in the pipeline
+and given its own key for the reason above (the two sections must stay
+independent). `verify.py` runs the identical saturation-ladder check against
+the new key and gets the identical property: gain falls monotonically as
+starting saturation rises (59% → 38% → 22% → 11% → 2% at vibrance 0.8 across
+five saturation levels — the same ladder Tone Response's own check measures).
+
+`grade_saturation` is new in a stronger sense: there was no flat, unweighted
+saturation control anywhere in the engine before this (confirmed by grep — the
+only chroma-about-luma-axis scale in the codebase was vibrance's own weighted
+one). `gain = max(0, 1 + sat)`, applied as `lum + (img - lum) * gain` — every
+pixel gains or loses the same proportion regardless of how saturated it
+already is, which is the classic blunt control and will push a vivid area out
+of gamut before a muted one catches up, in contrast to Vibrance immediately
+above it. Checked as an *exact* claim rather than a ratio: because every
+channel's offset from luma scales by precisely `gain`, chroma (`max − min`)
+must scale by exactly 2× at `sat = 1` — measured 1.79e-07 off — and `sat = -1`
+must be exactly monochrome — measured 0.00e+00. A saturation-ratio check
+cannot make this claim as tightly, because the ratio's own denominator (the
+max channel) shifts at the same time.
+
+### Cost: still nothing in `pad_for`
+
+All six are per-pixel with no kernel and no neighbourhood, same as every stage
+in this section but Clarity — `pad_for`'s `grade_clarity_radius` term is
+unchanged, and `verify.py` pins it explicitly with all six new sliders on at
+once alongside Clarity. `_grade`'s own docstring is updated to stop citing
+"four of the five stages" now that there are eleven.
+
 ## Film texture is drawn, never scattered (added 2026-07-31)
 
 Step 15, dead last, after sharpening: dust, scratches, hair, light leaks.
@@ -1655,8 +1914,10 @@ enabled in one render, and loading a preset file from disk does the same.
 |---|---|---|
 | `EDGE_REF` | 0.06 | Fixed edge-magnitude reference. Must stay a constant, not a statistic — see invariant 1. |
 | `_GRADE_TEMP_GAIN` | 0.40 | Peak channel gain for Temperature at ±1: red and blue move this far in opposite directions, green is left alone, and the vector is then normalised against the luma weights so the control cannot also expose the frame. |
+| `_GRADE_TINT_GAIN` | 0.30 | Same job, on Tint's green/magenta axis. **Smaller than Temperature's on purpose** — green carries 0.7152 of the luma weight against red's 0.2126 and blue's 0.0722, so the same magnitude costs more level. Reusing 0.40 measured a 2.3% luma drift against Temperature's own 1.8%; 0.30 brings it to 1.4%, the same envelope. |
 | `_GRADE_TONE_KNEE` | 0.5 | Where the Shadows and Highlights ramps meet. Both are quintic over half the range, so every pixel is in exactly one of them and a gradient shows no seam. Not exposed — a knee and a falloff per end would be four more sliders in a section that is meant to stay cheap. |
 | `_GRADE_TONE_MAX` | 0.35 | How far a tone lift travels at ±1, as a share of its headroom. **Not 1.0**: that takes a black pixel to pure white at +1 and squeezes the useful range into the slider's first tenth. Measured on a real photo, Shadows +0.5 took the mean from 0.19 to 0.53 at 1.0. |
+| `_GRADE_CONTRAST_GAIN` | 0.9 | Gain on the two-way Contrast pivot at ±1, floored at 0 so it cannot invert through grey — at −1 the gain is exactly 0.1. Smaller than the deferred film curve's 1.1: this control has no shoulder to catch what it steepens, so a gentler reach delays clipping at the top of the slider. |
 | `_GRADE_CLARITY_GAIN` | 1.6 | Gain on the *positive* side of Clarity only. The negative side is pinned at exactly 1.0 and must stay there: at gain 1, −1 removes precisely 100% of the band, and past that it inverts local contrast rather than flattening further. |
 | `_GNORM` | 0.55 | Noise normaliser. **The old note here claimed field std ~0.27 clipping ~3.6%; re-measured 2026-07-31 it is std ~0.45 clipping ~18%**, constant across octave counts now that `_fbm` preserves variance. The 18% is pre-existing — a single-octave field measures the same — so this row was simply wrong, not broken by a change. Lowering it flattens the distribution's tails further. |
 | `_AMP_SCALE` | 0.38 | Maps the 0–100 intensity slider to amplitude; default 32 lands near 3.5% luminance sigma. Was 0.5 — recalibrated when `_fbm` started preserving variance, since the old value was silently compensating for a field running at 43% strength. |

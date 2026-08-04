@@ -46,6 +46,12 @@ body {
 }
 .spacer { flex: 1; }
 .meta { color: var(--dim); font-variant-numeric: tabular-nums; }
+.checkfield {
+  display: flex; align-items: center; gap: 6px;
+  color: var(--dim); font-size: 12.5px;
+  cursor: pointer; user-select: none;
+}
+.checkfield input { margin: 0; accent-color: var(--accent); cursor: pointer; }
 .status { color: var(--dim); font-variant-numeric: tabular-nums; min-width: 66px; text-align: right; display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
 .status.busy { color: var(--accent); }
 

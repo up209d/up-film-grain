@@ -1,11 +1,11 @@
 {
   "format": "film-grain-preset",
   "version": 1,
-  "name": "Stock",
+  "name": "Vintage",
   "reference_mp": 24,
-  "lut": "Fuji Classic Neg by Seim 1.1",
+  "lut": "UPVintage",
   "values": {
-    "grade_temp": 0,
+    "grade_temp": -0.35,
     "grade_tint": 0,
     "grade_exposure": 0,
     "grade_shadows": 0,
@@ -59,6 +59,7 @@
     "halation": 0.2,
     "halation_radius": 7.5,
     "halation_threshold": 0.3,
+    "halation_recovery": 0.75,
     "halation_hue": 0,
     "halation_blue": 2,
     "halation_blue_level": 0.75,
@@ -95,13 +96,13 @@
     "hair_length": 160,
     "hair_soften": 0.35,
     "light_leak": 3,
-    "leak_strength": 0.1,
-    "leak_size_min": 2000,
+    "leak_strength": 0.15,
+    "leak_size_min": 999,
     "leak_size_max": 3000,
     "leak_feather": 96,
     "leak_variation": 0.33,
     "leak_hue": 0.5,
-    "texture_seed": 2334,
+    "texture_seed": 3090,
     "master_opacity": 1
   }
 }

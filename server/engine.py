@@ -129,6 +129,14 @@ _SMOOTH_GAIN_K = 5.62
 # roughly 3200K/8000K feel without any setting driving a channel to a rail.
 _GRADE_TEMP_GAIN = 0.40
 #
+# Peak channel gain for Tint, the other white-balance axis: green against
+# magenta. Deliberately *smaller* than Temperature's -- green carries most of
+# the luma weight (0.7152 against red's 0.2126 and blue's 0.0722), so the same
+# magnitude on this axis costs more level. Measured on an asymmetric plate,
+# 0.40 drifts luma up to 2.3%, against Temperature's own 1.8% at its 0.40; 0.30
+# brings the worst case to 1.4%, in the same envelope as Temperature.
+_GRADE_TINT_GAIN = 0.30
+#
 # Where the shadow and highlight ramps meet. Both are quintic over half the
 # range, so every pixel is in exactly one of them and a smooth gradient shows
 # no seam between them. Not exposed: a knee plus a falloff per end would be four
@@ -154,6 +162,14 @@ _GRADE_TONE_MAX = 0.35
 # *inverts* -- dark halos on the light side of every edge. Positive has no such
 # limit, so it gets the headroom to be worth reaching for.
 _GRADE_CLARITY_GAIN = 1.6
+#
+# Gain on Contrast's pivot-about-middle-grey, at +/-1. Floored so the gain can
+# never reach 0 or go negative: at -1 it is 0.1, a tenth of the original
+# spread rather than a flattened or inverted picture. Deliberately smaller than
+# the film characteristic curve's own 1.1 -- this control has no shoulder to
+# catch what it steepens, so a gentler reach keeps the top of the slider from
+# clipping immediately.
+_GRADE_CONTRAST_GAIN = 0.9
 
 # Local mean-absolute-deviation thresholds, in luma units, separating "smooth"
 # from "textured" over a medium radius. Skin and clear sky sit near or below
@@ -1625,12 +1641,12 @@ class GrainEngine:
 
         Everything below this models an emulsion. This models the *decision*
         about what the photograph is before any of that runs -- which is why it
-        sits at the very top and why the LUT is last within it: the four
-        adjustments set the light and the tonal range, then the LUT reads the
-        picture it was meant to read.
+        sits at the very top and why the LUT is last within it: white balance,
+        exposure and the tonal adjustments set the light and the tonal range,
+        then the LUT reads the picture it was meant to read.
 
         Written to be cheap, which was the explicit ask, and there is only one
-        thing in here that is not free: four of the five stages are pure
+        thing in here that is not free: every stage but Clarity is pure
         per-pixel arithmetic with no kernel and no neighbourhood at all, so they
         cost a couple of passes over the frame and add nothing to ``pad_for``.
         Clarity is the exception -- it needs a blurred copy to find its band --
@@ -1639,40 +1655,64 @@ class GrainEngine:
 
         Tile independence comes for free everywhere except clarity, for the same
         reason: nothing here reads a statistic of the region. The LUT is a fixed
-        table, the temperature is a constant vector, and the tone masks are
-        thresholds on each pixel's own luma. Clarity's blur is a kernel like any
-        other and is paid for in ``pad_for``.
+        table, temperature/tint are constant vectors, exposure is a constant
+        multiply, and the tone, contrast, black-point, vibrance and saturation
+        stages are all thresholds or gains on each pixel's own luma. Clarity's
+        blur is a kernel like any other and is paid for in ``pad_for``.
         """
         temp = p["grade_temp"]
+        tint = p["grade_tint"]
+        ev = p["grade_exposure"]
         sh = p["grade_shadows"]
         hl = p["grade_highlights"]
+        ct = p["grade_contrast"]
+        bp = p["grade_black_point"]
         cl = p["grade_clarity"]
+        vib = p["grade_vibrance"]
+        sat = p["grade_saturation"]
         lut = p.get("lut")
         mix = p["lut_amount"]
 
-        # -1a. Temperature, in linear light.
+        # -1a. White balance: temperature (blue/amber) and tint (green/magenta),
+        #      in linear light.
         #
         #      A white balance is a change in the *illuminant*, so it multiplies
         #      light -- and gamma-encoded values are not light. Done encoded the
         #      same gain moves the shadows much further than the highlights,
-        #      which is what makes a naive temperature slider read as a tint
-        #      laid over the picture instead of a different lamp. Same argument
-        #      as `pre_blur`'s, and gated the same way so the transfer round
-        #      trip costs nothing when the stage is off.
+        #      which is what makes a naive slider read as a tint laid over the
+        #      picture instead of a different lamp. Same argument as
+        #      `pre_blur`'s, and gated the same way so the transfer round trip
+        #      costs nothing when both stages are off.
         #
-        #      The gain vector is normalised by its own luma so the control is
-        #      colour-only: warming a frame must not also expose it, or every
-        #      other tonal control in the app is being fought by this one.
-        if abs(temp) > 0.001:
-            g = _GRADE_TEMP_GAIN * temp
-            gain = [1.0 + g, 1.0, 1.0 - g]
+        #      One round trip for both axes, not two: a change of illuminant
+        #      moves along both at once, so temperature and tint are one
+        #      physical operation rather than two, and the combined gain vector
+        #      is normalised by its own luma exactly once so the control stays
+        #      colour-only -- warming or tinting a frame must not also expose
+        #      it, or every other tonal control in the app is being fought by
+        #      this one.
+        if abs(temp) > 0.001 or abs(tint) > 0.001:
+            gt = _GRADE_TEMP_GAIN * temp
+            gn = _GRADE_TINT_GAIN * tint
+            gain = [1.0 + gt + gn, 1.0 - gn, 1.0 - gt + gn]
             norm = sum(w * c for w, c in zip(_LUMA, gain))
             gain = torch.tensor(
                 [c / norm for c in gain], device=img.device, dtype=img.dtype,
             ).view(1, 3, 1, 1)
             img = _linear_to_srgb(_srgb_to_linear(img) * gain).clamp(0.0, 1.0)
 
-        # -1b/c. Shadows and highlights, display-referred.
+        # -1b. Exposure, in linear light, ahead of every luma-keyed mask below --
+        #      Shadows, Highlights, Clarity, Vibrance and Saturation all measure
+        #      *this* image, so raising exposure first means they read the frame
+        #      at the light level actually being graded rather than the one that
+        #      arrived. Same construction as Tone Response's Brightness: a
+        #      stops multiply that lets the sRGB encoding roll the highlights
+        #      off on the way back, instead of a display-referred stretch that
+        #      would clip them flat.
+        if abs(ev) > 0.001:
+            img = _linear_to_srgb(_srgb_to_linear(img) * (2.0 ** ev)).clamp(0.0, 1.0)
+
+        # -1c/d. Shadows and highlights, display-referred.
         #
         #        Both are a fraction of the headroom that is *actually there*:
         #        going up, a share of the distance to white; coming down, a
@@ -1696,7 +1736,31 @@ class GrainEngine:
                 m = _smootherstep(_GRADE_TONE_KNEE, 1.0, lum) * _GRADE_TONE_MAX
                 img = img + (hl * m) * ((1.0 - img) if hl > 0 else img)
 
-        # -1d. Clarity: two-way local contrast on one band.
+        # -1e. Contrast: a two-way pivot about the same middle grey the
+        #      (deferred) film characteristic curve uses, done directly rather
+        #      than through a toe and shoulder.
+        #
+        #      The gain is floored at 0 so no setting inverts the picture
+        #      through grey -- at -1 the spread is a tenth of the original
+        #      rather than crossing zero. Unlike the film curve, nothing here
+        #      asymptotes, so a strong positive setting clips outright: that is
+        #      what a quick contrast control is expected to do, and it runs
+        #      after Shadows/Highlights precisely so the clip-free version is
+        #      available first.
+        if abs(ct) > 0.001:
+            gain_ct = max(0.0, 1.0 + _GRADE_CONTRAST_GAIN * ct)
+            img = (_MID_GREY + (img - _MID_GREY) * gain_ct).clamp(0.0, 1.0)
+
+        # -1f. Black point: the blunt Levels-style remap, not a masked lift.
+        #
+        #      Every value at or below `bp` is driven to 0 and 1 stays exactly
+        #      at 1, so this genuinely crushes shadow detail rather than easing
+        #      it -- the opposite trade from Shadows above, and the reason both
+        #      exist. One-directional: there is nothing below 0 to lift from.
+        if bp > 0.001:
+            img = ((img - bp) / max(1.0 - bp, 1e-4)).clamp(0.0, 1.0)
+
+        # -1g. Clarity: two-way local contrast on one band.
         #
         #      The band is the luma's own high-pass at the chosen radius, added
         #      back to all three channels. Doing it on luminance rather than per
@@ -1720,7 +1784,32 @@ class GrainEngine:
             gain_c = cl * (_GRADE_CLARITY_GAIN if cl > 0 else 1.0)
             img = (img + gain_c * detail).clamp(0.0, 1.0)
 
-        # -1e. The 3D LUT, last in the section, on the graded frame.
+        # -1h. Vibrance: saturation weighted against how saturated a pixel
+        #      already is, so muted colour comes up while colour that is
+        #      already strong is left alone. Identical construction to Tone
+        #      Response's own Vibrance, kept as its own parameter because this
+        #      section runs before the film pipeline and the two must stay
+        #      independent -- see params.py for why sharing one slider would be
+        #      wrong. Saturation is chroma-over-value, the HSV definition, so a
+        #      deep, dark red still reads as fully saturated.
+        if abs(vib) > 0.001:
+            mx = img.amax(dim=1, keepdim=True)
+            mn = img.amin(dim=1, keepdim=True)
+            s_ = (mx - mn) / mx.clamp_min(1e-4)
+            lum_v = _luma(img)
+            gain_v = (1.0 + vib * (1.0 - s_)).clamp_min(0.0)
+            img = (lum_v + (img - lum_v) * gain_v).clamp(0.0, 1.0)
+
+        # -1i. Saturation: a flat multiply about the same luma axis, unweighted
+        #      by how saturated a pixel already is -- the blunt control
+        #      Vibrance is deliberately not. -1 lands exactly on the luma
+        #      (monochrome), +1 doubles chroma.
+        if abs(sat) > 0.001:
+            lum_s = _luma(img)
+            gain_s = max(0.0, 1.0 + sat)
+            img = (lum_s + (img - lum_s) * gain_s).clamp(0.0, 1.0)
+
+        # -1j. The 3D LUT, last in the section, on the graded frame.
         #
         #      Applied display-referred because that is the space a .cube is
         #      authored in -- its axes are code values, not light. Mixed as a
@@ -2120,6 +2209,30 @@ class GrainEngine:
             lum0 = _luma(lin)
             hi = ((lum0 - thr_lin) / max(1.0 - thr_lin, 0.02)).clamp(0.0, 1.0)
             glow = _blur(hi, max(1.0, p["halation_radius"] * scale))
+
+            # 2a0. Highlight recovery: hold the bloom back exactly where the
+            #      *receiving* pixel is already this close to the top of the
+            #      range, so a highlight that was already nearly blown does
+            #      not get pushed the rest of the way to a flat clip.
+            #
+            #      Reuses `hi` rather than computing anything new: it is
+            #      already "how far this pixel sits above the threshold,
+            #      0..1", the same per-pixel field the glow's own shape is
+            #      built from -- so a pixel right at the threshold (hi=0) is
+            #      untouched and a pixel already at the top of the range
+            #      (hi=1) has its incoming glow suppressed entirely,
+            #      regardless of whether that glow originated there or
+            #      bled in from a neighbouring hot spot after the blur. That
+            #      is the point: recovery protects what the *receiving*
+            #      pixel had left, not what the source of the bloom was.
+            #
+            #      Applied to `glow` itself, before the tint and the master
+            #      amount, so it composes with both rather than needing its
+            #      own copy of either. Purely per-pixel, so `pad_for` is
+            #      unaffected -- same reasoning as blue compensation below.
+            recover = p["halation_recovery"]
+            if recover > 0.001:
+                glow = glow * (1.0 - recover * hi)
 
             # 2a. Blue compensation, applied to the image the wash is about to
             #     land on rather than to the result.

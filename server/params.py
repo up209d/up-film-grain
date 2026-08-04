@@ -63,11 +63,12 @@ PARAMS: list[Param] = [
     # source before anything films it. Ships at 0, so the pipeline is still a
     # colour pass-through until something here is asked for.
     #
-    # Panel order matches pipeline order, the way Edge Destruction's does: the
-    # four adjustments first, then the LUT they feed. The LUT *file* is not a
-    # parameter -- see server/lut.py for why a name cannot be an index -- so it
-    # travels beside these values and the client renders its picker directly
-    # above `lut_amount`.
+    # Panel order matches pipeline order, the way Edge Destruction's does: white
+    # balance, exposure, the tonal range, contrast and black point, clarity,
+    # then vibrance and saturation, then the LUT they all feed. The LUT *file*
+    # is not a parameter -- see server/lut.py for why a name cannot be an index
+    # -- so it travels beside these values and the client renders its picker
+    # directly above `lut_amount`.
     Param(
         "grade_temp", "Temperature", "Colour Grading",
         -1.0, 1.0, 0.01, 0.0, "",
@@ -84,6 +85,39 @@ PARAMS: list[Param] = [
         "LUT below sees it; a LUT built for daylight has nothing sensible to do "
         "with a tungsten frame, and correcting afterwards fights the look. "
         "0 = off.",
+    ),
+    Param(
+        "grade_tint", "Tint", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "The other half of white balance: green against magenta, at right "
+        "angles to Temperature's blue/amber axis. Positive pushes toward "
+        "magenta (red and blue up, green down), negative toward green. Same "
+        "construction as Temperature and applied in the very same linear-light "
+        "round trip -- a change of illuminant is a shift on both axes at once, "
+        "so this and Temperature are one physical operation split across two "
+        "sliders rather than two separate operations paying for the transfer "
+        "twice.\n"
+        "\n"
+        "The gain is normalised against the luma weights the same way "
+        "Temperature's is, so tinting a frame does not also expose it. "
+        "0 = off.",
+    ),
+    Param(
+        "grade_exposure", "Exposure", "Colour Grading",
+        -2.0, 2.0, 0.01, 0.0, "EV",
+        "A stops-based exposure multiply in linear light, ahead of Shadows "
+        "and Highlights so their masks measure the frame at the light level "
+        "actually being graded rather than the one that arrived -- raise this "
+        "first and the two knees below still read the picture correctly. +1 "
+        "is twice the light, -1 is half, and the sRGB encoding on the way "
+        "back rolls the highlights off by itself rather than stretching them "
+        "into a flat clip.\n"
+        "\n"
+        "Same construction as Tone Response's own Brightness, and kept as a "
+        "separate control here rather than shared with it: that section is "
+        "deferred and ships at 0, and this one exists so the light can be set "
+        "before the film pipeline -- and the LUT below -- ever sees the "
+        "picture. 0 = off.",
     ),
     Param(
         "grade_shadows", "Shadows", "Colour Grading",
@@ -111,6 +145,37 @@ PARAMS: list[Param] = [
         "\n"
         "Gamut-safe and clip-free for the same reason Shadows is, and keyed on "
         "the same untouched luma. 0 = off.",
+    ),
+    Param(
+        "grade_contrast", "Contrast", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "Steepness of the tonal range about the same middle grey the "
+        "(deferred) film characteristic curve pivots on, but two-way and "
+        "applied directly here rather than through a toe and shoulder: "
+        "positive steepens, negative flattens toward the pivot. The gain is "
+        "floored at 0 so no setting can invert the picture through grey -- at "
+        "-1 the spread is reduced to a tenth of the original rather than "
+        "crossing zero.\n"
+        "\n"
+        "Unlike the film curve further down, nothing here rolls off "
+        "asymptotically, so a strong positive setting will clip highlights "
+        "and shadows outright -- that is what a quick contrast control is "
+        "expected to do, and Shadows/Highlights above exist for the clip-free "
+        "version. 0 = off.",
+    ),
+    Param(
+        "grade_black_point", "Black Point", "Colour Grading",
+        0.0, 0.3, 0.005, 0.0, "",
+        "Where the black clips. Unlike Shadows above, which is a broad, "
+        "clip-free lift, this is the blunt Levels-style remap: every value at "
+        "or below the chosen point is driven to 0 and 1 stays exactly at 1, "
+        "so it genuinely crushes shadow detail rather than easing it -- that "
+        "is the point of a black-point control. Deliberately one-directional: "
+        "there is nothing below 0 to lift from, and a floor lift belongs to "
+        "Shadows or to the (deferred) Base Fog instead.\n"
+        "\n"
+        "Reach for Shadows for a gentle, reversible lift and this for a hard, "
+        "printable black. 0 = off.",
     ),
     Param(
         "grade_clarity", "Clarity", "Colour Grading",
@@ -145,6 +210,34 @@ PARAMS: list[Param] = [
         "here that needs tile overlap, which is why Clarity is the only part of "
         "this section that costs anything measurable.",
         spatial=True,
+    ),
+    Param(
+        "grade_vibrance", "Vibrance", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "The same saturation-weighted-against-itself construction as Tone "
+        "Response's own Vibrance -- muted colour comes up, colour that is "
+        "already strong is left alone -- kept as its own control here because "
+        "this section runs before the film pipeline and the two have to stay "
+        "independent: grading the picture and grading the negative are "
+        "different jobs done at different points, and sharing one slider "
+        "between them would mean the (deferred) Tone Response section could "
+        "never be switched on later without re-touching a grade that was "
+        "already finished. Negative drains the muted colour and leaves the "
+        "vivid, which reads as bleached. 0 = off, and the pipeline stays a "
+        "colour pass-through.",
+    ),
+    Param(
+        "grade_saturation", "Saturation", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "A flat saturation scale about each pixel's own luma. Unlike "
+        "Vibrance, every pixel gains or loses the same proportion regardless "
+        "of how saturated it already is, which is the classic blunt "
+        "saturation control -- it will push an already-vivid area out of "
+        "gamut before a muted one has caught up. -1 is fully neutral "
+        "(equivalent to a monochrome conversion at this point in the "
+        "pipeline), +1 doubles the existing chroma. Reach for Vibrance "
+        "instead when skin and sky need to stay untouched while muted colour "
+        "comes up. 0 = off.",
     ),
     Param(
         "lut_amount", "LUT Mix", "Colour Grading",
@@ -476,6 +569,20 @@ PARAMS: list[Param] = [
         "halation_threshold", "Halation Threshold", "Halation",
         0.3, 1.0, 0.01, 0.72, "",
         "Luminance above which highlights start to bloom.",
+    ),
+    Param(
+        "halation_recovery", "Highlight Recovery", "Halation",
+        0.0, 1.0, 0.01, 0.0, "",
+        "Holds the bloom back exactly where a highlight is already close to "
+        "the top of the range, so a bright area that was nearly blown out "
+        "does not get pushed the rest of the way to a flat, textureless "
+        "clip -- restoring the detail that was already there instead of "
+        "burning it away. A highlight right at Halation Threshold is left "
+        "alone; one already at the very top of the range has its incoming "
+        "glow suppressed almost entirely, however close the source of the "
+        "bloom -- itself or a nearby hot spot. 0 = off, and the bloom burns "
+        "exactly as much as Halation and Halation Threshold alone say it "
+        "should.",
     ),
     Param(
         "halation_hue", "Halation Hue", "Halation",
@@ -1027,15 +1134,18 @@ NEUTRAL_ZERO: tuple[str, ...] = (
     # numbers the engine can be handed. Zeroing the mix switches the LUT off as
     # completely as unselecting it would, so the name can stay put and be there
     # again when the section is switched back on -- the same reasoning that
-    # keeps sizes, radii and seeds out of this list.
-    "grade_temp", "grade_shadows", "grade_highlights", "grade_clarity",
-    "lut_amount",
+    # keeps sizes, radii and seeds out of this list. `grade_clarity_radius` is
+    # a radius, not an amount, so it stays out for the same reason -- as does
+    # `grade_black_point`'s partner-in-spirit `base_fog` below.
+    "grade_temp", "grade_tint", "grade_exposure", "grade_shadows",
+    "grade_highlights", "grade_contrast", "grade_black_point", "grade_clarity",
+    "grade_vibrance", "grade_saturation", "lut_amount",
     "pre_blur", "pre_sharpen",
     "contrast", "toe", "shoulder", "highlight_desat", "brightness",
     "vibrance", "base_fog",
     "intensity",
     "edge_erosion", "acutance", "edge_soften", "edge_sand", "edge_jitter",
-    "halation", "halation_blue",
+    "halation", "halation_blue", "halation_recovery",
     "micro_blur", "scatter", "aa_strength",
     "warm_highlights", "cool_shadows",
     "global_intensity",

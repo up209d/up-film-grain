@@ -1,5 +1,7 @@
 # Film Grain Engine
 
+![Film grain sample](web/src/assets/film-grain-16x9.jpg)
+
 Organic film grain, edge destruction and halation for still photographs.
 Python/PyTorch image service behind a React UI. See `TOPIC.md` for the domain
 rules and pipeline design.

@@ -214,3 +214,28 @@ def downscale(arr: np.ndarray, scale: float, device=None) -> np.ndarray:
     out = F.interpolate(t, size=(nh, nw), mode="bicubic", antialias=True, align_corners=False)
     out = out.clamp(0.0, 1.0).squeeze(0).permute(1, 2, 0).cpu().numpy()
     return np.ascontiguousarray(out)
+
+
+def upscale(arr: np.ndarray, h: int, w: int, device=None) -> np.ndarray:
+    """Plain bicubic upsample to an exact target size, in float32.
+
+    Adds no detail -- it exists only to blow up an already-rendered image back
+    to a photo's full pixel dimensions, for "export what I am looking at, at
+    full size" rather than "re-render at full size". No `antialias`: that flag
+    exists to fight aliasing when *discarding* samples, and there is nothing to
+    discard going up. It is the same upsample `render_supersampled` already
+    does for supersampling, not `downscale`'s antialiased one run backwards.
+
+    A no-op, and returns the input array itself rather than a copy, when the
+    size already matches -- the common case once a source is no bigger than
+    the proxy long edge, where the caller must not pay for or introduce any
+    deviation from a plain pass-through.
+    """
+    if arr.shape[0] == h and arr.shape[1] == w:
+        return arr
+    t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+    if device is not None and device.type in ("cuda", "mps"):
+        t = t.to(device)
+    out = F.interpolate(t, size=(h, w), mode="bicubic", align_corners=False)
+    out = out.clamp(0.0, 1.0).squeeze(0).permute(1, 2, 0).cpu().numpy()
+    return np.ascontiguousarray(out)

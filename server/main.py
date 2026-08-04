@@ -339,7 +339,7 @@ def source(body: dict = Body(...)) -> Response:
 # ------------------------------------------------------------------ export --
 
 def _run_export(job_id: str, up: Upload, p: dict, fmt: str, ss: int,
-                quality: int, proxy: bool) -> None:
+                quality: int, mode: str) -> None:
     job = JOBS[job_id]
     try:
         def progress(f: float) -> None:
@@ -347,12 +347,21 @@ def _run_export(job_id: str, up: Upload, p: dict, fmt: str, ss: int,
 
         with _RENDER_LOCK:
             job["status"] = "rendering"
-            if proxy:
+            if mode in ("preview", "preview_full"):
                 # Byte-for-byte the live preview's render, guaranteed by going
                 # through the same function it does rather than by two call
                 # sites agreeing about their arguments. Anything different here
                 # and "export what I am looking at" stops being true.
                 out = _render_tier(up, p, ss, False, progress=progress)
+                if mode == "preview_full":
+                    # Blown up to the source's own pixel dimensions -- not a
+                    # fresh full-resolution render. This adds no detail; it
+                    # exists so "the look I am seeing" can leave as a
+                    # full-size file without silently becoming a different,
+                    # finer-grained picture the way a real full-res render
+                    # would. See imageio.upscale and CLAUDE.md.
+                    job["status"] = "upscaling"
+                    out = iio.upscale(out, up.h, up.w, DEVICE)
             else:
                 tile = ENGINE.tile_for(p, 1.0, up.h, up.w, ss)
                 out = ENGINE.render_image(
@@ -370,12 +379,14 @@ def _run_export(job_id: str, up: Upload, p: dict, fmt: str, ss: int,
         job["error"] = f"{type(e).__name__}: {e}"
 
 
+_EXPORT_SCALES = ("full", "preview", "preview_full")
+
+
 @app.post("/api/export")
 def export(body: dict = Body(...)) -> dict:
     """Render and encode a download.
 
-    ``scale`` picks which of the two renders is written, and they are the same
-    two the preview offers:
+    ``scale`` picks which of three renders is written:
 
       * ``"full"`` (default) -- the whole source at scale 1.0, the same pixels
         the Render 1:1 button shows.
@@ -384,6 +395,15 @@ def export(body: dict = Body(...)) -> dict:
         else, so this is not a downscale of the full render: the grain is
         resolved at the proxy's own pixel grid, which is exactly why it looks
         like the preview and the full render does not.
+      * ``"preview_full"`` -- the same proxy render as ``"preview"``, then
+        blown back up to the source's full pixel dimensions with a plain
+        bicubic upsample (``imageio.upscale``). Written for "export exactly
+        what I am looking at, but as a full-size file": it guarantees a pixel
+        match to the on-screen preview (just enlarged), which a fresh
+        full-resolution render cannot, because grain is resolved on a
+        different, finer grid at full scale -- see CLAUDE.md. It adds no
+        detail; it is the proxy's own look, magnified, not a substitute for
+        ``"full"``.
     """
     up = _get(body.get("id", ""))
     p = _params_for(up, body)
@@ -392,15 +412,32 @@ def export(body: dict = Body(...)) -> dict:
         raise HTTPException(400, f"Unknown format {fmt!r}.")
     ss = max(1, min(3, int(body.get("supersample", 2))))
     quality = max(60, min(100, int(body.get("quality", 95))))
-    proxy = str(body.get("scale", "full")).lower() == "preview"
+    mode = str(body.get("scale", "full")).lower()
+    if mode not in _EXPORT_SCALES:
+        raise HTTPException(400, f"Unknown scale {mode!r}.")
 
-    h, w = (up.proxy.shape[:2] if proxy else (up.h, up.w))
+    # "preview_full" writes the source's own dimensions -- it is the "preview"
+    # render upscaled to them, not the proxy's own (smaller) size.
+    h, w = (up.h, up.w) if mode != "preview" else up.proxy.shape[:2]
     job_id = uuid.uuid4().hex[:12]
     stem = Path(up.name).stem or "image"
-    # Preview-scale exports carry their long edge in the name. Two files from
-    # one photo that differ only in resolution are otherwise indistinguishable
-    # in a folder, and the smaller one is the surprising one.
-    tag = f"_grain_{max(w, h)}px" if proxy and up.proxy_scale < 0.999 else "_grain"
+    downscaled = up.proxy_scale < 0.999
+    if mode == "preview" and downscaled:
+        # Preview-scale exports carry their long edge in the name. Two files
+        # from one photo that differ only in resolution are otherwise
+        # indistinguishable in a folder, and the smaller one is the
+        # surprising one.
+        tag = f"_grain_{max(w, h)}px"
+    elif mode == "preview_full" and downscaled:
+        # Same pixel dimensions as "full", so the *size* cannot tell these
+        # two apart in a folder -- the look is what differs, so that is what
+        # the name says instead.
+        tag = "_grain_previewlook"
+    else:
+        # Either "full", or the source was never bigger than the proxy in the
+        # first place, in which case every mode renders the same pixels and
+        # tagging one as different from another would be a lie.
+        tag = "_grain"
     JOBS[job_id] = {
         "id": job_id, "status": "queued", "progress": 0.0,
         "filename": f"{stem}{tag}.{iio.FORMATS[fmt][1]}",
@@ -408,7 +445,7 @@ def export(body: dict = Body(...)) -> dict:
         "width": int(w), "height": int(h),
     }
     threading.Thread(
-        target=_run_export, args=(job_id, up, p, fmt, ss, quality, proxy),
+        target=_run_export, args=(job_id, up, p, fmt, ss, quality, mode),
         daemon=True,
     ).start()
     return {"job": job_id}
