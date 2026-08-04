@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -11,16 +12,21 @@ import {
   exportStatus,
   fetchSource,
   getHealth,
+  getLuts,
   getSchema,
   renderPreview,
   startExport,
   uploadImage,
+  uploadLut,
   type ExportJob,
   type ExportScale,
   type ImageMeta,
+  type LutInfo,
   type Schema,
   type ViewRequest,
 } from "./api";
+import filmGrain1x1 from "./assets/film-grain-1x1.jpg";
+import filmGrain16x9 from "./assets/film-grain-16x9.jpg";
 
 type Values = Record<string, number>;
 
@@ -84,7 +90,7 @@ const FIT_SNAP = 0.02;
  *  pane and there is no background left to darken, so an allowance that is
  *  merely close leaves the shadow visible at 18px and gone at 96px. */
 const FRAME_MAX = 96;
-const FRAME_DEFAULT = 18;
+const FRAME_DEFAULT = 30;
 const FRAME_SHADOW_BLUR = 24;
 const FRAME_SHADOW_DROP = 8;
 const FRAME_SHADOW_ROOM = FRAME_SHADOW_BLUR + FRAME_SHADOW_DROP;
@@ -100,6 +106,17 @@ const FIT_PADDING = 30;
  *  file self-describing -- loading deliberately does not require it, so a bare
  *  `{"intensity": 40}` typed by hand still works. */
 const PRESET_FORMAT = "film-grain-preset";
+
+/** Section the LUT picker is rendered into, immediately above its own Mix
+ *  slider.
+ *
+ *  The panel is generated from the schema and hand-adding a *slider* here would
+ *  be a bug — the schema is the single source of truth for parameters. A LUT is
+ *  not a parameter: it is a named resource, like a preset file, so it cannot be
+ *  a number in the schema and there is nothing for the generator to pick up. It
+ *  is placed by key rather than at the top or bottom of the section so the panel
+ *  reads in pipeline order: the four adjustments, then the LUT they feed. */
+const LUT_ANCHOR_KEY = "lut_amount";
 
 export default function App() {
   const [schema, setSchema] = useState<Schema | null>(null);
@@ -144,6 +161,16 @@ export default function App() {
   const [referenceMp, setReferenceMp] = useState<number | null>(null);
   const [scaleToRef, setScaleToRef] = useState(true);
 
+  /** Available LUTs, and which one is selected. The selection is its own state
+   *  rather than a value in `values` because it is a name, not a number — see
+   *  LUT_ANCHOR_KEY. It travels with the values everywhere they go: into a
+   *  render request, into an export, into a saved preset file, and back out of
+   *  one. Muting the section zeroes `lut_amount` and leaves this alone, which is
+   *  how every other "what it was set to" survives a mute. */
+  const [luts, setLuts] = useState<LutInfo[]>([]);
+  const [lut, setLut] = useState<string | null>(null);
+  const lutFileRef = useRef<HTMLInputElement | null>(null);
+
   const [format, setFormat] = useState("jpeg");
   /** Full resolution, or the proxy exactly as previewed. Not a size choice:
    *  the proxy renders every length at proxy scale, so its grain is the grain
@@ -163,17 +190,22 @@ export default function App() {
    *  the two cannot drift -- "reset" meaning something different from "how it
    *  opened" is its own small bug. */
   const startingValues = useCallback(
-    (s: Schema): { values: Values; referenceMp: number | null } => {
+    (s: Schema): { values: Values; referenceMp: number | null; lut: string | null } => {
       const v: Values = {};
       for (const p of s.params) v[p.key] = p.default;
       const preset = s.presets.find((x) => x.name === s.default_preset);
-      // The reference size travels with the values. Returning it here rather
-      // than only in applyPreset is the point: boot and Reset go through this
-      // path, so without it the app opened on Stock with size scaling inert
-      // until you re-picked Stock from the dropdown by hand.
+      // The reference size travels with the values, and so does the LUT name.
+      // Returning them here rather than only in applyPreset is the point: boot
+      // and Reset go through this path, so without it the app opened on Stock
+      // with size scaling inert until you re-picked Stock from the dropdown by
+      // hand.
       return preset
-        ? { values: { ...v, ...preset.values }, referenceMp: preset.reference_mp }
-        : { values: v, referenceMp: null };
+        ? {
+            values: { ...v, ...preset.values },
+            referenceMp: preset.reference_mp,
+            lut: preset.lut ?? null,
+          }
+        : { values: v, referenceMp: null, lut: null };
     },
     [],
   );
@@ -209,11 +241,17 @@ export default function App() {
         setValues(s.neutral);
         setApplied(s.neutral);
         setReferenceMp(start.referenceMp);
+        setLut(start.lut);
         setMuted(muteAll(s, start.values));
       })
       .catch((e) => setError(String(e.message ?? e)));
     getHealth()
       .then((h) => setDevice(h.device))
+      .catch(() => undefined);
+    // A missing or unreadable luts/ folder is not an error worth a banner --
+    // the picker just offers nothing but "None".
+    getLuts()
+      .then(setLuts)
       .catch(() => undefined);
   }, []);
 
@@ -252,8 +290,9 @@ export default function App() {
       params: applied,
       supersample,
       reference_mp: scaleToRef ? referenceMp : null,
+      lut,
     };
-  }, [meta, applied, supersample, referenceMp, scaleToRef]);
+  }, [meta, applied, supersample, referenceMp, scaleToRef, lut]);
 
   // The untouched image is the same bytes for the life of an upload, and it is
   // now a full-resolution PNG -- so it is fetched once here rather than riding
@@ -355,6 +394,7 @@ export default function App() {
         quality: 95,
         scale: exportScale,
         reference_mp: scaleToRef ? referenceMp : null,
+        lut,
       });
       const poll = async () => {
         const s = await exportStatus(id);
@@ -382,7 +422,49 @@ export default function App() {
       .filter((g) => g.params.length > 0);
   }, [schema]);
 
-  const setValue = (k: string, v: number) => setValues((s) => ({ ...s, [k]: v }));
+  const groupOf = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const p of schema?.params ?? []) m[p.key] = p.group;
+    return m;
+  }, [schema]);
+
+  /** Touching a control in a muted section switches that section back on.
+   *
+   *  What gets applied is not just the edit: it is the section's *kept* values
+   *  restored — exactly what clicking its own ● would do — with the edit laid on
+   *  top. Without that, un-muting by editing would quietly discard whatever the
+   *  rest of the section had been holding.
+   *
+   *  This matters far more than it used to. The app opens with every section
+   *  muted, so an edit to a muted section is no longer an odd case, it is the
+   *  first thing anybody does — and the state it left behind was incoherent
+   *  both ways round: the edit applied and rendered while the section's switch
+   *  still read "off", and a mute/un-mute round trip then reverted it to the
+   *  snapshot taken at mute time. Measured in a real browser: pick a LUT on a
+   *  fresh load, toggle the section off and on, and the mix went back to 0.
+   *
+   *  Split into a pure half and a side-effecting half on purpose: a `setMuted`
+   *  call inside a `setValues` updater would run twice under StrictMode. */
+  const keptFor = (k: string): Values | null => {
+    const g = groupOf[k];
+    return g && muted[g] ? muted[g] : null;
+  };
+
+  const liveFor = (k: string) => {
+    const g = groupOf[k];
+    if (!g || !muted[g]) return;
+    setMuted((m) => {
+      const n = { ...m };
+      delete n[g];
+      return n;
+    });
+  };
+
+  const setValue = (k: string, v: number) => {
+    const keep = keptFor(k);
+    setValues((s) => ({ ...s, ...keep, [k]: v }));
+    liveFor(k);
+  };
 
   /** Hand the live values to the renderer. Passing the ref's current object
    *  means an uncommitted gesture is a no-op: React bails out when the state
@@ -400,9 +482,110 @@ export default function App() {
    *  did nothing until the control lost focus. Building the next object here
    *  and handing it to both setters keeps them in step. */
   const setValueNow = (k: string, v: number) => {
-    const next = { ...valuesRef.current, [k]: v };
+    const next = { ...valuesRef.current, ...keptFor(k), [k]: v };
     setValues(next);
     setApplied(next);
+    liveFor(k);
+  };
+
+  /** One parameter's control, generated from the schema.
+   *
+   *  Extracted from the panel's map so the LUT picker can be interleaved into
+   *  the same list without duplicating any of this. It is still the only place a
+   *  control is built from a `Param`, which is the rule that matters: adding a
+   *  parameter means adding a `Param` in `params.py` and nothing here. */
+  const paramControl = (p: Schema["params"][number]) =>
+    // A discrete parameter is a menu, not a slider. It is still a plain number
+    // everywhere else -- in the schema, in the engine and in a preset file -- so
+    // this is the only place that knows the difference.
+    p.choices?.length ? (
+      <div className="slider">
+        <div className="slabel">
+          <Help text={p.help} label={p.label} />
+        </div>
+        <select
+          value={String(values[p.key] ?? p.default)}
+          onChange={(e) => setValueNow(p.key, Number(e.target.value))}
+        >
+          {p.choices.map((c, i) => (
+            <option key={c} value={i}>
+              {c}
+            </option>
+          ))}
+        </select>
+      </div>
+    ) : (
+      <div className="slider">
+        <div className="slabel">
+          <Help text={p.help} label={p.label} />
+          <input
+            className="num"
+            type="number"
+            min={p.min}
+            max={p.max}
+            step={p.step}
+            value={values[p.key] ?? p.default}
+            onChange={(e) => setValue(p.key, Number(e.target.value))}
+            onKeyUp={commit}
+            onBlur={commit}
+          />
+          {p.unit && <em>{p.unit}</em>}
+        </div>
+        <input
+          type="range"
+          min={p.min}
+          max={p.max}
+          step={p.step}
+          value={values[p.key] ?? p.default}
+          onChange={(e) => setValue(p.key, Number(e.target.value))}
+          // Pointer releases come from the window listener above; these cover
+          // the keyboard path (arrows nudge the thumb without ever producing a
+          // pointer event).
+          onKeyUp={commit}
+          onBlur={commit}
+        />
+      </div>
+    );
+
+  /** Pick a LUT (or clear it), and switch the stage on if it was off.
+   *
+   *  Bumping Mix from 0 to 1 is the one bit of behaviour here that is not
+   *  mechanical, and it is deliberate: Mix ships at 0 like every other stage in
+   *  the app, so a freshly-picked LUT would otherwise change nothing at all and
+   *  read as broken. A Mix the user has already moved is left exactly where they
+   *  put it — this only fires on a stage that is genuinely off. Clearing the LUT
+   *  leaves Mix alone, so re-picking one returns you to the strength you had.
+   *
+   *  Both setters, one gesture: `setValue` then `commit()` would apply the
+   *  *previous* value here, for the reason `setValueNow` documents — a menu has
+   *  no pointerup to clean up after it. */
+  const pickLut = (id: string | null) => {
+    setLut(id);
+    if (id && (valuesRef.current[LUT_ANCHOR_KEY] ?? 0) <= 0) {
+      // Goes through setValueNow, so it also switches the section on -- see
+      // keptFor/liveFor. On a fresh load every section is muted, and a LUT that
+      // renders while its own section reads "off" is the incoherent state that
+      // pair exists to prevent.
+      setValueNow(LUT_ANCHOR_KEY, 1);
+    } else if (id) {
+      liveFor(LUT_ANCHOR_KEY);
+    }
+    // Clearing it needs neither: `lut` is part of the render request, so
+    // changing it re-fires the render effect on its own, and "no LUT" is not a
+    // reason to switch a muted section back on.
+  };
+
+  const onLutFile = async (file: File) => {
+    try {
+      const info = await uploadLut(file);
+      setLuts((ls) => [...ls.filter((x) => x.id !== info.id), info]);
+      pickLut(info.id);
+      setError(null);
+      setNotice(`Loaded LUT ${info.name} (${info.size}³)`);
+    } catch (e: any) {
+      setNotice(null);
+      setError(`Could not load ${file.name}: ${e.message ?? e}`);
+    }
   };
 
   // A drag that ends outside the slider -- release the mouse over the image,
@@ -452,6 +635,10 @@ export default function App() {
     // one; the server rescales lengths by the linear ratio, but only if it is
     // told what size the values were authored at.
     setReferenceMp(p.reference_mp ?? null);
+    // The LUT is part of the look, so it comes along -- including its absence.
+    // A preset with no LUT has to *clear* one that is selected, or the last
+    // look's grade would keep riding under the new one.
+    setLut(p.lut ?? null);
     const v = { ...values, ...p.values };
     setValues(v);
     setApplied(v);
@@ -467,6 +654,7 @@ export default function App() {
     setValues(schema.neutral);
     setApplied(schema.neutral);
     setReferenceMp(start.referenceMp);
+    setLut(start.lut);
     setMuted(muteAll(schema, start.values));
   };
 
@@ -584,6 +772,11 @@ export default function App() {
       // Falls back to whatever it was loaded with, so re-saving a preset you
       // did not author here does not silently re-base it onto this image.
       reference_mp: referenceMp ?? meta?.megapixels ?? null,
+      // A sibling of `values`, not one of them -- a LUT is named, not numbered.
+      // An uploaded LUT's id will not resolve in a future session; that is the
+      // honest thing to write, and the picker shows the name as missing rather
+      // than the app pretending the grade is still there.
+      lut,
       values: Object.fromEntries(
         // Written in schema order, not insertion order, so a hand-edited file
         // stays readable and two saves diff cleanly.
@@ -615,6 +808,10 @@ export default function App() {
       const raw = JSON.parse(await file.text());
       const { values: v, dropped } = coerce(raw);
       if (typeof raw?.reference_mp === "number") setReferenceMp(raw.reference_mp);
+      // Set unconditionally, `null` included: a file with no LUT describes a
+      // look that has none, and leaving the previous selection in place would
+      // silently blend two grades.
+      setLut(typeof raw?.lut === "string" && raw.lut ? raw.lut : null);
       setValues(v);
       setApplied(v); // discrete action -- render straight away
       // A loaded file is a whole look too, same as picking one from the menu --
@@ -639,7 +836,7 @@ export default function App() {
     <div className="app">
       <header className="bar">
         <div className="brand">
-          <span className="dot" />
+          <img src={filmGrain1x1} alt="Film grain" className="film-grain-icon" />
           Film Grain Engine
         </div>
         <label
@@ -682,6 +879,7 @@ export default function App() {
         )}
         <div className="spacer" />
         <span className={`status ${rendering ? "busy" : ""}`}>
+          {rendering && <div className="spinner" />}
           {rendering ? "rendering…" : `${renderMs}ms`}
         </span>
         <span className="meta">{device}</span>
@@ -700,10 +898,14 @@ export default function App() {
           onShowBefore={setShowBefore}
           previewFull={previewFull}
           onFile={onFile}
+          rendering={rendering}
+          job={job}
         />
 
         <aside className="panel">
           {error && <div className="err">{error}</div>}
+
+          <img src={filmGrain16x9} alt="Film grain sample" className="film-grain-preview" />
 
           {/* Compare and Wipe used to live here. They are on the preview's own
               bar now: they are things you do *to the view*, like zoom, and
@@ -913,67 +1115,39 @@ export default function App() {
                   </button>
                 </h3>
                 {!collapsed[group] &&
-                  params.map((p) =>
-                    // A discrete parameter is a menu, not a slider. It is
-                    // still a plain number everywhere else -- in the schema,
-                    // in the engine and in a preset file -- so this is the
-                    // only place that knows the difference.
-                    p.choices?.length ? (
-                      <div className="slider" key={p.key}>
-                        <div className="slabel">
-                          <Help text={p.help} label={p.label} />
-                        </div>
-                        <select
-                          value={String(values[p.key] ?? p.default)}
-                          onChange={(e) =>
-                            setValueNow(p.key, Number(e.target.value))
-                          }
-                        >
-                          {p.choices.map((c, i) => (
-                            <option key={c} value={i}>
-                              {c}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                    ) : (
-                    <div className="slider" key={p.key}>
-                      <div className="slabel">
-                        <Help text={p.help} label={p.label} />
-                        <input
-                          className="num"
-                          type="number"
-                          min={p.min}
-                          max={p.max}
-                          step={p.step}
-                          value={values[p.key] ?? p.default}
-                          onChange={(e) =>
-                            setValue(p.key, Number(e.target.value))
-                          }
-                          onKeyUp={commit}
-                          onBlur={commit}
+                  params.map((p) => (
+                    <Fragment key={p.key}>
+                      {/* The LUT picker. Not a parameter and so not generated
+                          from the schema -- a LUT is a named resource, like a
+                          preset file. Anchored to its own Mix slider so the
+                          section still reads in pipeline order. */}
+                      {p.key === LUT_ANCHOR_KEY && (
+                        <LutPicker
+                          luts={luts}
+                          value={lut}
+                          onPick={pickLut}
+                          onLoadFile={() => lutFileRef.current?.click()}
                         />
-                        {p.unit && <em>{p.unit}</em>}
-                      </div>
-                      <input
-                        type="range"
-                        min={p.min}
-                        max={p.max}
-                        step={p.step}
-                        value={values[p.key] ?? p.default}
-                        onChange={(e) => setValue(p.key, Number(e.target.value))}
-                        // Pointer releases come from the window listener above;
-                        // these cover the keyboard path (arrows nudge the thumb
-                        // without ever producing a pointer event).
-                        onKeyUp={commit}
-                        onBlur={commit}
-                      />
-                    </div>
-                    ),
-                  )}
+                      )}
+                      {paramControl(p)}
+                    </Fragment>
+                  ))}
               </section>
             ))}
           </div>
+          <input
+            ref={lutFileRef}
+            type="file"
+            accept=".cube"
+            hidden
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              // Cleared for the reason the image and preset pickers are: without
+              // it, re-picking the same file fires no change event at all.
+              e.target.value = "";
+              if (f) onLutFile(f);
+            }}
+          />
 
           <div className="export">
             <select
@@ -1097,6 +1271,73 @@ function Help({ text, label }: { text: string; label: string }) {
   );
 }
 
+/** The 3D LUT selector: everything in `luts/`, everything uploaded this
+ *  session, and a button to add one.
+ *
+ *  A LUT that is selected but absent from the list gets its own entry rather
+ *  than silently resetting the menu to None. That happens for real -- a preset
+ *  file naming a `.cube` that has since been renamed, or an upload from a
+ *  previous run, since those live in process memory. Showing "missing" is the
+ *  honest state: the server renders with no LUT and zeroes the mix, so the
+ *  picture is right, and the picker says why rather than looking like the
+ *  preset had no LUT in it.
+ *
+ *  Sizes are shown for uploads because they were parsed on the way in. Folder
+ *  entries do not report one -- listing them deliberately does not open them,
+ *  so a directory of 64-cubes costs nothing to browse. */
+function LutPicker(props: {
+  luts: LutInfo[];
+  value: string | null;
+  onPick: (id: string | null) => void;
+  onLoadFile: () => void;
+}) {
+  const { luts, value } = props;
+  const missing = !!value && !luts.some((l) => l.id === value);
+  return (
+    <div className="slider lutpick">
+      <div className="slabel">
+        <span className="title">LUT</span>
+        <button
+          className="seg"
+          onClick={props.onLoadFile}
+          title="Load a .cube file from disk for this session"
+        >
+          Load .cube…
+        </button>
+      </div>
+      <select
+        value={value ?? ""}
+        onChange={(e) => props.onPick(e.target.value || null)}
+      >
+        <option value="">None</option>
+        {missing && <option value={value!}>{lutLabel(value!)} — missing</option>}
+        {luts.map((l) => (
+          <option key={l.id} value={l.id}>
+            {l.name}
+            {l.size ? ` (${l.size}³)` : ""}
+            {l.source === "upload" ? " — loaded" : ""}
+          </option>
+        ))}
+      </select>
+      {missing && (
+        <p className="hint">
+          This look wants a LUT called <strong>{lutLabel(value!)}</strong>, which
+          is not in <code>luts/</code>
+          {value!.startsWith("upload:")
+            ? " — it was loaded from disk in an earlier session, so it has to be loaded again."
+            : " — drop the .cube file in there, or load it from disk."}{" "}
+          Nothing is being applied in the meantime.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** A LUT id as something to show a person. Uploads carry an opaque id, so there
+ *  is nothing better to print for one that is no longer loaded. */
+const lutLabel = (id: string) =>
+  id.startsWith("upload:") ? "a loaded file" : id;
+
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="field">
@@ -1132,8 +1373,10 @@ function Stage(props: {
   onShowBefore: (v: boolean) => void;
   previewFull: boolean;
   onFile: (f: File) => void;
+  rendering: boolean;
+  job: ExportJob | null;
 }) {
-  const { meta, previewUrl, sourceUrl, compare, previewFull } = props;
+  const { meta, previewUrl, sourceUrl, compare, previewFull, rendering, job } = props;
   // Holding B peeks at the original outright, which is the wipe pushed all the
   // way over rather than a separate mode -- so it is resolved here, once,
   // instead of every consumer remembering to check both.
@@ -1157,7 +1400,7 @@ function Stage(props: {
   // is judging the picture, not decorating it -- a photograph butted straight
   // against a dark panel reads darker and flatter than it is, and the edge of
   // the frame stops being visible at all where the picture goes to black.
-  const [frame, setFrame] = useState(false);
+  const [frame, setFrame] = useState(true);
   const [frameWidth, setFrameWidth] = useState(FRAME_DEFAULT);
 
   // A new image inherits neither the old pan nor the old magnification -- a
@@ -1397,8 +1640,12 @@ function Stage(props: {
   // One bar for everything that changes the *view* and nothing that changes
   // the render: compare mode, the wipe, and the zoom. Grouped left to right in
   // the order you reach for them, with the wipe next to the mode that owns it.
+  const isExporting = job && job.status !== "done" && job.status !== "error";
   const bar = (
     <div className="viewbar">
+      <div className={`spinner-placeholder ${rendering || isExporting ? "active" : ""}`}>
+        <div className="spinner-icon" />
+      </div>
       {softened && (
         <span className="fid" title="Enlarged beyond the proxy's resolution — press Render 1:1 to judge grain">
           proxy

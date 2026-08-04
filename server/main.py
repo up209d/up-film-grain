@@ -20,8 +20,9 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import imageio as iio
+from . import lut as lutlib
 from . import params as P
-from .engine import GrainEngine, device_name, pick_device
+from .engine import GrainEngine, RenderCancelled, device_name, pick_device
 
 # Production is the default. Dev mode is the special case -- it is the one that
 # needs CORS holes and an interactive schema browser, so it has to be asked for
@@ -55,6 +56,29 @@ ENGINE = GrainEngine(DEVICE)
 # the UI only ever needs the newest preview anyway.
 _RENDER_LOCK = threading.Lock()
 
+# Monotonic counter identifying the newest requested preview.
+#
+# The lock above serialises renders, but it does not make a *stale* one stop.
+# Starlette cannot interrupt a threadpool worker, so when the client aborts --
+# which `App.tsx` does on every new render -- the abandoned render used to run to
+# completion and keep holding the lock the whole time, and the preview the user
+# actually wants would queue behind every superseded one. Latency then grows with
+# how many edits happened rather than with how long one render takes, which is
+# the difference between usable and not on a slow machine.
+#
+# So each preview takes a ticket on entry and gives up as soon as a newer ticket
+# exists. Guarded by its own lock rather than relying on the GIL, because the
+# read-modify-write has to be atomic against other threadpool workers.
+_GEN_LOCK = threading.Lock()
+_preview_gen = 0
+
+
+def _next_preview_gen() -> int:
+    global _preview_gen
+    with _GEN_LOCK:
+        _preview_gen += 1
+        return _preview_gen
+
 
 # Long edge of the working proxy used for live preview renders. Measured on a
 # 24MP source: a full-resolution 2x pass is 7.8s, this is 1.3s. That gap is the
@@ -65,7 +89,7 @@ PROXY_LONG_EDGE = 2400
 
 class Upload:
     __slots__ = ("id", "name", "arr", "h", "w", "proxy", "proxy_scale",
-                 "src_png", "touched")
+                 "src_enc", "touched")
 
     def __init__(self, uid: str, name: str, arr: np.ndarray) -> None:
         self.id = uid
@@ -75,8 +99,10 @@ class Upload:
         self.proxy_scale = min(1.0, PROXY_LONG_EDGE / float(max(self.h, self.w)))
         self.proxy = iio.downscale(arr, self.proxy_scale, DEVICE)
         # The untouched image never changes, so it is encoded once and served
-        # from here rather than re-encoded on every parameter change.
-        self.src_png: bytes | None = None
+        # from here rather than re-encoded on every parameter change. Named for
+        # "encoded" rather than a format: it follows `iio.encode_preview`, which
+        # is JPEG now, and a full-resolution PNG of a 24MP source was ~76MB.
+        self.src_enc: bytes | None = None
         self.touched = time.time()
 
 
@@ -114,6 +140,23 @@ def _params_for(up: Upload, body: dict) -> dict[str, float]:
     if ref:
         k = P.scale_factor(float(ref), up.w * up.h / 1e6)
         p = P.rescale(p, k)
+
+    # The 3D LUT rides alongside the values rather than in them -- it is a
+    # resource identified by name, not a quantity (see server/lut.py). Attached
+    # here, after sanitize and rescale, both of which only ever touch keys that
+    # are in PARAMS and so leave this alone.
+    #
+    # An unresolvable name is not an error: a preset can reference a LUT that
+    # has since been renamed, or an upload from a previous run. But the mix has
+    # to be zeroed with it, because `params.is_neutral` decides whether to
+    # short-circuit the render from the numbers alone and cannot see the LUT --
+    # leave a nonzero mix with no table and "show me the original" would return
+    # a full render of a neutral pipeline, which is measurably softer than the
+    # source rather than equal to it.
+    lut = lutlib.get(body.get("lut"))
+    p["lut"] = lut
+    if lut is None:
+        p["lut_amount"] = 0.0
     return p
 
 
@@ -127,6 +170,38 @@ def health() -> dict:
 @app.get("/api/params")
 def get_params() -> dict:
     return P.schema()
+
+
+@app.get("/api/luts")
+def get_luts() -> dict:
+    """Every 3D LUT the client can pick: the ``luts/`` folder plus any uploads.
+
+    Its own endpoint rather than a field on ``/api/params`` because the list
+    changes during a session -- uploading one has to add to it -- while the
+    parameter schema never does. Nothing is parsed to answer this; the folder is
+    only listed, so a directory of 64-cubes costs nothing to browse.
+    """
+    return {"luts": lutlib.list_luts()}
+
+
+@app.post("/api/lut")
+def upload_lut(file: UploadFile = File(...)) -> dict:
+    """Take a ``.cube`` from the user and hold it for this session.
+
+    Parsed here rather than at render time so a malformed file is reported while
+    the user is still looking at the file picker, instead of turning into a
+    failed render several gestures later.
+    """
+    data = file.file.read()
+    if not data:
+        raise HTTPException(400, "Empty file.")
+    try:
+        lut = lutlib.add_upload(file.filename or "lut.cube", data)
+    except lutlib.LutError as e:
+        raise HTTPException(415, str(e))
+    except Exception as e:
+        raise HTTPException(400, f"Could not read that LUT: {e}")
+    return lut.info()
 
 
 @app.post("/api/upload")
@@ -158,6 +233,32 @@ def upload(file: UploadFile = File(...)) -> dict:
     }
 
 
+def _render_tier(up: Upload, p: dict, ss: int, full: bool, progress=None,
+                 should_cancel=None):
+    """Render one of the two tiers. The single place either tier is rendered.
+
+    ``/api/preview`` and the proxy branch of ``/api/export`` both come through
+    here, and that is deliberate rather than tidy: a preview-scale export is
+    supposed to be **byte-for-byte** the live preview, so "export what I am
+    looking at" stays literally true, and the only way to guarantee that is for
+    both to make the identical call. They used to be two call sites carrying
+    duplicated literals, which is exactly the drift the invariant warns about --
+    and it became load-bearing the moment tile size stopped being a constant,
+    because now the two would have to agree about a *computed* value.
+    """
+    src, sc = (up.arr, 1.0) if full else (up.proxy, up.proxy_scale)
+    # Tile size from `ENGINE.tile_for`, not a constant. Per-tile overlap is fixed
+    # padding that gets rendered and thrown away, so wider tiles are strictly
+    # less work -- but the ceiling is memory, and the right ceiling differs per
+    # machine, per preset (a wide kernel pads more) and per supersample. See
+    # `tile_for` for the measurements.
+    tile = ENGINE.tile_for(p, sc, int(src.shape[0]), int(src.shape[1]), ss)
+    return ENGINE.render_image(
+        src, p, sc, tile=tile, supersample=ss, progress=progress,
+        should_cancel=should_cancel,
+    )
+
+
 @app.post("/api/preview")
 def preview(body: dict = Body(...)) -> Response:
     """Render the whole frame -- at proxy scale by default, full res on demand.
@@ -186,24 +287,28 @@ def preview(body: dict = Body(...)) -> Response:
     ss = max(1, min(3, int(body.get("supersample", 2))))
     full = bool(body.get("full", False))
 
+    # Take a ticket *before* waiting on the lock, so a request already queued
+    # here is superseded by a newer one arriving behind it rather than after it.
+    mine = _next_preview_gen()
+
+    def superseded() -> bool:
+        return _preview_gen != mine
+
     t0 = time.time()
-    with _RENDER_LOCK:
-        # Larger tiles than the export's: the per-tile overlap is fixed
-        # padding, so wider tiles amortise it. Measured on a 24MP source,
-        # 1536 beats 1024 by ~5% at the default halation radius and ~12% at
-        # the widest. Past 2048 it turns around again as the tensors stop
-        # fitting comfortably.
-        if full:
-            out = ENGINE.render_image(up.arr, p, 1.0, tile=1536, supersample=ss)
-        else:
-            out = ENGINE.render_image(
-                up.proxy, p, up.proxy_scale, tile=1536, supersample=ss
-            )
+    try:
+        with _RENDER_LOCK:
+            out = _render_tier(up, p, ss, full, should_cancel=superseded)
+    except RenderCancelled:
+        # 499, nginx's "client closed request". The client aborted this fetch the
+        # moment it issued the newer one, so nothing is waiting for this body --
+        # `api.ts` never sees it. Returning a status rather than an empty 200
+        # keeps it out of the success path if anything ever does look.
+        return Response(status_code=499, headers={"Cache-Control": "no-store"})
     ms = int((time.time() - t0) * 1000)
 
     return Response(
         content=iio.encode_preview(out),
-        media_type="image/png",
+        media_type=iio.PREVIEW_MEDIA_TYPE,
         headers={
             "X-Render-Ms": str(ms),
             "X-Render-Full": "1" if full else "0",
@@ -222,11 +327,11 @@ def source(body: dict = Body(...)) -> Response:
     the source does not change when a slider does.
     """
     up = _get(body.get("id", ""))
-    if up.src_png is None:
-        up.src_png = iio.encode_preview(up.arr)
+    if up.src_enc is None:
+        up.src_enc = iio.encode_preview(up.arr)
     return Response(
-        content=up.src_png,
-        media_type="image/png",
+        content=up.src_enc,
+        media_type=iio.PREVIEW_MEDIA_TYPE,
         headers={"Cache-Control": "no-store"},
     )
 
@@ -243,16 +348,15 @@ def _run_export(job_id: str, up: Upload, p: dict, fmt: str, ss: int,
         with _RENDER_LOCK:
             job["status"] = "rendering"
             if proxy:
-                # Byte-for-byte the live preview's render: same source array,
-                # same working scale, same tile size. Anything different here
+                # Byte-for-byte the live preview's render, guaranteed by going
+                # through the same function it does rather than by two call
+                # sites agreeing about their arguments. Anything different here
                 # and "export what I am looking at" stops being true.
-                out = ENGINE.render_image(
-                    up.proxy, p, up.proxy_scale, tile=1536, supersample=ss,
-                    progress=progress,
-                )
+                out = _render_tier(up, p, ss, False, progress=progress)
             else:
+                tile = ENGINE.tile_for(p, 1.0, up.h, up.w, ss)
                 out = ENGINE.render_image(
-                    up.arr, p, 1.0, tile=1024, supersample=ss, progress=progress
+                    up.arr, p, 1.0, tile=tile, supersample=ss, progress=progress
                 )
             job["status"] = "encoding"
             data = iio.encode(out, fmt, quality)

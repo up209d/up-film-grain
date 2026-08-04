@@ -41,6 +41,7 @@ class Param:
 
 # Groups are rendered in this order by the client.
 GROUPS: list[str] = [
+    "Colour Grading",
     "Pre Blur",
     "Pre Sharpen",
     "Grain Structure",
@@ -57,6 +58,113 @@ GROUPS: list[str] = [
 
 
 PARAMS: list[Param] = [
+    # ------------------------------------------------------- colour grading
+    # Step -1: the only block above pre-blur, and the whole section runs on the
+    # source before anything films it. Ships at 0, so the pipeline is still a
+    # colour pass-through until something here is asked for.
+    #
+    # Panel order matches pipeline order, the way Edge Destruction's does: the
+    # four adjustments first, then the LUT they feed. The LUT *file* is not a
+    # parameter -- see server/lut.py for why a name cannot be an index -- so it
+    # travels beside these values and the client renders its picker directly
+    # above `lut_amount`.
+    Param(
+        "grade_temp", "Temperature", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "White balance, as a warm/cool shift. Positive is warmer (more red, "
+        "less blue), negative cooler. Done as channel gains in *linear* light, "
+        "which is where a white balance physically happens -- the same reason "
+        "Pre Blur does its transfer round trip. Applied in gamma-encoded space "
+        "instead it drags the shadows further than the highlights and reads as "
+        "a tint painted over the picture rather than a different light.\n"
+        "\n"
+        "The gains are normalised against the luma weights, so warming a frame "
+        "does not also brighten it -- measured, overall luminance holds to "
+        "within 1% across the whole slider. Use it to set the light before the "
+        "LUT below sees it; a LUT built for daylight has nothing sensible to do "
+        "with a tungsten frame, and correcting afterwards fights the look. "
+        "0 = off.",
+    ),
+    Param(
+        "grade_shadows", "Shadows", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "Lifts or crushes the bottom half of the tonal range, weighted by a "
+        "broad quintic ramp so there is no line across a gradient. Positive "
+        "opens the shadows toward the film-base lift a negative has; negative "
+        "takes them down toward black.\n"
+        "\n"
+        "It cannot clip and it cannot break a hue: the lift is a fraction of "
+        "the headroom that is actually there (toward white going up, toward "
+        "zero coming down), so every channel stays inside 0-1 by construction "
+        "at any setting rather than by a clamp afterwards. Its mask is measured "
+        "from the frame as it arrived, so it and Highlights stay independent -- "
+        "moving one does not change what the other is keying on. 0 = off.",
+    ),
+    Param(
+        "grade_highlights", "Highlights", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "The same control for the top half of the range. Negative is the useful "
+        "direction most of the time -- it pulls blown highlights back down "
+        "before the LUT and the film pipeline get hold of them, which is the "
+        "one thing no amount of Shoulder further down can recover once it has "
+        "flattened. Positive pushes them up instead.\n"
+        "\n"
+        "Gamut-safe and clip-free for the same reason Shadows is, and keyed on "
+        "the same untouched luma. 0 = off.",
+    ),
+    Param(
+        "grade_clarity", "Clarity", "Colour Grading",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "Two-way local contrast: positive adds it, negative takes it away. "
+        "Above 0 it is the usual mid-frequency punch -- structure and texture "
+        "come forward without the edge halos a small-radius sharpen leaves. "
+        "Below 0 it flattens that same band, which reads as the soft, hazy, "
+        "lifted look of light bouncing around inside the lens. Both are one "
+        "band at one radius, so this is a different thing from Pre Blur (which "
+        "destroys detail outright) and from Edge Softening (which only touches "
+        "hard transitions).\n"
+        "\n"
+        "The two directions are deliberately not the same strength. Negative "
+        "stops at exactly the point where the band is *gone*: -1 removes 100% "
+        "of the local contrast at this radius and no setting can push past it "
+        "into inverted contrast, which would put dark halos on the light side "
+        "of every edge. Positive is free to go further and does. It runs on "
+        "luminance only -- the detail it adds or removes goes to all three "
+        "channels equally -- so it holds hue exactly and cannot drive a "
+        "saturated area out of gamut, and it costs one single-channel blur "
+        "instead of three. 0 = off.",
+    ),
+    Param(
+        "grade_clarity_radius", "Clarity Radius", "Colour Grading",
+        2.0, 80.0, 0.5, 14.0, "px",
+        "Which band Clarity works on, as a radius at full resolution. Small is "
+        "fine texture and starts competing with the grain further down the "
+        "pipeline; large is broad shaping that reads as light rather than as "
+        "detail. This is the one length in this section, so it scales with the "
+        "photo like every other radius in the app -- and it is the only thing "
+        "here that needs tile overlap, which is why Clarity is the only part of "
+        "this section that costs anything measurable.",
+        spatial=True,
+    ),
+    Param(
+        "lut_amount", "LUT Mix", "Colour Grading",
+        0.0, 1.0, 0.01, 0.0, "",
+        "How much of the selected 3D LUT is mixed in, as a straight cross-fade "
+        "between the graded frame and its LUT'd self. 1 is the LUT as its "
+        "author built it; part-way is the standard way to use a film LUT that "
+        "is stronger than the photograph wants.\n"
+        "\n"
+        "0 = off, and with no LUT selected this does nothing whatever it says "
+        "-- the server zeroes it in that case so 'show me the original' stays "
+        "bit-exact. Picking a LUT raises it to 1 for you if it was sitting at "
+        "0, because a picker that appears to do nothing is worse than one that "
+        "commits.\n"
+        "\n"
+        "The LUT is applied display-referred, on the source, before every film "
+        "stage -- which is what a LUT expects, and it means the grain, halation "
+        "and texture below all land on the graded picture rather than being "
+        "graded themselves.",
+    ),
     # ------------------------------------------------------------- pre blur
     # The very first thing that touches the image -- ahead of pre-sharpen and
     # of every film stage. See step 0 in engine.render().
@@ -620,13 +728,34 @@ PARAMS: list[Param] = [
         "sigma against 3.5% there. 5-20 is the usable range.",
     ),
     Param(
-        "global_size", "Global Size", "Global Grain",
+        "global_size", "Global Size Min", "Global Grain",
         0.1, 20.0, 0.05, 1.6, "px",
-        "Clump diameter of the global layer, at full resolution. Set it apart "
-        "from Clump Size and the two layers read as separate structures; match "
-        "them and it just thickens the main grain. Past about 8px the noise "
-        "lattice starts to show as rectangular blocks -- that is the field, "
-        "not the setting, and Global Smoothness is the cure.",
+        "Clump diameter of the global layer, at full resolution -- the "
+        "smallest a clump can be once Global Size Max is raised above this, "
+        "and the only size that exists while Max stays at or below it. Set it "
+        "apart from Clump Size and the two layers read as separate "
+        "structures; match them and it just thickens the main grain. Past "
+        "about 8px the noise lattice starts to show as rectangular blocks -- "
+        "that is the field, not the setting, and Global Smoothness is the "
+        "cure.",
+        spatial=True,
+    ),
+    Param(
+        "global_size_max", "Global Size Max", "Global Grain",
+        0.1, 20.0, 0.05, 1.6, "px",
+        "The largest a global-grain clump can be. At or below Global Size Min "
+        "this does nothing -- every clump renders at exactly Min, bit-for-bit "
+        "the field this layer has always drawn. Raised above it, each clump "
+        "independently draws its own diameter somewhere between the two, so "
+        "the layer stops reading as one uniform grain size and starts reading "
+        "as real crystals of differing sizes scattered through the frame -- "
+        "the fix for Global Grain looking too even and digital. This is not a "
+        "gradual blend: the moment Max moves past Min the layer switches from "
+        "smooth stacked noise to discrete randomly-sized particles, which is "
+        "a change in *kind*, not just in range. A wide gap can leave visible "
+        "clear patches between clumps -- real grain has them too, but back "
+        "the gap off if it reads as too sparse. Ships equal to Min, so no "
+        "existing preset changes.",
         spatial=True,
     ),
     Param(
@@ -893,6 +1022,14 @@ DEFAULTS: dict[str, float] = {p.key: p.default for p in PARAMS}
 # a worse failure than any of them being over-zealous. `verify.py` renders with
 # these and asserts the output is the input.
 NEUTRAL_ZERO: tuple[str, ...] = (
+    # Colour grading. `lut_amount` belongs here and the LUT *name* deliberately
+    # does not: this list is what "Original" applies, and it has to be a set of
+    # numbers the engine can be handed. Zeroing the mix switches the LUT off as
+    # completely as unselecting it would, so the name can stay put and be there
+    # again when the section is switched back on -- the same reasoning that
+    # keeps sizes, radii and seeds out of this list.
+    "grade_temp", "grade_shadows", "grade_highlights", "grade_clarity",
+    "lut_amount",
     "pre_blur", "pre_sharpen",
     "contrast", "toe", "shoulder", "highlight_desat", "brightness",
     "vibrance", "base_fog",
@@ -1092,9 +1229,15 @@ def load_presets() -> list[dict]:
         if not isinstance(values, dict):
             values = raw
         ref = raw.get("reference_mp") or DEFAULT_REFERENCE_MP
+        lut = raw.get("lut")
         out.append({
             "name": f.stem,
             "values": sanitize(values),
+            # Which 3D LUT the look wants, by name. A sibling key rather than a
+            # value, for the reason server/lut.py sets out -- it is a resource,
+            # not a quantity. Unresolvable names (a renamed file, an upload from
+            # a previous run) degrade to no LUT rather than erroring.
+            "lut": lut if isinstance(lut, str) and lut else None,
             # Size the preset was dialled in on, so it can be rescaled onto a
             # different photo. Absent in older files -> no scaling, which is
             # the pre-existing behaviour rather than a guess.

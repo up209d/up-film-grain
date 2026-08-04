@@ -155,11 +155,43 @@ def encode(arr: np.ndarray, fmt: str = "png16", quality: int = 95) -> bytes:
     return buf.getvalue()
 
 
+PREVIEW_QUALITY = 95
+PREVIEW_MEDIA_TYPE = "image/jpeg"
+
+
 def encode_preview(arr: np.ndarray) -> bytes:
-    """8-bit PNG for on-screen preview, compressed lightly for latency."""
+    """8-bit JPEG for on-screen preview.
+
+    **4:4:4, and that is not optional** -- the default 4:2:0 would average away
+    exactly the chroma grain the pipeline exists to produce.
+
+    Was a `compress_level=1` PNG, which is a poor fit for this content: grain
+    defeats PNG's predictor, so the "lightly compressed for latency" version came
+    out both enormous *and* slow. Measured on a real photograph rendered through
+    the `Stock` preset -- which matters, because a synthetic noise plate is a
+    much harder case than real output and flatters the JPEG figure:
+
+    | | size | encode |
+    |---|---|---|
+    | 2400px proxy, PNG level 1 | 10.4MB | 108ms |
+    | 2400px proxy, JPEG q95 4:4:4 | **3.4MB** | **24ms** |
+
+    So ~84ms of server time and ~7MB of wire per proxy preview, before the
+    browser's decode of the difference -- and on a weak machine the zlib pass is
+    the larger share of the two. 3.0x smaller, 4.5x faster.
+
+    This is not a new quality judgement: JPEG 95 4:4:4 is already the shipped
+    default for `/api/export`, measured at 100.2% of grain sigma. What it *does*
+    cost is strict bit-equality between what is on screen and a preview-scale
+    png export -- the two *renders* are still byte-for-byte identical (see
+    `main._render_tier`), but the pixels displayed now go through JPEG. Judge
+    grain from a 1:1 render, not from a pixel-peep diff of the preview.
+    """
     u = (np.clip(arr, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
     buf = io.BytesIO()
-    Image.fromarray(u, "RGB").save(buf, format="PNG", compress_level=1)
+    Image.fromarray(u, "RGB").save(
+        buf, format="JPEG", quality=PREVIEW_QUALITY, subsampling=0,
+    )
     return buf.getvalue()
 
 
@@ -174,7 +206,10 @@ def downscale(arr: np.ndarray, scale: float, device=None) -> np.ndarray:
     h, w, _ = arr.shape
     nh, nw = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
     t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-    if device is not None and device.type == "cuda":
+    # Any accelerator, not just CUDA. The old `== "cuda"` guard quietly ran a
+    # 24MP bicubic-antialias downscale in CPU torch on every upload on this
+    # machine, because the device here is `mps`.
+    if device is not None and device.type in ("cuda", "mps"):
         t = t.to(device)
     out = F.interpolate(t, size=(nh, nw), mode="bicubic", antialias=True, align_corners=False)
     out = out.clamp(0.0, 1.0).squeeze(0).permute(1, 2, 0).cpu().numpy()

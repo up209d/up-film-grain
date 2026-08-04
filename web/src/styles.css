@@ -39,14 +39,27 @@ body {
   flex: 0 0 auto;
 }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; letter-spacing: .2px; }
-.dot {
-  width: 9px; height: 9px; border-radius: 50%;
-  background: radial-gradient(circle at 30% 30%, var(--accent), var(--accent2));
+.film-grain-icon {
+  width: 20px; height: 20px;
+  border-radius: 4px;
+  object-fit: cover;
 }
 .spacer { flex: 1; }
 .meta { color: var(--dim); font-variant-numeric: tabular-nums; }
-.status { color: var(--dim); font-variant-numeric: tabular-nums; min-width: 66px; text-align: right; }
+.status { color: var(--dim); font-variant-numeric: tabular-nums; min-width: 66px; text-align: right; display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
 .status.busy { color: var(--accent); }
+
+.spinner {
+  width: 12px; height: 12px;
+  border: 2px solid rgba(216, 160, 90, 0.3);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex: 0 0 auto;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
 
 /* ----------------------------------------------------------------- body -- */
 .body { display: flex; flex: 1; min-height: 0; }
@@ -123,6 +136,28 @@ body {
    stage. Wrapping keeps it usable there instead of pushing controls off the
    edge; `justify-content: flex-end` keeps it hugging the right as it does. */
 .viewbar { flex-wrap: wrap; justify-content: flex-end; max-width: calc(100% - 20px); }
+/* Spinner placeholder: reserves space even when not spinning, so the bar
+   doesn't shift width when rendering starts/stops. */
+.spinner-placeholder {
+  flex: 0 0 16px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 1px 4px 0 4px;
+}
+.spinner-icon {
+  width: 20px;
+  height: 20px;
+  border: 1.5px solid rgba(139, 146, 158, 0.25);
+  border-radius: 50%;
+  animation: none;
+}
+.spinner-placeholder.active .spinner-icon {
+  border: 1.5px solid rgba(216, 160, 90, 0.3);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
 /* Thin rule between the view-comparison group and the zoom group. */
 .viewbar .vsep {
   width: 1px; align-self: stretch; margin: 1px 3px;
@@ -165,6 +200,14 @@ body {
 .row > * { flex: 1; }
 
 .hint { margin: 0; color: var(--dim); font-size: 11.5px; line-height: 1.4; }
+
+.film-grain-preview {
+  width: 100%;
+  height: auto;
+  border-radius: 8px;
+  object-fit: cover;
+  margin-bottom: 12px;
+}
 /* The size-scaling readout: three numbers and the factor, always on show. */
 .scalebox {
   display: flex; align-items: center; justify-content: space-between; gap: 6px;
@@ -263,6 +306,12 @@ button:disabled { opacity: .45; cursor: default; }
 /* Discrete parameters render as a menu instead of a track (see the params
    map in App.tsx). Full width so the row still reads as one control. */
 .slider select { width: 100%; padding: 4px 8px; }
+/* The LUT picker: a menu plus a load button, sat above its own Mix slider. Its
+   own rule only so the pair reads as one control and the hint under a missing
+   LUT does not butt against the slider below it. */
+.lutpick .slabel > .seg { padding: 2px 8px; font-size: 11px; }
+.lutpick .hint { margin-top: 5px; }
+.lutpick { margin-bottom: 11px; }
 .slabel {
   display: flex; align-items: center; gap: 6px;
   margin-bottom: 3px; font-size: 12px;

@@ -12,19 +12,26 @@ Exits non-zero if any check fails.
 
 from __future__ import annotations
 
+import math
+import os
 import struct
 import sys
 import zlib
 from pathlib import Path
 
 import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from server import imageio as iio  # noqa: E402
 from server import params as P  # noqa: E402
 from server.engine import (  # noqa: E402
-    GrainEngine, _leak_anchor, _leak_sites, device_name, pick_device,
+    _MIN_CELL, _VARCELL_JITTER_LO, _VARCELL_JITTER_SPAN, _VARCELL_RINGS,
+    _VARCELL_TIE_MARGIN, _VARCELL_WARP_AMOUNT, _VARCELL_WARP_CELL_FRAC,
+    GrainEngine, RenderCancelled, _lat_span, _lattice_np, _leak_anchor,
+    _leak_sites, _smoothstep, _value_noise, _variable_cell_noise, device_name,
+    pick_device,
 )
 from tests.scene import patch as scene_patch  # noqa: E402
 from tests.scene import scene  # noqa: E402
@@ -186,8 +193,10 @@ def main() -> int:
         {x.key for x in P.PARAMS if x.spatial} == {
             "aa_radius",
             "dust_size", "edge_jitter", "edge_sand_grit", "edge_soften_radius",
-            "global_size", "grain_size", "hair_length", "halation_radius",
-            "highpass_radius", "leak_feather", "leak_size_max", "leak_size_min",
+            "global_size", "global_size_max", "grade_clarity_radius",
+            "grain_size", "hair_length",
+            "halation_radius", "highpass_radius", "leak_feather",
+            "leak_size_max", "leak_size_min",
             "micro_blur", "pre_blur", "pre_sharpen_radius",
             "scatter_cell", "scatter_radius",
             "scratch_width", "sharpen_radius"},
@@ -218,6 +227,271 @@ def main() -> int:
         "no count between 0 and 1", not dead,
         "all counts are 0 or a real number of marks" if not dead
         else ", ".join(f"{n}.{k}={x}" for n, k, x in dead),
+    )
+
+    # -- 3e. colour grading: the section above pre-blur -----------------------
+    # Five stages, and every one of them ships at 0 -- so the checks above,
+    # which render at the defaults, walk straight past all of it. Each of these
+    # switches one thing on and measures the specific property that would be
+    # silently wrong otherwise.
+    #
+    # The LUT ones are the sharp end. A 3D LUT is read by three coordinates into
+    # a volume, and *any* mix-up of those axes -- the storage order, the grid
+    # order, the sample alignment -- still produces a plausible-looking graded
+    # image. So the tables here are deliberately asymmetric and exactly linear:
+    # trilinear interpolation of a linear function is exact, which turns "did
+    # the LUT land right" from an eyeball question into an equality.
+    print("\ncolour grading (temperature, tone, clarity, 3D LUT)")
+    import torch  # noqa: E402
+
+    from server import lut as lutlib  # noqa: E402
+    from server.engine import _blur, _luma  # noqa: E402
+
+    def cube(fn) -> lutlib.Lut:
+        """A LUT built from ``fn(r, g, b) -> (R, G, B)`` over an 8-cube.
+
+        Stored ``[b][g][r]`` because that is what the .cube format's
+        red-varies-fastest ordering means after a C-order reshape.
+        """
+        n = 8
+        ax = np.linspace(0.0, 1.0, n, dtype=np.float32)
+        bb, gg, rr = np.meshgrid(ax, ax, ax, indexing="ij")
+        tab = np.stack(fn(rr, gg, bb), axis=-1).astype(np.float32)
+        return lutlib.Lut(id="t", name="t", size=n, table=np.ascontiguousarray(tab))
+
+    ident = cube(lambda r, g, b: (r, g, b))
+    # Output red = input blue, green = red, blue = green. Nothing about this
+    # survives a transposed axis or a half-cell misalignment.
+    rot = cube(lambda r, g, b: (b, r, g))
+
+    def graded(over: dict, im: np.ndarray, lut=None, ss: int = 1) -> np.ndarray:
+        p_ = P.sanitize({**{k: 0.0 for k in P.NEUTRAL_ZERO}, **over})
+        p_["lut"] = lut
+        return eng.render_image(im, p_, 1.0, tile=4096, supersample=ss)
+
+    # A mid-grey plate with pixel-scale-free structure and three distinct
+    # channels, so hue and local contrast are both measurable on it without
+    # anything clipping at either rail.
+    gy, gx = np.mgrid[0:192, 0:192].astype(np.float32)
+    pat = np.sin(gx / 3.0) * np.sin(gy / 3.4)
+    plate = np.stack([0.55, 0.45, 0.35], -1)[None, None, :] * np.ones(
+        (192, 192, 1), np.float32
+    ) * (1.0 + 0.2 * pat[..., None])
+    plate = np.ascontiguousarray(np.clip(plate, 0, 1).astype(np.float32))
+
+    o = graded({"lut_amount": 1.0}, plate, ident)
+    d = float(np.abs(o - plate).max())
+    check(
+        "an identity LUT is a pass-through", d < 1e-5,
+        f"max delta {d:.2e} (align_corners=False would shift the whole table)",
+    )
+
+    o = graded({"lut_amount": 1.0}, plate, rot)
+    want = plate[..., [2, 0, 1]]
+    d = float(np.abs(o - want).max())
+    check(
+        "LUT axes are (r, g, b) -> (W, H, D)", d < 1e-5,
+        f"a channel-rotating LUT rotates them, max delta {d:.2e}",
+    )
+
+    o = graded({"lut_amount": 0.5}, plate, rot)
+    half = plate + (want - plate) * 0.5
+    d = float(np.abs(o - half).max())
+    check("LUT mix is a straight cross-fade", d < 1e-5, f"at 0.5, max delta {d:.2e}")
+
+    o = graded({"lut_amount": 0.0}, plate, rot)
+    d = float(np.abs(o - plate).max())
+    check("mix 0 is bit-exactly off", d == 0.0, f"max delta {d:.2e}")
+
+    # A selected LUT with a nonzero mix has to defeat the neutral short-circuit,
+    # and a zero mix has to leave it intact -- that is what keeps the Original
+    # button bit-exact whether or not a LUT happens to be picked.
+    nz = P.sanitize({**{k: 0.0 for k in P.NEUTRAL_ZERO}, "lut_amount": 1.0})
+    z = P.sanitize({k: 0.0 for k in P.NEUTRAL_ZERO})
+    check(
+        "the mix is what is_neutral sees",
+        not P.is_neutral(nz) and P.is_neutral(z),
+        "mix 1 renders, mix 0 short-circuits",
+    )
+
+    # Temperature. Warm must move red up and blue down while leaving the *level*
+    # alone -- a white balance that also exposes the frame is fighting every
+    # tonal control below it.
+    warm = graded({"grade_temp": 1.0}, plate)
+    cool = graded({"grade_temp": -1.0}, plate)
+    lum0 = float((plate * np.array([0.2126, 0.7152, 0.0722], np.float32)).sum(-1).mean())
+    lw = float((warm * np.array([0.2126, 0.7152, 0.0722], np.float32)).sum(-1).mean())
+    lc = float((cool * np.array([0.2126, 0.7152, 0.0722], np.float32)).sum(-1).mean())
+    check(
+        "temperature moves red against blue",
+        warm[..., 0].mean() > plate[..., 0].mean()
+        and warm[..., 2].mean() < plate[..., 2].mean()
+        and cool[..., 0].mean() < plate[..., 0].mean()
+        and cool[..., 2].mean() > plate[..., 2].mean(),
+        f"warm R {plate[..., 0].mean():.3f}->{warm[..., 0].mean():.3f}, "
+        f"B {plate[..., 2].mean():.3f}->{warm[..., 2].mean():.3f}",
+    )
+    check(
+        "temperature holds the level",
+        abs(lw / lum0 - 1.0) < 0.02 and abs(lc / lum0 - 1.0) < 0.02,
+        f"luma {lum0:.4f} -> {lw:.4f} warm, {lc:.4f} cool "
+        f"({100 * (lw / lum0 - 1):+.1f}% / {100 * (lc / lum0 - 1):+.1f}%)",
+    )
+
+    # Shadows and highlights. Two properties: each end only moves its own end,
+    # and neither can leave the cube at any setting -- the lift is a share of
+    # the headroom that is there, not an addition that then needs a clamp.
+    ramp = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+    ramp = np.repeat(np.repeat(ramp[None, :, None], 32, 0), 3, 2)
+    ramp = np.ascontiguousarray(ramp)
+    lo_i, hi_i = slice(0, 40), slice(216, 256)
+    worst = 0.0
+    for a in (-1.0, -0.5, 0.5, 1.0):
+        for k in ("grade_shadows", "grade_highlights"):
+            r_ = graded({k: a}, ramp)
+            worst = max(worst, float(r_.min() * -1.0), float(r_.max() - 1.0))
+    check(
+        "tone lifts cannot clip", worst <= 1e-6,
+        f"worst excursion outside 0..1 over 8 settings: {worst:.2e}",
+    )
+    s_up = graded({"grade_shadows": 1.0}, ramp)
+    h_dn = graded({"grade_highlights": -1.0}, ramp)
+    ds_lo = float((s_up[:, lo_i] - ramp[:, lo_i]).mean())
+    ds_hi = float((s_up[:, hi_i] - ramp[:, hi_i]).mean())
+    dh_hi = float((h_dn[:, hi_i] - ramp[:, hi_i]).mean())
+    dh_lo = float((h_dn[:, lo_i] - ramp[:, lo_i]).mean())
+    check(
+        "each end keys on its own end",
+        ds_lo > 0.15 and abs(ds_hi) < 0.02 and dh_hi < -0.15 and abs(dh_lo) < 0.02,
+        f"shadows +1: {ds_lo:+.3f} low / {ds_hi:+.3f} high; "
+        f"highlights -1: {dh_lo:+.3f} low / {dh_hi:+.3f} high",
+    )
+
+    # Clarity. The band is measured at the stage's own radius, so the metric
+    # has to use the same kernel the stage does or it is measuring something
+    # else.
+    def band(a: np.ndarray, r: float) -> np.ndarray:
+        t = torch.from_numpy(np.ascontiguousarray(a)).permute(2, 0, 1).unsqueeze(0)
+        lm = _luma(t)
+        return (lm - _blur(lm, r)).squeeze().numpy()
+
+    CR = 6.0
+    b0 = band(plate, CR)
+    e0 = float(b0.std())
+    ladder = []
+    for cl in (-1.0, -0.5, 0.5, 1.0):
+        oc = graded({"grade_clarity": cl, "grade_clarity_radius": CR}, plate)
+        bc = band(oc, CR)
+        ladder.append((cl, float(bc.std()) / e0, float(np.mean(bc * b0) / (e0 * e0))))
+    check(
+        "clarity is two-way and monotonic",
+        all(ladder[i][1] < ladder[i + 1][1] for i in range(len(ladder) - 1))
+        and ladder[0][1] < 0.1 and ladder[-1][1] > 1.5,
+        ", ".join(f"{c:+.1f} -> {s * 100:.0f}%" for c, s, _ in ladder),
+    )
+    check(
+        "negative clarity flattens, never inverts",
+        all(corr > -0.02 for _, _, corr in ladder),
+        f"band correlation with the source at -1 is {ladder[0][2]:+.3f} "
+        "(a negative number would be reversed halos)",
+    )
+    # Clarity adds one signed luminance value to all three channels, so the
+    # channel *differences* -- which is what hue is -- come through untouched.
+    oc = graded({"grade_clarity": 1.0, "grade_clarity_radius": CR}, plate)
+    dif0 = np.stack([plate[..., 0] - plate[..., 1], plate[..., 1] - plate[..., 2]], -1)
+    dif1 = np.stack([oc[..., 0] - oc[..., 1], oc[..., 1] - oc[..., 2]], -1)
+    d = float(np.abs(dif0 - dif1).max())
+    check(
+        "clarity holds hue exactly", d < 1e-6,
+        f"channel differences move by {d:.2e}",
+    )
+
+    # pad_for has to know about the one kernel in this section. Everything else
+    # here is per-pixel and must reserve nothing.
+    pad_off = eng.pad_for(P.sanitize({k: 0.0 for k in P.NEUTRAL_ZERO}), 1.0)
+    pad_cl = eng.pad_for(
+        P.sanitize({**{k: 0.0 for k in P.NEUTRAL_ZERO},
+                    "grade_clarity": 1.0, "grade_clarity_radius": 40.0}), 1.0)
+    pad_rest = eng.pad_for(
+        P.sanitize({**{k: 0.0 for k in P.NEUTRAL_ZERO}, "grade_temp": 1.0,
+                    "grade_shadows": 1.0, "grade_highlights": -1.0,
+                    "lut_amount": 1.0}), 1.0)
+    check(
+        "pad_for reserves for clarity and nothing else here",
+        pad_cl >= pad_off + 3 * 40 and pad_rest == pad_off,
+        f"{pad_off}px off, {pad_cl}px at 40px clarity, {pad_rest}px with the "
+        "per-pixel stages on",
+    )
+
+    # And the seam check that all of that is for: the whole section on, at
+    # default everything else, tiled against a single pass.
+    cg_all = P.sanitize({
+        "grade_temp": 0.5, "grade_shadows": 0.35, "grade_highlights": -0.4,
+        "grade_clarity": 0.8, "grade_clarity_radius": 24.0, "lut_amount": 1.0,
+    })
+    cg_all["lut"] = rot
+    a = eng.render_image(img, cg_all, 1.0, tile=4096, supersample=2)
+    b = eng.render_image(img, cg_all, 1.0, tile=128, supersample=2)
+    d = float(np.abs(a - b).max())
+    check("no seam from colour grading", d < 2e-3, f"max delta {d:.2e}")
+
+    # Scale invariance: clarity is a length, so the proxy and the export have to
+    # agree about *the picture* -- the same relative band energy at half scale.
+    def clar_ratio(sc: float) -> float:
+        im = np.ascontiguousarray(iio.downscale(plate, sc)) if sc < 1 else plate
+        pc = {"grade_clarity": 1.0, "grade_clarity_radius": CR}
+        on = graded(pc, im) if sc >= 1 else eng.render_image(
+            im, {**P.sanitize({**{k: 0.0 for k in P.NEUTRAL_ZERO}, **pc}),
+                 "lut": None}, sc, tile=4096, supersample=1)
+        return float(band(on, CR * sc).std() / max(band(im, CR * sc).std(), 1e-9))
+
+    r1, r2 = clar_ratio(1.0), clar_ratio(0.5)
+    check(
+        "clarity is scale-invariant", abs(r2 / r1 - 1.0) < 0.12,
+        f"band gain {r1:.2f}x at 1:1 vs {r2:.2f}x at half scale",
+    )
+
+    # -- 3f. .cube parsing ----------------------------------------------------
+    print("\n.cube parsing (header keywords, comments, storage order)")
+    txt = (
+        "# a comment\nTITLE \"t\"\nVENDOR_JUNK 3\n\nDOMAIN_MIN 0 0 0\n"
+        "DOMAIN_MAX 1 1 1\nLUT_3D_SIZE 2\n\n"
+        # red fastest, then green, then blue -- 8 entries. Each entry is tagged
+        # with its own (r, g, b) index so a transposed reshape cannot pass.
+        "0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n"
+    )
+    pl = lutlib.parse_cube(txt, "t", "t", "folder")
+    ok = pl.size == 2 and all(
+        abs(pl.table[bi, gi, ri, c] - v) < 1e-6
+        for bi in (0, 1) for gi in (0, 1) for ri in (0, 1)
+        for c, v in enumerate((ri, gi, bi))
+    )
+    check("red varies fastest", ok, f"size {pl.size}, table indexed [b][g][r]")
+
+    bad = 0
+    for probe, why in (
+        ("LUT_1D_SIZE 4\n0 0 0\n", "1D"),
+        ("LUT_3D_SIZE 2\n0 0 0\n1 0 0\n", "truncated"),
+        ("TITLE \"x\"\n0 0 0\n", "no size"),
+    ):
+        try:
+            lutlib.parse_cube(probe, "p", "p", "folder")
+        except lutlib.LutError:
+            bad += 1
+    check("bad files are refused with a reason", bad == 3, f"{bad}/3 rejected")
+
+    shipped = lutlib.list_luts()
+    loaded = [(x["name"], lutlib.get(x["id"])) for x in shipped]
+    check(
+        "every LUT in luts/ loads",
+        bool(loaded) and all(l is not None for _, l in loaded),
+        ", ".join(f"{n} ({l.size}^3)" if l else f"{n} FAILED" for n, l in loaded)
+        or "none present",
+    )
+    check(
+        "a path cannot escape the LUT folder",
+        lutlib.get("../presets/Stock") is None and lutlib.get("..") is None,
+        "traversal attempts resolve to no LUT",
     )
 
     # -- 4. luminance response peaks in the 15-65% band ----------------------
@@ -358,6 +632,119 @@ def main() -> int:
                                          "global_chroma": 1.0}), 1.0, tile=1024)
     d = float(np.abs(a.astype(float) - b.astype(float)).max())
     check("inert with the global layer off", d == 0.0, f"max delta {d:.2e}")
+
+    # -- 5b-i-b. global size variation: independently-sized clumps ------------
+    # `global_size_max` swaps the whole construction, from `_fbm` (one size for
+    # every clump) to `_variable_cell_noise` (each clump draws its own size
+    # between Min and Max) -- so most of what has to be pinned here is the
+    # backward-compatibility boundary between the two, plus two failure modes
+    # discovered and fixed while building the replacement.
+    print("\nglobal size variation (independently-sized clumps)")
+    gv_grey = np.full((400, 560, 3), 0.5, dtype=np.float32)
+
+    def gv_render(lo: float, hi: float, smooth: float = 0.0,
+                  im: np.ndarray = gv_grey, tile: int = 1024) -> np.ndarray:
+        over = {k: 0.0 for k in P.NEUTRAL_ZERO}
+        over.update({"global_intensity": 40.0, "global_size": lo,
+                     "global_size_max": hi, "global_opacity": 1.0,
+                     "global_smooth": smooth})
+        return eng.render_image(im, P.sanitize(over), 1.0, tile=tile,
+                                supersample=1).astype(np.float64) - 0.5
+
+    # At or below Min this must be the exact old field -- every shipped preset
+    # (none of which set global_size_max) sanitizes to Max == Min and has to
+    # keep rendering bit-for-bit what it always has.
+    a = gv_render(4.0, 4.0)
+    b = gv_render(4.0, 3.5)  # Max below Min -- clamped up to Min, not swapped
+    check("max at or below min is the exact old field",
+          float(np.abs(a - b).max()) == 0.0, "max delta 0.00e+00 required")
+    # The clamp is up, never a swap: raising Min alone, with Max left at its
+    # own untouched default, must never cross into the variable construction
+    # just because the default happens to be smaller than the new Min.
+    c = eng.render_image(gv_grey, P.sanitize({k: 0.0 for k in P.NEUTRAL_ZERO}
+                         | {"global_intensity": 40.0, "global_size": 9.0,
+                            "global_opacity": 1.0}), 1.0, tile=1024, supersample=1)
+    d = eng.render_image(gv_grey, P.sanitize({k: 0.0 for k in P.NEUTRAL_ZERO}
+                         | {"global_intensity": 40.0, "global_size": 9.0,
+                            "global_size_max": 1.6, "global_opacity": 1.0}),
+                         1.0, tile=1024, supersample=1)
+    check("raising min alone cannot cross into the variable field",
+          float(np.abs(c.astype(float) - d.astype(float)).max()) == 0.0,
+          "max delta 0.00e+00 required")
+
+    # Above min the field has to actually be a different thing, not a
+    # cosmetic nudge -- measured against the fixed-size field at the same Min.
+    var = gv_render(4.0, 14.0)
+    check("above min the field visibly changes character",
+          float(np.abs(a - var).max()) > 0.05,
+          f"max delta {float(np.abs(a - var).max()):.3f}")
+
+    # Coverage gaps are the honest consequence of a wide min-max range, not a
+    # bug -- but the frame's mean must stay unbiased regardless of how wide the
+    # gaps get. A first version failed this: gaps read as the raw field's zero
+    # rather than its neutral 0.5, which after the shared *2-1 remap put every
+    # gap at the fully negative rail -- a frame-wide dark cast, not "nothing
+    # here". Swept from a narrow to a very wide range.
+    for hi in (4.0, 10.0, 18.0):
+        v = gv_render(1.0, hi)
+        check(f"gaps stay neutral at max={hi:.0f}", abs(v.mean()) < 0.01,
+              f"frame mean {v.mean():+.4f}")
+
+    # The resonance: when the effective cell lands on an exact integer number
+    # of working pixels, the pixel grid and the point lattice used to phase-
+    # lock, capping the field's own amplitude well below what a neighbouring,
+    # non-integer size reaches -- a dead zone sitting exactly where a user's
+    # slider is likeliest to land. Regression-tested directly against the
+    # construction, not through the full pipeline, so the check pins the
+    # actual mechanism rather than a render that merely happens to look fine.
+    from server.engine import _variable_cell_noise  # noqa: E402
+    import torch  # noqa: E402
+
+    def gv_std(cell: float) -> float:
+        f = _variable_cell_noise(500, 500, 0, 0, cell, cell, 555,
+                                 torch.device("cpu"), 1)
+        return float((f - 0.5).std())
+
+    baseline = gv_std(1.6)
+    resonant = gv_std(1.0)
+    check("exact-integer cell size is not a dead zone",
+          abs(resonant - baseline) < 0.08 * baseline,
+          f"std {resonant:.4f} at cell 1.0 vs {baseline:.4f} at cell 1.6 "
+          f"({resonant / baseline * 100:.0f}%)")
+
+    # Tile independence, the invariant this whole construction is riskiest
+    # against: it reads lattice cells beyond a pixel's own (pad_for has to
+    # cover that reach) and picks a winner by nearest falloff (a boundary
+    # decision that a first version left sensitive to which bit the coordinate
+    # arithmetic happened to round to differently between tile layouts).
+    # Checked at the exact resonant size, with smoothing on top of it, since
+    # both were where the two bugs actually showed up.
+    gv_scene = np.ascontiguousarray(
+        (np.random.RandomState(9).rand(320, 480, 3) * 0.5 + 0.25).astype(np.float32)
+    )
+    for lo, hi, smooth, tile in (
+        (0.4, 1.0, 0.0, 64), (1.0, 2.0, 0.6, 64), (0.8, 20.0, 1.0, 96),
+    ):
+        p = P.sanitize({"global_intensity": 40, "global_size": lo,
+                        "global_size_max": hi, "global_opacity": 1.0,
+                        "global_smooth": smooth})
+        wide = eng.render_image(gv_scene, p, 1.0, tile=4096, supersample=1)
+        narrow = eng.render_image(gv_scene, p, 1.0, tile=tile, supersample=1)
+        d = float(np.abs(wide.astype(float) - narrow.astype(float)).max())
+        check(f"tile independence (min={lo}, max={hi}, smooth={smooth})",
+              d < 2e-3, f"max delta {d:.2e}")
+
+    # Chroma shares the construction (see `_global_field`), so a colour variant
+    # of the variable field must still decorrelate the channels.
+    over = {k: 0.0 for k in P.NEUTRAL_ZERO}
+    over.update({"global_intensity": 40.0, "global_size": 4.0,
+                 "global_size_max": 14.0, "global_opacity": 1.0,
+                 "global_chroma": 1.0})
+    gcv = eng.render_image(gv_grey, P.sanitize(over), 1.0, tile=1024,
+                           supersample=1).astype(np.float64) - 0.5
+    spread = float(np.abs(gcv[:, :, 0] - gcv[:, :, 1]).max())
+    check("chroma still decorrelates the variable field", spread > 0.05,
+          f"max channel spread {spread:.3f}")
 
     # -- 5b-ii. master opacity: a cross-fade over the untouched source --------
     # The two ends have to be *bit* exact, not close. Opacity 0 is a second
@@ -1832,6 +2219,265 @@ def main() -> int:
     check("no seam from film texture", m < 1e-5, f"mean delta {m:.2e}")
 
     # -- 6. 16-bit PNG export is genuinely 16-bit ----------------------------
+    # -- performance rewrites: every one of these must be bit-exact -----------
+    #
+    # These four changes exist purely to make the render faster and are only
+    # correct if they change nothing at all. Each is checked against a reference
+    # implementation of the code it replaced rather than against a tolerance,
+    # because "close enough" is not the contract -- a re-rolled noise field would
+    # silently restyle every preset.
+    print("\nperformance rewrites are bit-exact")
+
+    # `_lattice_np` moved from numpy uint64 to torch int64 for the threading.
+    # torch has no uint64, so the logical right shift is emulated; a wrong mask
+    # produces something that still looks like noise, which is exactly why this
+    # is an equality check and not a render comparison.
+    def lattice_ref(iy0, ix0, hl, wl, seed, nfields):
+        yy = np.arange(iy0, iy0 + hl, dtype=np.int64).view(np.uint64)[:, None]
+        xx = np.arange(ix0, ix0 + wl, dtype=np.int64).view(np.uint64)[None, :]
+        out = np.empty((nfields, hl, wl), dtype=np.float32)
+        for f in range(nfields):
+            s = np.uint64(((seed + f * 7919) * 0x165667B19E3779F9) % (1 << 64))
+            n = (xx * np.uint64(0x9E3779B97F4A7C15)
+                 + yy * np.uint64(0xC2B2AE3D27D4EB4F))
+            n = n + s
+            n = n ^ (n >> np.uint64(29))
+            n = n * np.uint64(0xBF58476D1CE4E5B9)
+            n = n ^ (n >> np.uint64(32))
+            n = n * np.uint64(0x94D049BB133111EB)
+            n = n ^ (n >> np.uint64(31))
+            out[f] = (n >> np.uint64(40)).astype(np.float32) / float(1 << 24)
+        return out
+
+    lat_bad = 0
+    lat_n = 0
+    for nf in (1, 2, 3, 4, 6):
+        for iy0, ix0 in ((0, 0), (-1, -1), (-7, 13), (-3841, -2), (5000, 9999)):
+            for hl, wl in ((1, 1), (2, 3), (17, 29), (64, 64)):
+                for seed in (0, 1, 7717, 3391, 4241, 2 ** 31 - 1):
+                    lat_n += 1
+                    if not np.array_equal(
+                        _lattice_np(iy0, ix0, hl, wl, seed, nf),
+                        lattice_ref(iy0, ix0, hl, wl, seed, nf),
+                    ):
+                        lat_bad += 1
+    check("the torch lattice hash equals the numpy one", lat_bad == 0,
+          f"{lat_n} windows, {lat_bad} differ (negative origins included)")
+
+    # `_lat_span` replaced four `float(<device tensor>)` reads per noise call
+    # with Python arithmetic. It has to agree with the device path *exactly*: a
+    # float64 version would occasionally land the other side of an integer
+    # boundary and select a different lattice window, which is a different field.
+    def span_ref(n, origin, cell, pad_lo, pad_hi):
+        t = (torch.arange(n, device=dev, dtype=torch.float32)
+             + float(origin)) / cell
+        i0 = int(math.floor(float(t[0]))) - pad_lo
+        return i0, int(math.floor(float(t[-1]))) + pad_hi - i0 + 1
+
+    span_bad = 0
+    span_n = 0
+    for cell in (0.8, 1.0, 1.6, 2.0, 2.22, 3.2, 6.0, 110.0, 900.0):
+        for pl, ph in ((1, 2), (0, 0), (2, 2)):
+            for n in (1, 17, 512, 1536, 3072, 4800):
+                for origin in (0.0, 1.0, 7.0, 13.0, 178.0, 1023.0, 4096.0):
+                    span_n += 1
+                    if _lat_span(n, origin, cell, pl, ph) != span_ref(
+                        n, origin, cell, pl, ph
+                    ):
+                        span_bad += 1
+    check("lattice bounds computed in Python match the device ramp",
+          span_bad == 0, f"{span_n} cases, {span_bad} differ")
+
+    # `_variable_cell_noise` now carries the winning *cell* through the 25-cell
+    # search and gathers brightness once at the end, instead of rewriting
+    # nfields full-frame planes on every iteration. Same candidates, same order,
+    # same tie margin, so the same point must win.
+    def varcell_ref(h, w, y0, x0, lo, hi, seed, device, nfields=1):
+        rings = _VARCELL_RINGS
+        cell = hi
+        iy0, hl = _lat_span(h, y0, cell, rings, rings)
+        ix0, wl = _lat_span(w, x0, cell, rings, rings)
+        lat = torch.from_numpy(
+            _lattice_np(iy0, ix0, hl, wl, seed, 3 + nfields)
+        ).to(device)
+        jy = _VARCELL_JITTER_LO + _VARCELL_JITTER_SPAN * lat[0]
+        jx = _VARCELL_JITTER_LO + _VARCELL_JITTER_SPAN * lat[1]
+        rad = lo + lat[2] * (hi - lo)
+        bri = lat[3:] * 2.0 - 1.0
+        ciy = torch.arange(iy0, iy0 + hl, device=device, dtype=torch.float32)[:, None]
+        cix = torch.arange(ix0, ix0 + wl, device=device, dtype=torch.float32)[None, :]
+        py, px = (ciy + jy) * cell, (cix + jx) * cell
+        Y = (torch.arange(h, device=device, dtype=torch.float32) + float(y0))[:, None]
+        X = (torch.arange(w, device=device, dtype=torch.float32) + float(x0))[None, :]
+        piy = (torch.floor(Y / cell).long() - iy0).clamp(0, hl - 1)
+        pix = (torch.floor(X / cell).long() - ix0).clamp(0, wl - 1)
+        wc = max(_MIN_CELL, _VARCELL_WARP_CELL_FRAC * cell)
+        wn = _value_noise(h, w, y0, x0, wc, seed + 51, 2, device)
+        Yw = Y + (wn[0, 0] * 2.0 - 1.0) * (_VARCELL_WARP_AMOUNT * cell)
+        Xw = X + (wn[0, 1] * 2.0 - 1.0) * (_VARCELL_WARP_AMOUNT * cell)
+        bs = torch.zeros(h, w, device=device)
+        bb = torch.zeros(nfields, h, w, device=device)
+        for dy in range(-rings, rings + 1):
+            for dx in range(-rings, rings + 1):
+                ny = (piy + dy).clamp(0, hl - 1)
+                nx = (pix + dx).clamp(0, wl - 1)
+                dxp, dyp = Xw - px[ny, nx], Yw - py[ny, nx]
+                dn = torch.sqrt(dxp * dxp + dyp * dyp) / rad[ny, nx].clamp_min(1e-3)
+                sh = 1.0 - _smoothstep(0.0, 1.0, dn)
+                win = sh > bs + _VARCELL_TIE_MARGIN
+                bb = torch.where(win.unsqueeze(0), bri[:, ny, nx], bb)
+                bs = torch.where(win, sh, bs)
+        return (0.5 + 0.5 * bs.unsqueeze(0) * bb).unsqueeze(0)
+
+    vc_worst = 0.0
+    # Integer and non-integer cells both, since the integer case is the
+    # pixel-grid resonance the domain warp exists to break.
+    for h_, w_, nf, lo_, hi_, oy, ox in (
+        (256, 256, 1, 1.0, 3.0, 0.0, 0.0),
+        (256, 256, 3, 1.0, 3.0, 17.0, 29.0),
+        (192, 288, 3, 2.0, 6.0, 101.0, 7.0),
+        (160, 160, 3, 0.8, 1.0, 5.0, 11.0),
+        (160, 160, 3, 1.0, 2.0, 0.0, 0.0),
+    ):
+        d = float((
+            _variable_cell_noise(h_, w_, oy, ox, lo_, hi_, 7717, dev, nf)
+            - varcell_ref(h_, w_, oy, ox, lo_, hi_, 7717, dev, nf)
+        ).abs().max())
+        vc_worst = max(vc_worst, d)
+    check("the variable-cell restructure changes nothing", vc_worst == 0.0,
+          f"worst deviation {vc_worst:.2e} over 5 configurations")
+
+    # -- the Global Grain texture cache --------------------------------------
+    #
+    # The one failure mode here is a key that misses an input, and it fails
+    # *silently*: a stale hit renders a perfectly plausible texture that happens
+    # to be the previous one. So this tests it as a cache -- which parameters
+    # miss, and whether reverting one returns the original bytes -- rather than
+    # only checking that some render looks right.
+    print("\nGlobal Grain texture cache (a stale hit is invisible, so test the cache)")
+    gg_eng = GrainEngine(dev)
+    gp = P.sanitize({
+        "global_intensity": 12.0, "global_opacity": 0.8, "global_size": 1.6,
+        "global_size_max": 4.0, "global_chroma": 0.6, "global_smooth": 0.3,
+        "intensity": 0.0, "halation": 0.0, "micro_blur": 0.0,
+    })
+    gimg = scene(220, 300)
+
+    def gg_render(pp):
+        return gg_eng.render_image(pp and pp, pp, 1.0, tile=4096, supersample=1)
+
+    gg_eng.clear_caches()
+    cold = gg_eng.render_image(gimg, gp, 1.0, tile=4096, supersample=1)
+    m_after_cold = gg_eng.gg_misses
+    warm = gg_eng.render_image(gimg, gp, 1.0, tile=4096, supersample=1)
+    check("a warm cache returns the identical frame",
+          float(np.abs(cold - warm).max()) == 0.0
+          and gg_eng.gg_misses == m_after_cold,
+          f"maxdiff {float(np.abs(cold - warm).max()):.2e}, "
+          f"{gg_eng.gg_misses - m_after_cold} further misses")
+
+    # Every input the field is built from must miss, must change the frame, and
+    # must come back bit-exact when reverted.
+    for key, delta in (("seed", 1.0), ("global_size", 0.6),
+                       ("global_size_max", 2.0), ("global_smooth", 0.4),
+                       ("global_chroma", -0.5)):
+        q = P.sanitize({**gp, key: gp[key] + delta})
+        before = gg_eng.gg_misses
+        other = gg_eng.render_image(gimg, q, 1.0, tile=4096, supersample=1)
+        missed = gg_eng.gg_misses > before
+        moved = float(np.abs(other - cold).max())
+        back = gg_eng.render_image(gimg, gp, 1.0, tile=4096, supersample=1)
+        exact = float(np.abs(back - cold).max()) == 0.0
+        check(f"{key} invalidates the cache", missed and moved > 1e-6 and exact,
+              f"missed={missed} moved {moved:.2e} revert bit-exact={exact}")
+
+    # The two amplitude sliders are applied outside the cached field, which is
+    # the whole reason this cache is worth having: they are what a user drags.
+    for key, delta in (("global_intensity", 6.0), ("global_opacity", -0.3)):
+        q = P.sanitize({**gp, key: gp[key] + delta})
+        before = gg_eng.gg_misses
+        other = gg_eng.render_image(gimg, q, 1.0, tile=4096, supersample=1)
+        moved = float(np.abs(other - cold).max())
+        check(f"{key} reuses the cached texture",
+              gg_eng.gg_misses == before and moved > 1e-6,
+              f"misses={gg_eng.gg_misses - before} (want 0), moved {moved:.2e}")
+
+    # Tile independence again, but with the cache *warm* -- the key carries
+    # absolute (y0, x0), so a tiled render must not be able to pick up a
+    # neighbouring tile's texture.
+    a = gg_eng.render_image(gimg, gp, 1.0, tile=4096, supersample=1)
+    b = gg_eng.render_image(gimg, gp, 1.0, tile=96, supersample=1)
+    d = float(np.abs(a - b).max())
+    check("the cache is keyed on absolute coordinates", d < 2e-3,
+          f"tiled vs whole-image, warm cache: {d:.2e}")
+
+    # -- tile size is chosen, not fixed --------------------------------------
+    #
+    # `tile_for` now derives the tile from a memory budget, so the renderer sees
+    # sizes nobody hard-coded. Tile independence is what makes that safe, and it
+    # is only safe if it holds at whatever size the budget picks.
+    print("\ntile size is derived from a memory budget")
+    # Explicit fresh parameter sets rather than reusing `p`, which earlier
+    # sections rebind -- these checks compare *pads*, so they must not inherit
+    # whatever the previous section left behind.
+    narrow = P.sanitize(None)
+    ref = eng.render_image(img, narrow, 1.0, tile=4096, supersample=2)
+    worst = 0.0
+    for tile in (256, 384, 512, 1024):
+        d = float(np.abs(
+            eng.render_image(img, narrow, 1.0, tile=tile, supersample=2) - ref
+        ).max())
+        worst = max(worst, d)
+    check("any tile size gives the same picture", worst < 2e-3,
+          f"worst deviation {worst:.2e} over tiles 256-1024 vs single-pass")
+
+    hi_tile = eng.tile_for(narrow, 1.0, 4000, 6000, 2)
+    _prev = os.environ.get("FILM_GRAIN_TILE_BUDGET_GB")
+    os.environ["FILM_GRAIN_TILE_BUDGET_GB"] = "2"
+    lo_tile = eng.tile_for(narrow, 1.0, 4000, 6000, 2)
+    if _prev is None:
+        os.environ.pop("FILM_GRAIN_TILE_BUDGET_GB", None)
+    else:
+        os.environ["FILM_GRAIN_TILE_BUDGET_GB"] = _prev
+    check("a smaller budget picks a smaller tile", lo_tile < hi_tile,
+          f"{hi_tile}px at this machine's budget, {lo_tile}px at 2GB")
+    # A wider kernel pads more, so it must get a *smaller* tile for the same
+    # budget -- that coupling is the point, and the old constants had none. The
+    # search steps in 128px increments, so this needs a pad difference wider than
+    # that to show; halation at full radius is 276px against the default 108px.
+    wide = P.sanitize({"halation": 1.0, "halation_radius": 400.0})
+    wide_tile = eng.tile_for(wide, 1.0, 4000, 6000, 2)
+    check("a wider kernel gets a smaller tile", wide_tile < hi_tile,
+          f"pad {eng.pad_for(wide, 1.0)}px -> tile {wide_tile}px, against pad "
+          f"{eng.pad_for(narrow, 1.0)}px -> {hi_tile}px")
+
+    # -- a superseded render stops ------------------------------------------
+    print("\nsuperseded renders stop instead of running to completion")
+    polls: list[int] = []
+
+    def cancel_on(nth):
+        def f():
+            polls.append(1)
+            return len(polls) > nth
+        return f
+
+    cancelled = True
+    try:
+        eng.render_image(img, p, 1.0, tile=128, supersample=1,
+                         should_cancel=cancel_on(2))
+        cancelled = False
+    except RenderCancelled:
+        pass
+    check("cancellation raises rather than returning a partial frame",
+          cancelled, f"stopped after {len(polls)} polls")
+    polls.clear()
+    never = eng.render_image(img, p, 1.0, tile=128, supersample=1,
+                             should_cancel=lambda: False)
+    plain = eng.render_image(img, p, 1.0, tile=128, supersample=1)
+    check("a hook that never fires costs nothing",
+          float(np.abs(never - plain).max()) == 0.0,
+          f"maxdiff {float(np.abs(never - plain).max()):.2e}")
+
     print("\n16-bit PNG writer (Pillow cannot write these; we emit them by hand)")
     small = np.random.default_rng(0).random((37, 53, 3)).astype(np.float32)
     blob = iio.encode(small, "png16")

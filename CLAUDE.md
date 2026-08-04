@@ -16,12 +16,20 @@ Working and verified end to end as of 2026-07-31.
 **In scope — the point of the app:** detail destruction, edge softening and
 edge noising, grain, halation, chromatic edge fringing.
 
-**Deferred — the user has a separate project planned:** colour grading in
-general. `vibrance` and `brightness` were added on request 2026-07-31 and
+**In scope as of 2026-08-04:** a `Colour Grading` section at the very top of the
+pipeline — 3D LUTs plus temperature, shadows, highlights and a two-way clarity.
+Requested outright, so the "colour grading is deferred" note below no longer
+covers this one section. Everything in it still ships at 0, so the colour
+pass-through holds with nothing selected. See its own section further down.
+
+**Deferred — the user has a separate project planned:** colour grading
+*elsewhere in the pipeline*. `vibrance` and `brightness` were added on request
+2026-07-31 and
 ship at 0 like the rest, so the pass-through still holds. The engine implements tone curves, contrast, toe/shoulder, split
 toning, highlight desaturation and base fog, and exposes them as sliders, but
 they **ship neutral (0)** so the pipeline is a colour pass-through. Do not tune
-them or fold them into presets without asking.
+them or fold them into presets without asking. The `Tone Response` group is
+still the deferred one; `Colour Grading` is not.
 
 **Quality beats speed.** The user has explicitly accepted lag and latency. Do
 not clamp octaves, lattice density, blur radii, supersampling or preview
@@ -38,12 +46,14 @@ including a section correcting three claims that did not survive implementation.
 server/params.py    parameter schema -- SINGLE SOURCE OF TRUTH for engine + UI
 server/engine.py    the pipeline (module docstring states the invariants)
 server/imageio.py   decode/encode, incl. a hand-written 16-bit RGB PNG encoder
+server/lut.py       .cube 3D LUT parsing + registry (folder and uploads)
 server/main.py      FastAPI service
 web/src/App.tsx     UI; slider panel generated from GET /api/params
 web/src/api.ts      typed client
 tests/verify.py     engine invariant checks -- run after touching engine.py
 tests/scene.py      synthetic test scene
 presets/            preset library -- files, not code; see below
+luts/               3D LUTs -- files, not code; same idea as presets/
 run.sh / dev.sh     production from source / hot-reload dev
 build.sh            compiles a distribution into build/
 ```
@@ -93,12 +103,28 @@ exports are wrong.
 
 `pipenv run python tests/verify.py` checks both, plus zoom fidelity, colour
 pass-through, luminance response, edge bias, the smooth-area guard, 16-bit PNG
-validity, the global-grain overlay with its smoothing and its chroma,
-anti-aliasing, the pre-blur, edge softening, edge jitter and its direction bias,
-edge sanding, scatter, output sharpening, the master opacity cross-fade and the
-film-texture section — 158 checks. It exits non-zero on failure.
+validity, the global-grain overlay with its smoothing, its chroma and its
+independently-sized-clump construction, anti-aliasing, the pre-blur, edge
+softening, edge jitter and its direction bias, edge sanding, scatter, output
+sharpening, the master opacity cross-fade, the colour-grading section with its
+3D LUT lookup and `.cube` parsing, and the film-texture section — 205
+checks. It exits non-zero on failure.
 
-The global-grain, anti-aliasing, pre-blur, edge-softening, edge-sanding,
+Seventeen of those are the 2026-08-04 performance work, and they are a different
+*kind* of check worth knowing about: rather than measuring a property, they assert
+**bit-equality against a reference implementation of the code that was replaced**
+(`lattice_ref`, `span_ref`, `varcell_ref`, all inline in `verify.py`). A faster
+rewrite of a noise generator is only correct if it changes nothing, and "the
+render still looks like grain" cannot tell you that. Keep the references when
+touching those functions — deleting them turns the checks into tautologies.
+
+The Global Grain cache checks are the same idea from the other direction: a stale
+cache hit renders a perfectly plausible texture, so they test *which parameters
+miss* via a hit counter (`GrainEngine.gg_hits` / `gg_misses`) rather than only
+that the output is right.
+
+The global-grain, colour-grading, anti-aliasing, pre-blur, edge-softening,
+edge-sanding,
 scatter and sharpening checks exist because those stages ship at 0, so the
 default-parameter checks render straight past them. Each re-runs tile independence with its stage switched on:
 they all add work `pad_for` has to cover, and a kernel missing from `pad_for`
@@ -121,10 +147,17 @@ browser does all the scaling.
 `full` picks the fidelity, and it is the only difference between the two:
 
 * `false` (default) — the working proxy, `PROXY_LONG_EDGE = 2400`. This is what
-  every slider change triggers. **~1.25s on a 24MP source**, 5MB.
+  every slider change triggers. At *parameter defaults* it is a few hundred ms;
+  what it actually costs depends almost entirely on the preset — see the
+  performance section, where `Stock` measures 8.8× defaults.
 * `true` — the whole source at scale 1.0. The preview *is* the export at this
-  point. **~9.5s on 24MP**, 32MB. Only ever fired by the explicit
-  "Render 1:1" button; any parameter change drops back to the proxy.
+  point. Only ever fired by the explicit "Render 1:1" button; any parameter
+  change drops back to the proxy.
+
+Payload is a **JPEG q95 4:4:4** (`imageio.encode_preview`), not the PNG it used
+to be: grain defeats PNG's predictor, so a level-1 PNG of a 2400px proxy measured
+10.4MB and 108ms of zlib against 3.4MB and 24ms for the JPEG. 4:4:4 is not
+optional — the default 4:2:0 would average away the chroma grain.
 
 Deliberately not automatic after an idle delay: it is ~8s of work, and spending
 that every time a drag settles burns it on frames you are about to change.
@@ -200,9 +233,16 @@ the panel says to Render 1:1 before judging grain. Do not remove those.
 
 ## Pipeline order matters at both ends
 
-Five stages are placed by *position*, not by what they compute, and moving them
+Six stages are placed by *position*, not by what they compute, and moving them
 breaks their whole purpose:
 
+* `Colour Grading` (step -1) is above everything, `pre_blur` included. Every
+  stage below it models an emulsion; this is the decision about what the
+  photograph *is* before any of that runs. Put it after the film stages and it
+  grades grain, halation and dust along with the picture, and a LUT built to be
+  fed a photograph is fed a rendered negative instead. Within the block the LUT
+  is last, after the four adjustments, because the adjustments exist to hand the
+  LUT the picture it was meant to read.
 * `pre_blur` (step 0) is before `lum_ref` is taken, which is the only thing
   separating it from `micro_blur` — same kernel, same linear light. See the
   section below.
@@ -634,6 +674,155 @@ not read as **smooth** — it trades squares for a crumpled-foil swirl, which is
 a different look, not a softer one. Reach for it if the ask is ever "organic
 but still harsh".
 
+## Global Grain grew a size range, and it is a different noise entirely above Min (2026-08-04)
+
+Reported as "too digital a job" — the layer looked too even, every clump the
+same size, reading as manufactured rather than organic. `_fbm` cannot fix
+this no matter how it is tuned: Octaves and Roughness stack coarser structure
+*on top of* the base clump, but the base clump itself is always the same
+diameter, because the whole field is one lattice at one pitch. Making clumps
+genuinely differ from their neighbours means giving up the lattice.
+
+**Three ways to read "randomise the size" were on the table, and they are not
+the same feature.** One random size per render (the whole frame uniform, but
+different between renders) does not touch the actual complaint, which is
+variation *within* one image. Spatially blended patches — build the field at
+Min and again at Max, blend between them with a slow selector field — is
+cheap and safe but still gives every clump in a given patch the same size,
+just a size that drifts region to region. The option that actually matches
+"clumps genuinely differ from their neighbours" is a jittered point field
+where **every clump independently draws its own radius** — closer to real
+film, and a materially bigger rebuild, chosen deliberately over the cheaper
+option once the tradeoff was explicit.
+
+`global_size` is relabelled **Global Size Min** and a new **Global Size Max**
+sits next to it, same range, defaulting equal to Min. The two are not a
+symmetric pair the way the light-leak sizes are: Min already has an
+established meaning on its own, so the effective ceiling is **`max(Min, Max)`,
+never a swap**. A preset that raises Min alone, with Max still at its own
+untouched default, must never cross into the new construction just because
+the default happens to be smaller than the new Min — `verify.py` pins this
+explicitly, separately from the plain "Max below Min" case.
+
+### `_variable_cell_noise`: one independently-sized point per lattice cell
+
+At or below Min, nothing changes — every existing preset (none of which sets
+Max) renders the bit-identical field it always has. Above Min,
+`_variable_cell_noise` replaces `_fbm` for that layer:
+
+* One point per cell of a base lattice pitched at **Max** — the largest any
+  point can be — jittered to the middle half of its own cell and given its
+  own radius drawn uniformly from `[Min, Max]` and its own signed brightness,
+  all from one hash per cell.
+* A pixel takes its value from whichever candidate point has the strongest
+  claim on it — the largest radial falloff, "closest relative to that point's
+  *own* size" rather than closest in raw distance — and reads out that
+  winner's own brightness. Selected, not summed: summing would read as fog,
+  and selection is what keeps individual grains looking like discrete
+  particles with their own edges.
+* **Centred on 0.5, matching `_fbm`'s own convention, and this is load-bearing
+  rather than cosmetic.** `_smooth_noise` re-centres explicitly
+  (`0.5 + blur(n - 0.5, sigma) * gain`), so a field that means something
+  different at 0.5 gets blurred around the wrong point. A gap — every
+  candidate's falloff at zero, real film base between grains at a wide
+  Min-Max range — has to land exactly on 0.5. The first version did not: it
+  read out raw brightness with no gap-aware centring, so gaps landed near
+  zero and the shared `*2-1` remap then drove every gap toward the fully
+  negative rail — measured, a frame-wide **dark cast** the moment any real
+  gap existed, the opposite of "nothing is here". Fixed by drawing brightness
+  signed in `[-1, 1)` and returning `0.5 + 0.5 * falloff * brightness`: a gap
+  is 0.5 regardless of any candidate's brightness, and a pixel at a point's
+  centre reaches that point's own brightness at full amplitude, lighter or
+  darker with equal odds — matching how real grain is not one-sided either.
+  Swept Min 1.0 against Max 4/10/18: frame mean stays within 0.2% of neutral
+  at every width, where the first version would have shown the bias grow with
+  the gap.
+* **Coverage gaps are the honest cost of a wide range, not a defect.** At Min
+  1px / Max 20px the field measures ~70% coverage on a flat plane; narrower
+  ranges cover more. The help text says so, because a control that quietly
+  turns into "70% grain, 30% nothing" without warning reads as broken rather
+  than as a dial.
+
+Shape is `[1, nfields, h, w]`, matching `_fbm`, so it drops into the same
+normalise-and-clamp pipeline. Chroma shares the exact same construction
+through `_global_field` (a small closure picking `_fbm` or the variable field
+per the same gate) — geometry (point positions and radii) is identical across
+channels and only brightness is drawn independently per channel, the same
+"shared shape, independent value" pattern `_lattice_np` already gives `_fbm`'s
+multi-field calls. That is what lets a coloured variant share every grain's
+position and size across channels while still giving each channel its own
+intensity, rather than three unrelated point fields that would not even
+agree on where a grain's edge is from channel to channel.
+
+### Two failure modes found building it, both regression-tested directly
+
+**The resonance.** When the effective cell size lands on (or very near) an
+exact integer number of working pixels, the pixel grid and the point lattice
+phase-lock: every pixel sits at *exactly* the same fractional offset within
+its own cell, for every row and column, so no pixel is ever nearer than a
+quarter-cell to any point, anywhere. Measured on a flat field: cell 1.00
+scored 0.123 std against 0.193 at 1.05 or 0.95 — a **>35% amplitude hole**
+sitting exactly where a user's slider is likeliest to land, since round
+numbers are round numbers before and after the working-scale multiply.
+
+Not a rare edge case to shrug off: it is the *default* well-behaved case for
+anyone who reaches for whole-pixel sizes, which is most people. Fixed with a
+small domain warp on the pixel side of the distance computation only — never
+on which cell a pixel is nominally assigned to, which would need the
+neighbour-search proof re-done against a wider slack. A first attempt warped
+by 0.12 cells, the most a 3x3 (1-ring) search could safely absorb without
+risking that proof, and it was not enough (0.123 → 0.128): breaking a phase
+lock that pins *every* pixel at the same offset takes a warp comparable to
+half a cell, not a tenth of one. Widening the search to 5x5 (2 rings) buys
+room for exactly that — the far-corner geometry allows up to 1.25 cells of
+warp before the proof would need widening further, and 0.7 cells is where a
+sweep against cell 1.6 as a control lands within 0.3%. The warp itself is
+sourced from `_value_noise` rather than a second point lattice, because
+interpolated noise does not itself suffer this failure mode — its output
+varies smoothly pixel to pixel regardless of whether its own cell aligns with
+the pixel grid, so it cannot reintroduce the same problem at one remove.
+
+**The tie-break.** Fixing the resonance surfaced tile independence failures
+the isolated function did not show — comparing a whole-image render against a
+tiled one turned up single-pixel deltas up to 0.07, tracing to a genuine
+near-tie between two candidate points where the coordinate arithmetic behind
+`dist` differs in its last bit or two depending on how a tile happened to be
+padded and cropped to get there. Because the winner is chosen by a bare `>`,
+a difference of a few counts in the last float32 bit can flip which point
+wins — and therefore which brightness gets read out — which is a **discrete
+jump**, not the gradual sub-pixel drift every other float-precision
+discrepancy in this codebase settles for. Fixed with a fixed margin
+(`_VARCELL_TIE_MARGIN`): a candidate has to beat the current winner by more
+than the margin to take over, so whichever candidate the fixed iteration
+order reaches first within a near-tie keeps the win consistently, regardless
+of tile layout. Swept 1e-4 to 1e-2 against a scene that reproduced the
+failure: 1e-4 left a 4.9e-3 gap open (too close to the measured ~2e-5 noise
+floor to fully cover it), 3e-4 to 1e-3 both closed it to 1.4e-4, and 1e-2
+reopened a much larger one (4.9e-2) — wide enough to start treating pixels
+with a genuine, non-noise falloff difference as tied, a different failure
+from the one the margin exists to fix. Set at 1e-3, in the middle of the
+working range rather than at its edge. Re-verified across 48 combinations of
+seed, size range, smoothing and tile size: worst delta 2.6e-4, comfortably
+under the 2e-3 this codebase holds every other tile-independence check to.
+
+### `pad_for` has two new terms, both gated on the variable construction being on
+
+`_variable_cell_noise` reads lattice cells up to two rings away from a
+pixel's own — a real read reach, not merely an addressing convenience,
+because the render pipeline only ever hands the function a padded window
+rather than the whole image. Under-reserve this and a pixel near a tile edge
+silently substitutes a clamped boundary cell for the true neighbour, which
+two different tile splits do differently — invisible in a single preview, a
+seam in a tiled export, exactly the failure mode this codebase's whole
+tile-independence discipline exists to catch. The gate matches `render()`'s
+own decision **exactly**, including the floor on Min, so `pad_for` and the
+renderer can never disagree about whether the field switched construction.
+Global-grain smoothing's own kernel term was *already* wrong for this
+feature before this section existed — it referenced Min alone, and above Min
+the field's characteristic scale is Max, so a tile computed with only Min in
+view would under-reserve and seam exactly where Max exceeds Min. Fixed
+alongside the new reach term, not as an afterthought.
+
 ## The Colour section is gone, and Global Grain grew a chroma slider (2026-08-03)
 
 Both on request. The section merge is pure UI — group names live only in
@@ -833,6 +1022,149 @@ Cost is nil at 6MP — inside MPS run-to-run variance either way. `pad_for` grow
 108 → 113 at radius 1 and 130 at radius 4, and it has to count **both** terms:
 the taps travel a radius (a displacement, added outside the ×3) and the tangent
 and step gate come off blurred luma (a kernel, inside it).
+
+## Colour Grading: a LUT is a *resource*, not a parameter (added 2026-08-04)
+
+Requested: a section at the top of the pipeline that applies a 3D LUT from
+`luts/` or from a file, with temperature, shadow, highlight and two-way clarity
+sliders **before** the LUT, and cheap enough not to stress the main pipeline.
+Step -1 in `render()`, above `pre_blur`. Everything ships at 0.
+
+**The structural decision, and the one that shapes everything else: the LUT does
+not live in `params.py`.** Every other control the engine takes is a float with a
+range, so it can be sanitised, clamped, rescaled for a different image size and
+stored in a preset file as a value. A LUT is identified by *name* and its content
+is a table. So it travels beside the parameters — `body["lut"]` next to
+`reference_mp`, and a `lut` sibling key in a preset file — and `main._params_for`
+attaches the resolved object as `p["lut"]` after `sanitize` and `rescale`, both of
+which only touch keys that are in `PARAMS` and so leave it alone.
+
+The obvious alternative needed no new plumbing at all: a `choices` menu indexed
+into the folder listing. It is wrong for exactly the reason `_SCATTER_STENCILS`
+documents, and worse here — that list is fixed in code, whereas `luts/` is
+user-mutable *by design*, the same way `presets/` is. A preset stores the index,
+so dropping one more `.cube` in the folder silently renumbers it and changes the
+look of every preset that named one. Names it is.
+
+**`lut_amount` *is* a parameter, and it is in `NEUTRAL_ZERO`.** That pair is what
+keeps the Original button honest. `params.is_neutral` decides whether
+`render_image` short-circuits, and it works from the numbers alone — it cannot see
+the LUT. So:
+
+* Zeroing the mix switches the LUT off as completely as unselecting it would,
+  which is why the *name* stays out of `NEUTRAL_ZERO`: same reasoning that keeps
+  sizes, radii and seeds out of it, so the section remembers what it had.
+* **A mix above zero with no resolvable LUT would be a silent bug**, not a no-op:
+  `is_neutral` would be false, the render would run, and at supersample 2 the
+  bicubic-up/box-down round trip comes back a measured 1.0e-01 softer than the
+  source. `_params_for` therefore forces `lut_amount = 0` whenever `lut.get`
+  returns nothing, so the gate in the engine and `is_neutral` can never disagree.
+  `verify.py` pins both halves.
+
+An unresolvable name is deliberately **not** an error — a preset can name a
+`.cube` that has since been renamed, or an upload from a previous run (those live
+in process memory and do not survive a restart). The picker keeps the name as a
+"— missing" entry with a hint rather than resetting itself to None, because
+silently showing None makes it look like the preset never had a LUT.
+
+### The four things that had to be right about the lookup
+
+* **`align_corners=True`.** A LUT's first and last samples *are* input 0 and
+  input 1, not the centres of edge cells. The default reads the whole table half
+  a cell off — a small, uniform, entirely wrong shift that looks like the LUT
+  being slightly wrong rather than like a bug.
+* **The axis order.** `.cube` says red varies fastest, so a C-order reshape gives
+  `table[b][g][r]`; permuted to `[c][b][g][r]` that puts red on `grid_sample`'s
+  `W`, green on `H`, blue on `D`, which is why the sampling grid is just the
+  image's own channels in order. Get this backwards and every *symmetric* LUT
+  still looks fine while every real one is channel-swapped.
+* **Both of the above are pinned by construction rather than by eyeball.**
+  `verify.py` builds two exactly-linear 8-cubes — an identity and one that
+  rotates the channels — and trilinear interpolation of a linear function is
+  exact, so the check is an *equality* (2.4e-07) rather than a judgement. The
+  rotation catches a transposed axis; the identity catches the alignment.
+* **`F.grid_sample` in 3D works on MPS**, checked before building on it. One call,
+  trilinear, so a 35-cube and a 64-cube cost the same and neither shows up against
+  the stages below. The alternative — gathering eight corners by flat index —
+  needs int64 index tensors MPS handles badly and eight full-frame gathers of
+  working memory.
+
+### Why each adjustment is where it is
+
+* **Temperature in linear light.** A white balance is a change of *illuminant*, so
+  it multiplies light, and gamma-encoded values are not light — done encoded, the
+  same gain moves the shadows much further than the highlights, which is what
+  makes a naive temperature slider read as a tint laid over the picture. Same
+  argument as `pre_blur`'s, and gated the same way so the transfer round trip
+  costs nothing at 0. The gain vector is normalised by its own luma, so the
+  control is colour-only: measured, luminance holds to within 1% across the slider.
+* **Shadows and highlights display-referred, and clip-free by construction.** The
+  lift is a share of the headroom that is *actually there* — toward white going
+  up, toward zero coming down — so for any setting the map is affine with positive
+  slope and both endpoints inside 0..1. No channel can leave the cube and none can
+  cross another, which is what would break a hue. `verify.py` sweeps eight
+  settings and pins the worst excursion at 0.00e+00. One luma, taken before either
+  runs, feeds both masks: recomputing between them would make lifting the shadows
+  change what the highlight control thinks a highlight is, and the two sliders
+  would pull on each other — the same independence `lum_ref` buys the grain masks.
+* **`_GRADE_TONE_MAX` is 0.35, not 1.0, and that is not a taste tweak.** At 1.0 a
+  setting of +1 takes a black pixel to *pure white*, so the whole top of the
+  slider is unusable and the useful range is squeezed into its first tenth.
+  Measured on a real photograph (mean luma 0.21), Shadows at only **+0.5 took the
+  frame's mean from 0.19 to 0.53** — that is a different exposure, not a shadow
+  lift. Caught by rendering the actual photo through the actual API, not by
+  reading the code. Same lesson as `_JITTER_MAX` from the other direction: the
+  whole range has to be usable.
+* **Clarity is asymmetric on purpose.** Positive gets `_GRADE_CLARITY_GAIN` (1.6);
+  negative is pinned at exactly 1.0, because at gain 1 a setting of −1 subtracts
+  precisely the band it measured — the local contrast is *gone*. Past that it does
+  not keep flattening, it **inverts**: dark halos on the light side of every edge,
+  an artifact rather than a look. `verify.py` measures the band's correlation with
+  the source at −1 and fails on a negative number. Measured ladder: −1 → 5% of the
+  band, −0.5 → 52%, +0.5 → 177%, +1 → 255%.
+* **Clarity runs on luminance, which is both cheaper and better.** The signed
+  detail goes to all three channels equally, so the channel *differences* — which
+  is what hue is — come through untouched (pinned at 2.4e-07), a saturated area
+  cannot be pushed out of gamut by a structure control, and it is one blur instead
+  of three.
+
+### Cost, and the one term in `pad_for`
+
+Four of the five stages are per-pixel with no kernel and no neighbourhood, so
+they reserve **nothing**. Clarity's high-pass is the only kernel in the section
+and it is a real reach even though the stage runs first: a tile that cannot see
+far enough measures a different band at its own edge, and that difference then
+propagates through everything below it. `verify.py` pins both halves — that
+`pad_for` grows by 3× the clarity radius, and that it is *unchanged* with
+temperature, tone and a LUT all on.
+
+Measured on a 6MP render at 2×, best of 3 in fresh processes (MPS run-to-run
+variance here is ±1s on larger frames, so single-shot numbers are worthless):
+
+| | time | pad_for |
+|---|---|---|
+| section off | 0.67s | 108px |
+| temperature / tone / a LUT at mix 1 | 0.67–0.73s, inside variance | 108px |
+| clarity at the default 14px | 0.75s | 150px |
+| clarity at 40px | 0.88s | 228px |
+| all of it | 0.82s | 150px |
+
+### Two things outside the section that had to change with it
+
+* **`build.sh` copies `luts/`.** It already had this exact bug documented for
+  `presets/` — a distribution without the folder has an empty LUT menu and a
+  preset that names a `.cube` quietly grades nothing.
+* **Editing a control in a muted section now switches that section on.** Found in
+  a real browser, not by inspection: on a fresh load *every* section is muted (see
+  the muted-on-boot section), so picking a LUT left the section's switch reading
+  "off" while the LUT rendered — and a mute/un-mute round trip then reverted the
+  mix to the snapshot `toggleGroup` took at mute time, measured going straight
+  back to 0. `keptFor`/`liveFor` in `App.tsx` restore the section's kept values
+  and lay the edit on top, which is exactly what clicking its own ● does. This is
+  general, not LUT-specific: it was latent for every slider in the app the moment
+  boot started muting everything, and the new section is simply where it is hit
+  first. The pair is split into a pure half and a side-effecting half because a
+  `setMuted` call inside a `setValues` updater would run twice under StrictMode.
 
 ## Film texture is drawn, never scattered (added 2026-07-31)
 
@@ -1322,6 +1654,10 @@ enabled in one render, and loading a preset file from disk does the same.
 | Constant | Value | Why |
 |---|---|---|
 | `EDGE_REF` | 0.06 | Fixed edge-magnitude reference. Must stay a constant, not a statistic — see invariant 1. |
+| `_GRADE_TEMP_GAIN` | 0.40 | Peak channel gain for Temperature at ±1: red and blue move this far in opposite directions, green is left alone, and the vector is then normalised against the luma weights so the control cannot also expose the frame. |
+| `_GRADE_TONE_KNEE` | 0.5 | Where the Shadows and Highlights ramps meet. Both are quintic over half the range, so every pixel is in exactly one of them and a gradient shows no seam. Not exposed — a knee and a falloff per end would be four more sliders in a section that is meant to stay cheap. |
+| `_GRADE_TONE_MAX` | 0.35 | How far a tone lift travels at ±1, as a share of its headroom. **Not 1.0**: that takes a black pixel to pure white at +1 and squeezes the useful range into the slider's first tenth. Measured on a real photo, Shadows +0.5 took the mean from 0.19 to 0.53 at 1.0. |
+| `_GRADE_CLARITY_GAIN` | 1.6 | Gain on the *positive* side of Clarity only. The negative side is pinned at exactly 1.0 and must stay there: at gain 1, −1 removes precisely 100% of the band, and past that it inverts local contrast rather than flattening further. |
 | `_GNORM` | 0.55 | Noise normaliser. **The old note here claimed field std ~0.27 clipping ~3.6%; re-measured 2026-07-31 it is std ~0.45 clipping ~18%**, constant across octave counts now that `_fbm` preserves variance. The 18% is pre-existing — a single-octave field measures the same — so this row was simply wrong, not broken by a change. Lowering it flattens the distribution's tails further. |
 | `_AMP_SCALE` | 0.38 | Maps the 0–100 intensity slider to amplitude; default 32 lands near 3.5% luminance sigma. Was 0.5 — recalibrated when `_fbm` started preserving variance, since the old value was silently compensating for a field running at 43% strength. |
 | `_MIN_CELL` | 0.8 | Floor on lattice cell size in working pixels. Below Nyquist it is pure aliasing. |
@@ -1334,6 +1670,10 @@ enabled in one render, and loading a preset file from disk does the same.
 | `_AA_DIR_K` / `_AA_DIR_MIN` | 0.5 / 0.7 | Tangent-estimate blur for AA, as a fraction of its radius, and a floor. Smaller than `_SAND_DIR_K` against a smaller radius — this filter follows a contour at the pixel scale, and a wide estimate window cuts the corners off small features. The floor is what stops the tangent swinging on single-pixel noise. |
 | `_SMOOTH_MAX` | 0.5 | Peak global-grain smoothing sigma as a fraction of the clump. Half a cell takes measured gridiness 1.74 → 0.27, so the lattice is gone rather than softened, while clump-scale structure survives. |
 | `_SMOOTH_GAIN_K` | 5.62 | Restores the amplitude that smoothing blur costs, as `sqrt(1 + k(σ/cell)²)`. Analytic because a measured `std()` would be a statistic of the region and would seam exports. **Fit against the two-octave field it is used on** — calibrated on single-octave noise it comes out 7.7 and makes full Smoothness 10% louder than none. |
+| `_VARCELL_JITTER_LO` / `_SPAN` | 0.25 / 0.5 | Where in its own cell a variable-size grain's point can jitter to — the middle half, `[0.25, 0.75]`. Bounding it away from the cell edge is what makes the fixed-ring neighbour search below exact rather than heuristic. |
+| `_VARCELL_RINGS` | 2 | Neighbour-cell rings the variable-size search checks each way (5x5). 1 ring only budgets 0.25 cells of warp margin, measurably not enough to fix the resonance below; 2 rings budgets 1.25. |
+| `_VARCELL_WARP_CELL_FRAC` / `_AMOUNT` | 0.37 / 0.7 | Domain warp breaking the pixel-grid/cell-grid resonance at exact-integer cell sizes (measured: cell 1.00 scored 0.123 std against 0.193 at neighbouring sizes). Swept 0.5–1.2 cells of warp against cell 1.6 as a control; 0.7 is where they agree to 0.3%. |
+| `_VARCELL_TIE_MARGIN` | 1e-3 | How much better a candidate point's falloff must be before it displaces the current winner. Below the ~2e-5 float noise floor between tile layouts a near-tie can flip winners (a discrete jump, not drift); above ~1e-2 it starts treating genuinely different falloffs as tied. Swept 1e-4 to 1e-2; set in the middle. |
 | `_JITTER_MAX` | 3.0 | Peak edge displacement in full-res px at `edge_jitter` 1. Was an inline 0.6, whose *typical* displacement was 0.227px — invisible. |
 | `_STEP_LO` / `_STEP_HI` | 0.030 / 0.110 | Luma-step bounds separating a real transition from fine texture, for the edge-softening mask. Fine texture measures an order of magnitude under a hard border, which is the gap that lets softening take the snap off a border and leave fabric alone. |
 | `_TEX_LO` / `_TEX_HI` | 0.002 / 0.015 | Local mean-abs-deviation bounds separating "smooth" from "textured" for the smooth-area guard. Skin and clear sky sit at or below `_TEX_LO`; fabric, foliage and hair sit above `_TEX_HI`. |
@@ -1572,6 +1912,9 @@ says so and points at 5–20 as the usable range.
 
 ## Measured performance (Apple MPS, 24MP source, 2× supersample)
 
+**The numbers below the 2026-08-04 audit section are historical.** Read that
+section first — it supersedes the proxy-preview figures here.
+
 * Proxy preview (2400px): **~1.25s** wall (0.7s render + encode + HTTP), 5MB
   — what a slider costs
 * Full 1:1 preview (6000px): **~4.7s** (4.1s render + 0.6s encode), 32MB — the
@@ -1623,13 +1966,157 @@ one long-lived process get progressively slower on MPS — a first pass at tile
 sizing showed 3072 "beating" 1024 purely because of measurement order, and
 reversed completely once each ran clean.
 
-Tile size for the preview is 1536, not the export's 1024: per-tile overlap is
-fixed padding, so wider tiles amortise it (~5% better at the default halation
-radius, ~12% at the widest). Past 2048 it turns around as tensors stop fitting.
+Tile size used to be hard-coded at 1536 for the preview and 1024 for the export:
+per-tile overlap is fixed padding, so wider tiles amortise it (~5% better at the
+default halation radius, ~12% at the widest). Both constants are gone — see
+`tile_for` in the 2026-08-04 audit below.
 
-The `/api/source` PNG is encoded once per upload and cached on the `Upload`
-(18ms → 1.2ms on repeat). The untouched image never changes, so re-encoding a
-full-resolution PNG on every parameter change was pure waste.
+The `/api/source` image is encoded once per upload and cached on the `Upload`
+(18ms → 1.2ms on repeat). The untouched image never changes, so re-encoding it on
+every parameter change was pure waste.
+
+## Performance audit, 2026-08-04 — 3.70s → 1.31s, bit-identically
+
+The `1.6s` proxy figure above was **2.3x stale**. Re-measured with one fresh
+process per configuration (mandatory here — see the warning below), 2400x1600
+proxy, ss=2:
+
+| | before | after |
+|---|---|---|
+| parameter defaults | 0.419s | **0.309s** |
+| `Stock`, first render of a parameter set | 3.701s | **2.223s** |
+| `Stock`, any repeat render | 3.701s | **1.314s** |
+
+**The engine's baseline was never the problem: `Stock` costs 8.8x defaults.** All
+five changes below are **bit-identical** — asserted at 0.00e+00 in `verify.py`
+against reference implementations of the code they replaced, not argued from a
+tolerance. Nothing about the look moved.
+
+Where the time actually went, profiled with `torch.mps.synchronize()` around each
+primitive (exclusive time, `Stock` proxy):
+
+| primitive | | |
+|---|---|---|
+| `_variable_cell_noise` | 1.130s | 24.1% |
+| `_lattice_np` | 1.085s | 23.2% |
+| `_value_noise` (excl. lattice) | 0.444s | 9.5% |
+| `_smoothstep` | 0.334s | 7.1% |
+| `_blur` / `_linear_to_srgb` / `_warp` | 0.536s | 11.4% |
+
+1. **The Global Grain texture layer is cached** (`_global_grain_field`). It reads
+   no image data, so it was being rebuilt for nothing on every render: 1.29s of
+   3.70s, 35%. `global_intensity` and `global_opacity` are applied by the caller
+   as one scalar multiply and so sit *outside* the cache — the two sliders anyone
+   drags cannot miss it. This is the whole difference between the 2.22s and 1.31s
+   rows above.
+2. **`_lattice_np` runs in torch on the CPU, not numpy** — 2.2-2.6x for free,
+   because numpy's uint64 elementwise ops are single-threaded and torch's int64
+   ones are not. Worth ~17%.
+3. **`_variable_cell_noise` carries the winning cell index** through its 25-cell
+   search and gathers brightness once at the end, instead of rewriting `nfields`
+   full-frame planes on all 25 iterations. 1.26x on that function at nfields=3,
+   and a real cut in peak memory.
+4. **Lattice bounds are computed in Python** (`_lat_span`) instead of by reading
+   scalars back off device tensors. That was 32 MPS queue drains per
+   `render_supersampled` at defaults and **108 at `Stock`**, each a full pipeline
+   stall for a number Python already had.
+5. **Tile size comes from a memory budget** (`tile_for`), replacing the two
+   constants. See below.
+
+### Two traps this audit walked into, both worth knowing
+
+**`inference_mode` and kernel caching are both no-ops here, measured.** Wrapping
+the render in `torch.inference_mode()` came out at 3.764s against 3.701s — no
+change, because nothing sets `requires_grad` so no graph is ever built and there
+is nothing to skip. Caching `_blur`'s gaussian kernels and `_warp`'s sampling
+grids measured 0.90-1.02x: building them is noise next to the convolution. Both
+look like obvious wins and neither is one.
+
+**Never benchmark two configurations in one process.** The existing warning in
+this file is not cautious enough about *why*. A long-lived MPS process gets
+progressively slower, so a sequential sweep penalises whatever runs last — the
+first pass at this audit reported `inference_mode` and `grain_size 0.4` as
+*slower than baseline*, and reported the variable-cell path as costing 32% when a
+clean measurement says 1.19s of 3.70s. One process per configuration, best of 3.
+
+### `tile_for`: the tile is a memory decision, not a constant
+
+Tiling is pure overhead — `pad_for` overlap is read, rendered and thrown away on
+all four sides. Measured on the `Stock` proxy, fresh process each:
+
+| tile | tiles | overdraw | time |
+|---|---|---|---|
+| 1024 (the old export default) | 6 | 1.59x | 4.460s |
+| 1536 (the old preview default) | 4 | 1.32x | 3.701s |
+| 2048 | 2 | 1.15x | 3.302s |
+| single tile | 1 | 1.00x | 2.774s |
+
+Interior *export* tiles are the worst case, since they pad on all four sides:
+`1024 + 2*178 = 1380` square rendered for `1024` square kept, **1.82x**.
+
+So why not always one tile? **Because peak memory went 6.0GB at tile 1536 to
+8.0GB at 2048, and an 8GB machine is exactly where tiling matters most.** An
+out-of-memory render is not slow, it is broken, so this is the one place the
+"quality beats speed, take the lag" licence does not apply. `tile_for` derives
+the tile from `_render_budget_bytes()` (half of the backend's recommended working
+set, `FILM_GRAIN_TILE_BUDGET_GB` to override) and `_WORKING_BYTES_PER_PX` = 512,
+which is *measured* and deliberately above the worst marginal figure — erring
+that way picks a smaller tile, and the other way runs out of memory.
+
+Two consequences worth expecting:
+
+* **A wide-kernel preset now gets a smaller tile**, because it pads more and so
+  has a larger working set for the same nominal tile. That coupling is the point;
+  the old constants had none. `verify.py` pins it.
+* **The renderer now sees tile sizes nobody hard-coded**, which is only safe
+  because of invariant 1. `verify.py` checks tiled-vs-single-pass equality across
+  several sizes rather than trusting the two the app used to use.
+
+`main._render_tier` is new and is the *only* place either preview tier is
+rendered. That is load-bearing rather than tidy: a preview-scale export must be
+byte-for-byte the live preview, and once tile size became a *computed* value, two
+call sites agreeing about it was no longer something a comment could guarantee.
+
+### The lattice is bigger than the pixel grid, not smaller
+
+`_lattice_np`'s docstring used to claim "the lattice is far smaller than the pixel
+grid, so this is cheap." **False at every shipped setting**, and it is why 23% of
+the render hid in plain sight for so long. `cell` is floored at `_MIN_CELL` = 0.8
+*working* pixels and every preset sets `grain_size` to 0.1-0.3, so the base
+lattice is *denser* than the pixel grid. Lattice points hashed per output pixel:
+
+| defaults | Dreamy | Dramatic | Subtle | ExtraGrain | `Stock` |
+|---|---|---|---|---|---|
+| 2.5x | 5.7x | 38x | 48x | 54x | **58x** |
+
+That is 291M hashes for one proxy preview. Moving it to the GPU in 32-bit would
+be faster still and is deliberately not done: it would change every value and
+reroll every preset's grain.
+
+### Superseded renders now stop
+
+`/api/preview` is a sync `def` holding `_RENDER_LOCK`, and Starlette cannot
+interrupt a threadpool worker — so an aborted preview (the client aborts on
+*every* new render) used to run to completion and keep the lock the whole time.
+Latency then grew with how many edits happened rather than with how long one
+render takes. `render_image` takes a `should_cancel` hook polled once per tile and
+raises `RenderCancelled`; `main` hands out monotonic tickets and returns 499.
+
+Tile granularity is the right checkpoint: no plumbing inside `render`, and the
+wasted work is bounded at one tile.
+
+### Two things left on the table, deliberately
+
+Both were measured and then declined, so the numbers are not lost:
+
+* **`Stock`'s `global_size_max 3.0` is what switches on `_variable_cell_noise`**,
+  and that path is 1.19s of the preset's 3.70s. `grain_size 0.1` also buys
+  nothing over 0.4 for the grain field (both floor to `_MIN_CELL`) yet costs 4%.
+  Both are *look* decisions, so they stay.
+* **`_VARCELL_RINGS` 2 → 1** would cut the 25-cell search to 9, but the 2-ring
+  search is what buys the 0.7-cell domain warp that breaks the pixel-grid
+  resonance. It would need a different resonance fix (a staggered lattice needs
+  no warp at all) and would reroll the global-grain realisation.
 
 ## State / not done
 

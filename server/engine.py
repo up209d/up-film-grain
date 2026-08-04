@@ -39,7 +39,9 @@ Design notes that matter for correctness:
 
 from __future__ import annotations
 
+import collections
 import math
+import os
 
 import numpy as np
 import torch
@@ -61,6 +63,19 @@ EDGE_REF = 0.06
 # loose enough to leave the distribution's tails intact. Constant, not a
 # per-image statistic, so tiles stay seamless.
 _GNORM = 0.55
+
+# Byte cap on the Global Grain texture cache (see `_global_grain_field`). Sized
+# for a handful of tiles at preview resolution -- one entry is [1,3,h,w] at
+# *working* resolution, so 113MB per tile at tile 1536 / supersample 2, or ~38MB
+# for the monochrome case. Capped by bytes rather than by entry count for
+# exactly that reason: an entry-count cap sized for the chroma case would hold
+# three times too much memory when chroma is off, and vice versa.
+#
+# Shared budget, not an independent one: this competes with the working set that
+# `tile_for` sizes tiles against, so raising one means lowering the other.
+_GG_CACHE_BYTES = int(
+    float(os.environ.get("FILM_GRAIN_GRAIN_CACHE_GB", "0.5")) * (1 << 30)
+)
 
 # Converts the 0..100 intensity slider into image-referred amplitude. Chosen so
 # the default intensity of 32 lands near 3.5% luminance sigma in the midtones,
@@ -104,6 +119,41 @@ _MIN_CELL = 0.8
 #              the gain exists to prevent.
 _SMOOTH_MAX = 0.5
 _SMOOTH_GAIN_K = 5.62
+
+# --- colour grading (step -1, above everything) ---------------------------- #
+#
+# Peak channel gain for the temperature shift, at grade_temp = +/-1. Red and
+# blue move by this much in opposite directions and green is left alone; the
+# whole vector is then normalised against the luma weights, so the control
+# changes the light's colour and not its level. 0.40 puts the extremes at a
+# roughly 3200K/8000K feel without any setting driving a channel to a rail.
+_GRADE_TEMP_GAIN = 0.40
+#
+# Where the shadow and highlight ramps meet. Both are quintic over half the
+# range, so every pixel is in exactly one of them and a smooth gradient shows
+# no seam between them. Not exposed: a knee plus a falloff per end would be four
+# more sliders for a section that is meant to stay cheap and quick.
+_GRADE_TONE_KNEE = 0.5
+#
+# How far a tone lift can travel at +/-1, as a share of the headroom it has.
+#
+# Not 1.0, and the difference matters more than it sounds. The lift is a share
+# of the distance to the rail, so at 1.0 a setting of +1 takes a black pixel to
+# *pure white* -- which means the whole top of the slider is unusable and the
+# useful range is squeezed into its first tenth. Measured on a real photograph
+# (mean luma 0.21), Shadows at only +0.5 took the frame's mean from 0.19 to
+# 0.53; that is not a shadow lift, it is a different exposure. At 0.35 the same
+# +1 moves a black pixel to 0.35 -- a thoroughly lifted, faded-print look, which
+# is a fair thing to find at the end of the travel -- and +0.3 gives the natural
+# one-stop-ish lift you actually reach for. Same lesson as `_JITTER_MAX`, from
+# the other direction: a control whose whole range has to be usable.
+_GRADE_TONE_MAX = 0.35
+# Gain on the positive side of Clarity. The negative side is pinned at exactly
+# 1.0 and cannot be raised: at gain 1 a setting of -1 removes precisely 100% of
+# the local-contrast band, and anything past that does not flatten further, it
+# *inverts* -- dark halos on the light side of every edge. Positive has no such
+# limit, so it gets the headroom to be worth reaching for.
+_GRADE_CLARITY_GAIN = 1.6
 
 # Local mean-absolute-deviation thresholds, in luma units, separating "smooth"
 # from "textured" over a medium radius. Skin and clear sky sit near or below
@@ -418,6 +468,75 @@ def _leak_anchor(pos: float, fh: float, fw: float) -> tuple[int, float]:
     return 0, 0.0
 
 
+class RenderCancelled(Exception):
+    """Raised out of `render_image` when its `should_cancel` hook says stop.
+
+    Its own type rather than a bool return so a cancelled render cannot be
+    mistaken for a finished one by a caller that forgot to check.
+    """
+
+
+# Peak render memory per *working* pixel -- i.e. per pixel of the padded tile
+# after supersampling. Measured, not guessed: single-tile `Stock` renders at 512,
+# 768, 1024 and 1280 square with supersample 2 gave marginal costs of 763, 530
+# and 424 bytes per working pixel as the frame grew (the allocator reserves in
+# ~1GB steps, so the small end reads high). 512 is above the worst marginal
+# figure, which is the safe direction to be wrong in: over-estimating picks a
+# smaller tile and renders slower, under-estimating runs the machine out of
+# memory. `defaults` measures roughly half this, so the constant is sized for
+# the heaviest preset rather than the typical one.
+_WORKING_BYTES_PER_PX = 512
+
+# Fraction of the backend's recommended working set to actually use. The rest is
+# headroom for the client, the encoder and whatever else shares the GPU -- the
+# render is not the only thing on the machine, and on Apple silicon this is
+# system RAM, so overcommitting means swapping rather than a clean failure.
+_RENDER_BUDGET_FRACTION = 0.5
+
+# Tile floor and ceiling. The floor is not a memory figure: below it `pad_for`
+# overlap dominates the useful area so completely that the extra work costs more
+# than the memory it saves, and every supported backend can hold a tile this
+# size. The ceiling keeps a single enormous tile from defeating the point of
+# tiling on a machine that reports a very large budget.
+_TILE_MIN = 768
+_TILE_MAX = 8192
+
+
+def _render_budget_bytes() -> int:
+    """Working-set budget for one tile, in bytes.
+
+    `FILM_GRAIN_TILE_BUDGET_GB` overrides it outright, in the same spirit as
+    `FILM_GRAIN_DEFAULT_PRESET` -- useful both for forcing large tiles on a big
+    machine and for reproducing a small machine's tiling on a large one, which is
+    what makes the tile-independence checks in `verify.py` testable here.
+    """
+    env = os.environ.get("FILM_GRAIN_TILE_BUDGET_GB")
+    if env:
+        try:
+            return int(float(env) * (1 << 30))
+        except ValueError:
+            pass
+    total = 0
+    if torch.backends.mps.is_available():
+        try:
+            total = int(torch.mps.recommended_max_memory())
+        except Exception:
+            total = 0
+    elif torch.cuda.is_available():
+        try:
+            total = int(torch.cuda.get_device_properties(0).total_memory)
+        except Exception:
+            total = 0
+    if total <= 0:
+        # CPU, or a backend that will not say. Derive from system RAM, which is
+        # the real constraint there too.
+        try:
+            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except (OSError, ValueError, AttributeError):
+            total = 4 << 30
+    return max(1 << 30, int(total * _RENDER_BUDGET_FRACTION))
+
+
 def pick_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -621,6 +740,53 @@ def _linear_to_srgb(x: torch.Tensor) -> torch.Tensor:
     return torch.where(x <= 0.0031308, x * 12.92, 1.055 * x ** (1.0 / 2.4) - 0.055)
 
 
+def _apply_lut(x: torch.Tensor, lut) -> torch.Tensor:
+    """Trilinear 3D LUT lookup. ``x`` is [1,3,h,w] display-referred in 0..1.
+
+    ``lut`` is a ``server.lut.Lut``; duck-typed rather than imported so the
+    engine keeps no dependency on the file loader. It supplies the table as a
+    ``[1, 3, D, H, W]`` volume and its input domain.
+
+    One ``grid_sample`` call, which is trilinear in 3D and runs on the GPU -- so
+    a 35-cube and a 65-cube cost the same and neither shows up against the
+    stages below. The alternative, gathering eight corners by flat index and
+    interpolating by hand, needs int64 index tensors that MPS handles badly and
+    eight full-frame gathers of working memory.
+
+    Two things are load-bearing:
+
+    * **``align_corners=True``.** A LUT's first and last samples *are* input 0
+      and input 1, not the centres of edge cells. With the default the whole
+      table would be read at half a cell's offset -- a small, uniform, entirely
+      wrong shift that would look like the LUT being slightly off rather than
+      like a bug.
+    * **The grid's last dimension is ``(x, y, z)`` mapping to ``(W, H, D)``,**
+      and the table is stored ``[c][b][g][r]`` so that maps to ``(r, g, b)``.
+      That is why the grid is simply the image's own channels in order. Get it
+      backwards and any symmetric LUT still looks fine while every real one is
+      channel-swapped, which is what ``verify.py`` uses an asymmetric table to
+      pin.
+
+    ``padding_mode="border"`` clamps rather than reflecting, so a value that has
+    somehow left 0..1 reads the nearest real entry instead of folding back into
+    the middle of the cube.
+    """
+    tab = lut.tensor(x.device)
+    n = x
+    # Almost every LUT in the wild declares the 0..1 domain, so the rescale is
+    # skipped rather than paid for -- a per-channel multiply-add over the frame
+    # for nothing.
+    if lut.dmin != (0.0, 0.0, 0.0) or lut.dmax != (1.0, 1.0, 1.0):
+        lo = torch.tensor(lut.dmin, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        hi = torch.tensor(lut.dmax, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        n = (n - lo) / (hi - lo).clamp_min(1e-6)
+    grid = n.permute(0, 2, 3, 1).unsqueeze(1) * 2.0 - 1.0  # [1,1,h,w,3] as (r,g,b)
+    out = F.grid_sample(
+        tab, grid, mode="bilinear", padding_mode="border", align_corners=True,
+    )
+    return out.squeeze(2)
+
+
 def _soft_knee(x: torch.Tensor, amount: float, span: float) -> torch.Tensor:
     """Roll values off asymptotically as they approach 1.0.
 
@@ -662,31 +828,106 @@ def _characteristic_curve(
     return x
 
 
+def _u64(v: int) -> int:
+    """Reinterpret a 64-bit constant as the signed int64 with the same bits."""
+    return int(np.uint64(v).astype(np.int64))
+
+
+# splitmix64's mixing constants, as signed int64. Multiplication and addition are
+# bit-identical for signed and unsigned two's complement, so the same bit
+# patterns give the same hash -- only the *shifts* need care. See `_lsr`.
+_HASH_KY = _u64(0xC2B2AE3D27D4EB4F)
+_HASH_KX = _u64(0x9E3779B97F4A7C15)
+_HASH_M1 = _u64(0xBF58476D1CE4E5B9)
+_HASH_M2 = _u64(0x94D049BB133111EB)
+
+
+def _lsr(n: torch.Tensor, k: int) -> torch.Tensor:
+    """Logical (unsigned) right shift on an int64 tensor.
+
+    torch has no uint64, and int64 `>>` is *arithmetic* -- it smears the sign bit
+    down instead of shifting zeros in, so it is simply the wrong operator for a
+    hash. Masking off the bits above the shift width restores the unsigned
+    result: after shifting right by ``k`` only ``64 - k`` bits can be set.
+
+    **The mask has to come from ``k``.** A first pass at this used one wide
+    constant for every shift, which produced something that still *looked* like
+    noise and was a different field -- exactly the kind of bug that survives an
+    eyeball test, which is why ``verify.py`` asserts bit-equality against the
+    numpy reference rather than rendering a frame and squinting at it.
+    """
+    return (n >> k) & ((1 << (64 - k)) - 1)
+
+
 def _lattice_np(iy0: int, ix0: int, hl: int, wl: int, seed: int, nfields: int) -> np.ndarray:
     """Deterministic hash noise on an integer lattice window.
 
-    Computed in uint64 on the CPU: integer hashing is exact here and portable,
-    whereas 64-bit integer ops are poorly supported on MPS. The lattice is far
-    smaller than the pixel grid, so this is cheap.
+    Integer hashing, so it runs on the CPU rather than the GPU: 64-bit integer
+    ops are poorly supported on MPS, and the exactness is the point -- two tiles
+    asking about the same lattice point must agree bit for bit or exports seam.
+
+    **It is not a small amount of work, whatever the shape of the lattice
+    suggests.** An older version of this note claimed the lattice is "far smaller
+    than the pixel grid, so this is cheap", and that is false at every setting
+    the app actually ships. ``cell`` is floored at ``_MIN_CELL`` = 0.8 *working*
+    pixels and every preset in ``presets/`` sets ``grain_size`` to 0.1-0.3, so
+    the base lattice is *denser* than the pixel grid. Measured lattice points
+    hashed per output pixel: defaults 2.5x, Dreamy 5.7x, Dramatic 38x, Subtle
+    48x, ExtraGrain 54x, **Stock 58x** -- 291M hashes for one 2400px proxy
+    preview. It was 23% of that render's wall time.
+
+    So it runs in **torch on the CPU rather than numpy**, which is worth 2.5x for
+    free: numpy's uint64 elementwise ops are single-threaded, torch's int64 ones
+    use ``at::parallel_for`` across every core, and the arithmetic is otherwise
+    identical. Measured 113ms -> 46ms on a 44M-point lattice, bit-exact. It stays
+    on the CPU (rather than moving to the GPU in 32-bit, which would be faster
+    still) because that would change every value and reroll every preset's grain.
+
+    Returns numpy for its callers' ``torch.from_numpy(...)``; the conversion
+    shares memory and costs nothing.
     """
-    # Lattice indices go negative near the origin; reinterpret the bits rather
-    # than casting, so negative coordinates wrap into the hash domain.
-    yy = np.arange(iy0, iy0 + hl, dtype=np.int64).view(np.uint64)[:, None]
-    xx = np.arange(ix0, ix0 + wl, dtype=np.int64).view(np.uint64)[None, :]
-    out = np.empty((nfields, hl, wl), dtype=np.float32)
+    # Lattice indices go negative near the origin; the int64 bit pattern *is* the
+    # unsigned one, so this needs no reinterpretation -- it is the same wrap the
+    # old `.view(np.uint64)` produced.
+    yy = torch.arange(iy0, iy0 + hl, dtype=torch.int64).unsqueeze(1)
+    xx = torch.arange(ix0, ix0 + wl, dtype=torch.int64).unsqueeze(0)
+    out = torch.empty((nfields, hl, wl), dtype=torch.float32)
     for f in range(nfields):
-        # Fold the seed in Python ints so the wrap is explicit and numpy does
-        # not warn about the (intentional) scalar overflow.
-        s = np.uint64(((seed + f * 7919) * 0x165667B19E3779F9) % (1 << 64))
-        n = xx * np.uint64(0x9E3779B97F4A7C15) + yy * np.uint64(0xC2B2AE3D27D4EB4F)
-        n = n + s
-        n = n ^ (n >> np.uint64(29))
-        n = n * np.uint64(0xBF58476D1CE4E5B9)
-        n = n ^ (n >> np.uint64(32))
-        n = n * np.uint64(0x94D049BB133111EB)
-        n = n ^ (n >> np.uint64(31))
-        out[f] = (n >> np.uint64(40)).astype(np.float32) / float(1 << 24)
-    return out
+        # Fold the seed in Python ints so the wrap is explicit.
+        s = _u64(((seed + f * 7919) * 0x165667B19E3779F9) % (1 << 64))
+        n = xx * _HASH_KX + yy * _HASH_KY + s
+        n = n ^ _lsr(n, 29)
+        n = n * _HASH_M1
+        n = n ^ _lsr(n, 32)
+        n = n * _HASH_M2
+        n = n ^ _lsr(n, 31)
+        out[f] = _lsr(n, 40).to(torch.float32) / float(1 << 24)
+    return out.numpy()
+
+
+def _lat_span(
+    n: int, origin: float, cell: float, pad_lo: int, pad_hi: int,
+) -> tuple[int, int]:
+    """First lattice index and count covering ``n`` working pixels from ``origin``.
+
+    Exists to keep this arithmetic off the GPU. The three noise builders used to
+    build their coordinate ramp on the device and then read scalars back off it
+    (``int(math.floor(float(ys[0])))``), and every such read drains the MPS
+    command queue -- counted 32 per ``render_supersampled`` at defaults and 108
+    at ``Stock``, each a full pipeline stall for a number Python already had.
+
+    **Computed in float32, and that is not pedantry.** The device ramp is
+    ``torch.arange(n, dtype=float32) + origin``, and a Python float scalar takes
+    the tensor's dtype, so the whole expression is float32. Doing it in float64
+    here would occasionally land on the other side of an integer boundary and
+    select a *different* lattice window -- which is a different noise field, not
+    a rounding difference. ``verify.py`` pins this against the device path.
+    """
+    f = np.float32
+    lo = f(f(f(0.0) + f(origin)) / f(cell))
+    hi = f(f(f(n - 1) + f(origin)) / f(cell))
+    i0 = int(math.floor(float(lo))) - pad_lo
+    return i0, int(math.floor(float(hi))) + pad_hi - i0 + 1
 
 
 def _value_noise(
@@ -706,13 +947,11 @@ def _value_noise(
     of pixels tall and a couple wide.
     """
     cy = cell if cell_y is None else cell_y
+    iy0, hl = _lat_span(h, y0, cy, 1, 2)
+    ix0, wl = _lat_span(w, x0, cell, 1, 2)
+
     ys = (torch.arange(h, device=device, dtype=torch.float32) + float(y0)) / cy
     xs = (torch.arange(w, device=device, dtype=torch.float32) + float(x0)) / cell
-
-    iy0 = int(math.floor(float(ys[0]))) - 1
-    ix0 = int(math.floor(float(xs[0]))) - 1
-    hl = int(math.floor(float(ys[-1]))) + 2 - iy0 + 1
-    wl = int(math.floor(float(xs[-1]))) + 2 - ix0 + 1
 
     lat = torch.from_numpy(_lattice_np(iy0, ix0, hl, wl, seed, nfields))
     lat = lat.to(device).unsqueeze(0)
@@ -756,17 +995,233 @@ def _cell_noise(
     trip instead of dissolving. Addressed by global coordinates like every
     other field here, so two tiles asking about the same pixel agree.
     """
+    iy0, hl = _lat_span(h, y0, cell, 0, 0)
+    ix0, wl = _lat_span(w, x0, cell, 0, 0)
+
     ys = (torch.arange(h, device=device, dtype=torch.float32) + float(y0)) / cell
     xs = (torch.arange(w, device=device, dtype=torch.float32) + float(x0)) / cell
-    iy0 = int(math.floor(float(ys[0])))
-    ix0 = int(math.floor(float(xs[0])))
-    hl = int(math.floor(float(ys[-1]))) - iy0 + 1
-    wl = int(math.floor(float(xs[-1]))) - ix0 + 1
 
     lat = torch.from_numpy(_lattice_np(iy0, ix0, hl, wl, seed, nfields)).to(device)
     iy = (torch.floor(ys).long() - iy0).clamp(0, hl - 1)
     ix = (torch.floor(xs).long() - ix0).clamp(0, wl - 1)
     return lat[:, iy][:, :, ix].unsqueeze(0)
+
+
+# Jitter range for `_variable_cell_noise`'s point placement, as a fraction of
+# the cell. Keeping every point in the middle half of its own cell -- never
+# closer than a quarter-cell to an edge -- is what lets the neighbour search
+# below be *exact* rather than a heuristic, given the search radius below.
+_VARCELL_JITTER_LO = 0.25
+_VARCELL_JITTER_SPAN = 0.5
+
+# How many rings of neighbouring cells the search below checks, each way --
+# 2 means 5x5 (25 candidates). Worked from the far corner case: a point in the
+# first excluded ring is at least ``(RINGS + 1 - 0.75)`` cells from a pixel in
+# the search centre's own cell, and no point's radius can exceed one cell (see
+# ``_variable_cell_noise``), so the domain-warp amplitude below has to leave
+# at least that much margin over the 1-cell radius. At 1 ring (3x3) the margin
+# is only 0.25 cells, which measurably was not enough room to fix the
+# resonance below without also risking the proof; at 2 rings (5x5) it is 1.25,
+# comfortable enough that the warp amplitude is the only thing this trades
+# against, not correctness.
+_VARCELL_RINGS = 2
+
+# A domain warp on the pixel side of the distance computation only -- never on
+# which cell a pixel is nominally assigned to, which would need the search
+# proof above re-done against a wider slack. It exists for one specific
+# failure mode: when the working-pixel cell size lands on (or very near) an
+# exact integer, every pixel's position falls at *exactly the same* fractional
+# offset within its own cell, for every row and column -- the sampling grid
+# and the cell grid are commensurate, so no pixel is ever nearer than
+# `_VARCELL_JITTER_LO` of a cell to any point, anywhere, and the field can
+# never reach its own full amplitude. Measured on a flat field: cell 1.00
+# scored 0.123 std against 0.193 at 1.05 or 0.95, a >35% amplitude hole
+# exactly where a user's slider is most likely to land, since round numbers
+# are round numbers before and after the working-scale multiply.
+#
+# A first attempt warped by only 0.12 cells, the most a 3x3 (1-ring) search
+# could safely absorb, and it was not enough: measured, cell 1.00 only moved
+# 0.123 -> 0.128, because breaking a phase lock that pins *every* pixel at the
+# same offset takes a warp comparable to half a cell, not a tenth of one.
+# Widening the search to 5x5 buys room for that: swept 0.5 to 1.2 cells at
+# cell 1.00 against cell 1.6 as a control, and 0.7 is where the two agree to
+# within 0.3% (0.899 -> 0.997 -> back up past 1.0 and settling around 1 as the
+# warp overshoots and returns) -- comfortably inside the 1.25-cell budget the
+# 5x5 search allows. Sourced from `_value_noise` rather than a second point
+# lattice: interpolated noise does not itself suffer this failure mode (its
+# output varies smoothly pixel to pixel regardless of whether its own cell
+# aligns with the pixel grid), so it cannot reintroduce the same problem at
+# one remove.
+_VARCELL_WARP_CELL_FRAC = 0.37
+_VARCELL_WARP_AMOUNT = 0.7
+
+# How much better a candidate's falloff has to be than the current winner's
+# before it takes over. See the tie-break comment where this is used: the
+# coordinate arithmetic behind `dist` differs in its last bit or two between
+# computation paths, and without a margin comfortably above that noise floor
+# a near-tie between two candidates can resolve to a *different* winning
+# point -- and therefore a different brightness -- depending on how a tile
+# happened to be padded and cropped to get there.
+#
+# Swept 1e-4 to 1e-2 against a scene that reproduced the failure: 1e-4 still
+# left a 4.9e-3 tile-independence gap (too close to the ~2e-5 noise floor to
+# fully cover it), 3e-4 to 1e-3 both closed it to 1.4e-4, and 1e-2 reopened a
+# much larger one (4.9e-2) -- a margin that wide starts treating pixels with a
+# genuine, non-noise difference in falloff as tied, which is a different
+# failure than the one this exists to fix. Set in the middle of the working
+# range rather than at its edge.
+_VARCELL_TIE_MARGIN = 1e-3
+
+
+def _variable_cell_noise(
+    h: int, w: int, y0: float, x0: float, lo: float, hi: float, seed: int,
+    device: torch.device, nfields: int = 1,
+) -> torch.Tensor:
+    """Cellular ("Worley-style") noise with an independently random radius per
+    point, drawn uniformly from ``[lo, hi]`` -- genuine per-clump size
+    variation, rather than one clump size for the whole field.
+
+    ``_fbm`` cannot do this: its lattice is addressed on a single uniform
+    pitch, so every "clump" it produces is the same size by construction --
+    Octaves and Roughness change how much *structure* stacks on top of the
+    base clump, never the base clump's own size. Getting an independently
+    sized clump means giving up the uniform lattice and its cheap
+    ``grid_sample`` interpolation trick, and building the field from discrete
+    points instead.
+
+    One point per cell of a base lattice pitched at ``hi`` -- the *largest*
+    radius any point can have, which is what makes the fixed-ring neighbour
+    search below exact rather than approximate (see ``_VARCELL_JITTER_LO`` and
+    ``_VARCELL_RINGS`` for the proof). Each point's position is jittered
+    within the middle half of its cell, and each draws its own radius
+    uniformly from ``[lo, hi]`` and its own brightness, all from one hash per
+    cell -- deterministic and addressed in global coordinates, so two tiles
+    asking about the same point agree.
+
+    A pixel takes its value from whichever of the candidate points has
+    the strongest claim on it -- the largest radial falloff (1 at that point's
+    own centre, 0 at its own radius, cubic in between), which is "closest
+    *relative to that point's own size*" rather than closest in raw distance.
+    That point's own signed brightness, scaled by the falloff, is the output.
+    Selecting by falloff rather than combining every candidate is what keeps
+    this reading as discrete particles with their own edges rather than as
+    fog, and it is what makes coverage gaps -- clear film base between grains,
+    where no point's falloff ever rises off zero -- an honest consequence of a
+    wide ``lo``-``hi`` range rather than a bug to paper over.
+
+    **Centred on 0.5, the same convention `_fbm` returns, and for the same
+    reason `_smooth_noise` needs it**: that function re-centres explicitly
+    (``0.5 + blur(n - 0.5, sigma) * gain``), so a field that means something
+    different at 0.5 would be blurred around the wrong point. A gap -- every
+    candidate's falloff at zero -- must land exactly on 0.5, the shared
+    "no deviation" value both the blur and the caller's later ``*2-1`` remap
+    already assume; landing gaps on raw zero instead would read as the
+    strongest possible *darkening* over most of the frame the moment any
+    range wider than a sliver of ``lo``-``hi`` left real gaps, which is
+    backwards from "nothing is here". So brightness is drawn signed, in
+    ``[-1, 1)``, and the output is ``0.5 + 0.5 * falloff * brightness``: a gap
+    (falloff 0) is 0.5 regardless of any candidate's brightness, and a pixel
+    sitting in a point's centre reaches its own brightness at full amplitude,
+    lighter or darker with equal likelihood -- matching how real grain is not
+    one-sided either.
+
+    Returns shape ``[1, nfields, h, w]``, matching `_fbm`'s convention, so it
+    drops into the same normalise-and-clamp pipeline the mono and chroma
+    global-grain fields already share. Geometry (positions and radii) is
+    identical across fields and the winning point is chosen once, shared by
+    every field; only brightness is drawn independently per field and read
+    from whichever point won -- the same "shared shape, independent value"
+    pattern ``_lattice_np`` already gives ``_fbm``'s multi-field calls, and it
+    is what lets a chroma variant share every grain's position and size across
+    channels while still giving each channel its own intensity.
+    """
+    cell = hi
+    # The ramp is monotonically increasing (cell > 0 always), so its min and max
+    # are its first and last entries -- which `_lat_span` computes in Python,
+    # saving both the scalar reads and the two full-tensor reductions that used
+    # to feed them.
+    iy0, hl = _lat_span(h, y0, cell, _VARCELL_RINGS, _VARCELL_RINGS)
+    ix0, wl = _lat_span(w, x0, cell, _VARCELL_RINGS, _VARCELL_RINGS)
+
+    # Three geometry channels (jitter y, jitter x, radius fraction) plus one
+    # brightness channel per output field, all from the one hash so a single
+    # CPU call covers the whole lattice window.
+    lat = torch.from_numpy(_lattice_np(iy0, ix0, hl, wl, seed, 3 + nfields)).to(device)
+    jy = _VARCELL_JITTER_LO + _VARCELL_JITTER_SPAN * lat[0]
+    jx = _VARCELL_JITTER_LO + _VARCELL_JITTER_SPAN * lat[1]
+    rad = lo + lat[2] * (hi - lo)
+    bri = lat[3:] * 2.0 - 1.0  # [nfields, hl, wl], signed -- see the docstring
+
+    cell_iy = torch.arange(iy0, iy0 + hl, device=device, dtype=torch.float32)[:, None]
+    cell_ix = torch.arange(ix0, ix0 + wl, device=device, dtype=torch.float32)[None, :]
+    py = (cell_iy + jy) * cell  # [hl, wl], this cell's point in working px
+    px = (cell_ix + jx) * cell
+
+    Y = (torch.arange(h, device=device, dtype=torch.float32) + float(y0))[:, None]
+    X = (torch.arange(w, device=device, dtype=torch.float32) + float(x0))[None, :]
+    # Cell assignment uses the true, unwarped position -- the search proof
+    # above is against this coordinate, and warping it would need a wider
+    # search to stay valid.
+    piy = (torch.floor(Y / cell).long() - iy0).clamp(0, hl - 1)  # [h, 1]
+    pix = (torch.floor(X / cell).long() - ix0).clamp(0, wl - 1)  # [1, w]
+
+    # See `_VARCELL_WARP_CELL_FRAC` -- breaks the pixel-grid/cell-grid
+    # resonance without touching which cell a pixel belongs to.
+    warp_cell = max(_MIN_CELL, _VARCELL_WARP_CELL_FRAC * cell)
+    wn = _value_noise(h, w, y0, x0, warp_cell, seed + 51, 2, device)
+    Yw = Y + (wn[0, 0] * 2.0 - 1.0) * (_VARCELL_WARP_AMOUNT * cell)
+    Xw = X + (wn[0, 1] * 2.0 - 1.0) * (_VARCELL_WARP_AMOUNT * cell)
+
+    # The winning candidate is chosen by falloff alone -- shared across every
+    # field -- and only afterward is that winner's own (per-field) brightness
+    # read out. Selecting by the product instead would let a dim, distant
+    # candidate's positive brightness beat a near-zero-falloff gap into
+    # registering as real signal, which is exactly backwards: a gap must stay
+    # a gap regardless of what any nearby point's brightness happens to be.
+    # Carries the *winning cell*, not the winning brightness. Brightness is
+    # `[nfields, h, w]`, so keeping it in the loop meant `torch.where` rewriting
+    # nfields full-frame planes on all 25 iterations -- 75 plane writes to end up
+    # using one. The flat cell index is a single plane whatever `nfields` is, and
+    # one gather afterwards reads out the winner. Measured 1.26x on this function
+    # at nfields=3 and bit-identical, which it has to be: same candidates, same
+    # order, same comparison, so the same point wins and the same brightness is
+    # read from it. The saving is mostly peak memory, which is what lets a
+    # weaker machine afford a larger tile.
+    best_shape = torch.zeros(h, w, device=device)
+    best_cell = torch.zeros(h, w, device=device, dtype=torch.long)
+    for dy in range(-_VARCELL_RINGS, _VARCELL_RINGS + 1):
+        for dx in range(-_VARCELL_RINGS, _VARCELL_RINGS + 1):
+            ny = (piy + dy).clamp(0, hl - 1)
+            nx = (pix + dx).clamp(0, wl - 1)
+            dxp = Xw - px[ny, nx]
+            dyp = Yw - py[ny, nx]
+            dist = torch.sqrt(dxp * dxp + dyp * dyp)
+            d_norm = dist / rad[ny, nx].clamp_min(1e-3)
+            shape = 1.0 - _smoothstep(0.0, 1.0, d_norm)  # [h, w]
+            # A margin, not a bare `>`: two candidates can be genuinely almost
+            # tied (a pixel near the border between two blobs), and there the
+            # coordinate arithmetic feeding `dist` differs in its last bit or
+            # two depending on how a tile happens to be padded and cropped --
+            # around 2e-5 measured. Without a margin comfortably above that
+            # noise floor, a near-tie can resolve to a *different* winning
+            # point depending on tile layout, which is not a gradual drift but
+            # a discrete jump to that other point's own brightness -- the one
+            # thing a tile-independent field must never do. The margin is
+            # fixed and the candidate order is fixed (same dy, dx sweep every
+            # time), so whichever candidate is reached first while within it
+            # keeps the win consistently, regardless of how the image was
+            # tiled to get here.
+            win = shape > best_shape + _VARCELL_TIE_MARGIN
+            best_cell = torch.where(win, (ny * wl + nx).expand(h, w), best_cell)
+            best_shape = torch.where(win, shape, best_shape)
+
+    # One gather instead of 25 masked writes. `bri` is [nfields, hl, wl] and
+    # `best_cell` indexes its flattened lattice, so this reads each pixel's
+    # winning point's own per-field brightness.
+    best_bri = bri.reshape(nfields, -1).gather(
+        1, best_cell.reshape(1, -1).expand(nfields, -1)
+    ).reshape(nfields, h, w)
+    return (0.5 + 0.5 * best_shape.unsqueeze(0) * best_bri).unsqueeze(0)
 
 
 # Scatter stencils, indexed by the ``scatter_pattern`` parameter. A stencil is
@@ -950,6 +1405,25 @@ def _smooth_noise(n: torch.Tensor, cell: float, amount: float) -> torch.Tensor:
 class GrainEngine:
     def __init__(self, device: torch.device | None = None) -> None:
         self.device = device or pick_device()
+        # Global Grain texture cache -- see `_global_grain_field`. An
+        # OrderedDict used as an LRU: `move_to_end` on a hit, pop from the front
+        # when over `_GG_CACHE_BYTES`.
+        #
+        # A plain dict needs no lock because `main._RENDER_LOCK` serialises every
+        # render. That is a load-bearing assumption borrowed from the caller: if
+        # renders ever run concurrently, this needs a lock or a per-render cache.
+        self._gg_cache: collections.OrderedDict = collections.OrderedDict()
+        self._gg_bytes = 0
+        # Hit/miss counters, for `verify.py` to assert *which* parameters miss
+        # rather than only that the output is right. A stale-cache bug renders a
+        # plausible texture, so "the numbers changed" is not enough of a test.
+        self.gg_hits = 0
+        self.gg_misses = 0
+
+    def clear_caches(self) -> None:
+        """Drop the Global Grain texture cache."""
+        self._gg_cache.clear()
+        self._gg_bytes = 0
 
     # ------------------------------------------------------------------ #
     def _grain_field(
@@ -988,6 +1462,280 @@ class GrainEngine:
         if abs(gamma - 1.0) > 1e-3:
             t = torch.sign(t) * t.abs().clamp_min(1e-6) ** gamma
         return t
+
+    # ------------------------------------------------------------------ #
+    def _global_grain_field(
+        self, h: int, w: int, y0: float, x0: float, p: dict,
+        gcell: float, gcell_max: float, variable: bool,
+    ) -> torch.Tensor:
+        """The Global Grain texture layer, normalised and clamped. Cached.
+
+        Shape is ``[1,1,h,w]`` at chroma 0 and ``[1,3,h,w]`` above it; both
+        broadcast against the frame, which is why the channel count is allowed to
+        depend on a parameter.
+
+        **Cached because it reads no image data at all.** Every input is either a
+        parameter or the tile's own global coordinates, so nudging Halation or
+        Sharpen currently pays to rebuild a texture that has not changed --
+        measured at 1.29s of a 3.70s `Stock` proxy preview, 35%. The two sliders
+        in this section anyone actually drags, `global_intensity` and
+        `global_opacity`, are applied by the *caller* as a single scalar multiply
+        and so sit outside this boundary entirely: they cannot miss the cache.
+
+        The cache key has to cover every input, and the failure mode if it does
+        not is the nasty kind -- a stale hit renders a perfectly plausible
+        texture that is simply the previous one, so nothing looks broken. What is
+        in it, and why:
+
+        * ``y0, x0, h, w`` -- **absolute global coordinates, never a tile
+          index.** The field is addressed globally (invariant 1), so keying on
+          anything relative would hand one tile another tile's texture and seam
+          every export while every preview looked fine.
+        * ``gcell, gcell_max, variable`` -- the *derived* working cells, not the
+          raw sliders. Two different (size, scale) pairs that floor to the same
+          working cell genuinely produce the same field and should share an
+          entry, and this folds in both `scale` and the supersample level for
+          free, since the caller has already multiplied them in.
+        * ``seed`` -- both field draws offset from it.
+        * ``global_smooth`` -- `_smooth_noise` is inside this boundary.
+        * ``global_chroma`` -- decides whether the second field is built at all,
+          and changes the returned channel count.
+        * the device -- these are device-resident tensors.
+
+        Deliberately *not* keyed on the image or upload: the field never reads
+        either. Two photographs of the same dimensions already get an identical
+        global-grain field today, because the lattice is addressed in absolute
+        coordinates; caching does not change that, it just stops recomputing it.
+
+        Caching the finished field rather than `_lattice_np` is the deliberate
+        choice even though the lattice would be more general. The lattice is the
+        one array in the pipeline you least want to hold: at `Stock` it is ~58
+        points per output pixel (see `_lattice_np`). This is one plane per
+        channel at working resolution.
+        """
+        key = (
+            h, w, float(y0), float(x0), gcell, gcell_max, variable,
+            int(p["seed"]), p["global_smooth"], p["global_chroma"],
+            str(self.device),
+        )
+        hit = self._gg_cache.get(key)
+        if hit is not None:
+            self._gg_cache.move_to_end(key)
+            self.gg_hits += 1
+            return hit
+        self.gg_misses += 1
+
+        def field(seed_off: int, nfields: int) -> torch.Tensor:
+            if variable:
+                return _variable_cell_noise(
+                    h, w, y0, x0, gcell, gcell_max,
+                    int(p["seed"]) + seed_off, self.device, nfields,
+                )
+            return _fbm(
+                h, w, y0, x0, gcell,
+                int(p["seed"]) + seed_off, nfields, 2, 0.5, self.device,
+            )
+
+        gg = field(7717, 1)
+        # Before the normalise-and-clamp, not after: the clamp is what
+        # gives the field its hard tails, and smoothing a clamped field
+        # would leave the plateaus it created and merely round their
+        # corners. Smoothed first, the clamp bites on a field that has
+        # already lost its extremes, so the rails are reached less often.
+        #
+        # Referenced against Max in the variable case: that is the field's
+        # own characteristic scale now (the base lattice pitch
+        # `_variable_cell_noise` places one point per cell of), where Min
+        # was the reference for the old single-size field. Smoothness on
+        # the variable field mostly softens the base-lattice boundary
+        # rather than a value-noise quilt -- there is no axis-aligned quilt
+        # here to begin with, since the points are jittered off-grid.
+        gg = _smooth_noise(gg, gcell_max if variable else gcell, p["global_smooth"])
+        gg = gg * 2.0 - 1.0
+
+        # Chroma: decorrelate the three channels without touching the
+        # monochrome field.
+        #
+        # The obvious construction is `_grain_field`'s -- draw three
+        # independent fields, take their rescaled mean as the monochrome
+        # component and blend outward. It is not used here for two reasons.
+        # It would replace the single field this layer has always been built
+        # from, rerolling every existing preset's global grain at chroma 0;
+        # and that blend does not hold amplitude, because the mean and the
+        # per-channel fields are correlated -- measured pre-clamp, it dips
+        # to 88.8% of its own strength at chroma 0.5 and returns to 99.9% by
+        # 1.0, so the slider quietly moves loudness as well as colour.
+        #
+        # Instead the mono field `m` is kept exactly as it was and a
+        # *mean-zero* deviation `d` is added on top, from its own seed.
+        # Because `d` sums to zero across channels its statistics are fixed
+        # -- var 2/3 and covariance -1/3 of a single field -- and the two
+        # coefficients can be solved rather than guessed:
+        #
+        #     g_c = A*m + B*d_c,   A = sqrt(1 - 2/3 c),  B = sqrt(c)
+        #
+        # gives unit variance and cross-channel correlation exactly `1 - c`
+        # at every setting. Measured: correlation 1.000 / 0.501 / 0.001 at
+        # chroma 0 / 0.5 / 1, pre-clamp amplitude flat to 0.6%, and chroma 0
+        # bit-identical to the old layer (max channel spread 0.0).
+        #
+        # The one thing that does move is the clamp below. Mixing in `d`
+        # gaussianises the field, so it reaches the rails less often --
+        # clipping falls 25.4% -> 22.8% across the slider -- and since a
+        # clipped sample sits at exactly +-1 rather than wherever it was
+        # headed, less clipping means slightly less measured sigma. Rendered
+        # amplitude therefore drifts 100% -> 96.8% from chroma 0 to 1. That
+        # is the hard tails doing their job, not the blend, and it is a
+        # third of the wobble the other construction has.
+        gc = p["global_chroma"]
+        if gc > 0.001:
+            # Same construction as `gg` above (fBm or variable-cell,
+            # whichever `variable` selected), through the same closure --
+            # the decorrelation below only needs `gs` to be a second field
+            # of comparable amplitude, but sharing the geometry generator
+            # means a variable-size chroma field reuses each grain's own
+            # position and radius across channels and only randomises its
+            # per-channel brightness, which is what gives a coloured grain
+            # its speckle without moving its shape from channel to channel.
+            gs = field(3391, 3)
+            gs = _smooth_noise(gs, gcell_max if variable else gcell, p["global_smooth"])
+            gs = gs * 2.0 - 1.0
+            gd = gs - gs.mean(dim=1, keepdim=True)
+            gg = gg * math.sqrt(1.0 - (2.0 / 3.0) * gc) + gd * math.sqrt(gc)
+
+        gg = (gg / _GNORM).clamp(-1.0, 1.0)
+
+        # LRU insert. An entry larger than the whole budget is returned without
+        # being cached rather than immediately evicting itself -- otherwise a
+        # single-tile render of a large frame would thrash the cache empty on
+        # every pass and pay the bookkeeping for nothing.
+        nbytes = gg.element_size() * gg.nelement()
+        if nbytes <= _GG_CACHE_BYTES:
+            self._gg_cache[key] = gg
+            self._gg_bytes += nbytes
+            while self._gg_bytes > _GG_CACHE_BYTES and len(self._gg_cache) > 1:
+                _, old = self._gg_cache.popitem(last=False)
+                self._gg_bytes -= old.element_size() * old.nelement()
+        return gg
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _grade(img: torch.Tensor, p: dict, scale: float) -> torch.Tensor:
+        """Colour grading, step -1: the only block above pre-blur.
+
+        Everything below this models an emulsion. This models the *decision*
+        about what the photograph is before any of that runs -- which is why it
+        sits at the very top and why the LUT is last within it: the four
+        adjustments set the light and the tonal range, then the LUT reads the
+        picture it was meant to read.
+
+        Written to be cheap, which was the explicit ask, and there is only one
+        thing in here that is not free: four of the five stages are pure
+        per-pixel arithmetic with no kernel and no neighbourhood at all, so they
+        cost a couple of passes over the frame and add nothing to ``pad_for``.
+        Clarity is the exception -- it needs a blurred copy to find its band --
+        and it is a *single-channel* blur rather than three, because the detail
+        it extracts is added back to all three channels equally.
+
+        Tile independence comes for free everywhere except clarity, for the same
+        reason: nothing here reads a statistic of the region. The LUT is a fixed
+        table, the temperature is a constant vector, and the tone masks are
+        thresholds on each pixel's own luma. Clarity's blur is a kernel like any
+        other and is paid for in ``pad_for``.
+        """
+        temp = p["grade_temp"]
+        sh = p["grade_shadows"]
+        hl = p["grade_highlights"]
+        cl = p["grade_clarity"]
+        lut = p.get("lut")
+        mix = p["lut_amount"]
+
+        # -1a. Temperature, in linear light.
+        #
+        #      A white balance is a change in the *illuminant*, so it multiplies
+        #      light -- and gamma-encoded values are not light. Done encoded the
+        #      same gain moves the shadows much further than the highlights,
+        #      which is what makes a naive temperature slider read as a tint
+        #      laid over the picture instead of a different lamp. Same argument
+        #      as `pre_blur`'s, and gated the same way so the transfer round
+        #      trip costs nothing when the stage is off.
+        #
+        #      The gain vector is normalised by its own luma so the control is
+        #      colour-only: warming a frame must not also expose it, or every
+        #      other tonal control in the app is being fought by this one.
+        if abs(temp) > 0.001:
+            g = _GRADE_TEMP_GAIN * temp
+            gain = [1.0 + g, 1.0, 1.0 - g]
+            norm = sum(w * c for w, c in zip(_LUMA, gain))
+            gain = torch.tensor(
+                [c / norm for c in gain], device=img.device, dtype=img.dtype,
+            ).view(1, 3, 1, 1)
+            img = _linear_to_srgb(_srgb_to_linear(img) * gain).clamp(0.0, 1.0)
+
+        # -1b/c. Shadows and highlights, display-referred.
+        #
+        #        Both are a fraction of the headroom that is *actually there*:
+        #        going up, a share of the distance to white; coming down, a
+        #        share of the distance to zero. That is what makes them
+        #        clip-free by construction rather than by a clamp -- for any
+        #        setting in range the map is affine with a positive slope and
+        #        both endpoints inside 0..1, so no channel can leave the cube
+        #        and none can cross another, which is what would break a hue.
+        #
+        #        One luma, measured before either runs, shared by both masks.
+        #        Recomputing it between them would make lifting the shadows
+        #        change what the highlight control considers a highlight, and
+        #        the two sliders would pull on each other -- the same
+        #        independence `lum_ref` buys the grain masks further down.
+        if abs(sh) > 0.001 or abs(hl) > 0.001:
+            lum = _luma(img)
+            if abs(sh) > 0.001:
+                m = (1.0 - _smootherstep(0.0, _GRADE_TONE_KNEE, lum)) * _GRADE_TONE_MAX
+                img = img + (sh * m) * ((1.0 - img) if sh > 0 else img)
+            if abs(hl) > 0.001:
+                m = _smootherstep(_GRADE_TONE_KNEE, 1.0, lum) * _GRADE_TONE_MAX
+                img = img + (hl * m) * ((1.0 - img) if hl > 0 else img)
+
+        # -1d. Clarity: two-way local contrast on one band.
+        #
+        #      The band is the luma's own high-pass at the chosen radius, added
+        #      back to all three channels. Doing it on luminance rather than per
+        #      channel is both the cheaper and the better choice -- one blur
+        #      instead of three, and because the same signed amount goes to R, G
+        #      and B the hue is held exactly, so a saturated area cannot be
+        #      pushed out of gamut by a control that is meant to be about
+        #      structure.
+        #
+        #      The negative side is capped at gain 1.0 while the positive side
+        #      gets _GRADE_CLARITY_GAIN. That asymmetry is deliberate: at gain 1
+        #      a setting of -1 subtracts exactly the band it measured, i.e. the
+        #      local contrast is gone. Past that it does not keep flattening, it
+        #      reverses -- a dark halo on the light side of every edge, which is
+        #      an artifact rather than a look. There is no such ceiling going
+        #      the other way.
+        if abs(cl) > 0.001:
+            r = max(0.5, p["grade_clarity_radius"] * scale)
+            lum_c = _luma(img)
+            detail = lum_c - _blur(lum_c, r)
+            gain_c = cl * (_GRADE_CLARITY_GAIN if cl > 0 else 1.0)
+            img = (img + gain_c * detail).clamp(0.0, 1.0)
+
+        # -1e. The 3D LUT, last in the section, on the graded frame.
+        #
+        #      Applied display-referred because that is the space a .cube is
+        #      authored in -- its axes are code values, not light. Mixed as a
+        #      straight cross-fade, which is the honest reading of "50% of this
+        #      LUT" and is what every grading application means by it.
+        #
+        #      `lut` is absent from `p` unless a request resolved one, and the
+        #      service zeroes `lut_amount` when it could not, so this gate and
+        #      `params.is_neutral` can never disagree about whether the stage
+        #      runs.
+        if lut is not None and mix > 0.001:
+            graded = _apply_lut(img, lut).clamp(0.0, 1.0)
+            img = graded if mix >= 0.999 else img + (graded - img) * mix
+
+        return img
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -1249,6 +1997,17 @@ class GrainEngine:
         h, w = img.shape[-2:]
         hp_r = max(0.3, p["highpass_radius"] * scale)
         mb = p["micro_blur"] * scale
+
+        # -1. Colour grading, above everything -- temperature, shadows,
+        #     highlights, clarity, then the 3D LUT. See _grade.
+        #
+        #     Above `pre_blur` rather than anywhere else because this is the
+        #     decision about what the photograph *is*; every stage below it is
+        #     the emulsion's response to that photograph. Putting it after the
+        #     film stages would mean grading grain, halation and dust along with
+        #     the picture, and a LUT built to be fed a photograph would be being
+        #     fed a rendered negative instead.
+        img = self._grade(img, p, scale)
 
         # 0. Pre-blur, on the untouched input, in linear light.
         #
@@ -1723,68 +2482,34 @@ class GrainEngine:
         #     `global_chroma` asks otherwise -- see below for why that is built
         #     as a separate mean-zero field rather than by the main grain's
         #     recipe.
+        #
+        #     `global_size_max` (2026-08-04, on request) is the one thing here
+        #     that is not just another knob on this same field -- it swaps the
+        #     construction entirely. Reported as "too digital a job": `_fbm`
+        #     stacks octaves of a *single* clump size, so no matter how rough or
+        #     how many octaves, every grain is the same diameter. Above Min,
+        #     `_variable_cell_noise` replaces it with discrete points that each
+        #     draw their own radius uniformly between Min and Max, which is
+        #     what makes clumps genuinely differ from their neighbours rather
+        #     than all sharing one stacked structure. See that function for the
+        #     construction and `pad_for` for why its reach is Max, not Min.
         gi = p["global_intensity"]
         go = p["global_opacity"]
         if gi > 0.01 and go > 0.001:
             gcell = max(_MIN_CELL, p["global_size"] * scale)
-            gg = _fbm(
-                h, w, y0, x0, gcell,
-                int(p["seed"]) + 7717, 1, 2, 0.5, self.device,
+            # Max can never pull the effective ceiling *below* Min: clamped up
+            # to it rather than swapped with it, so a preset that raises Min
+            # alone (global_size_max still at its own untouched default) can
+            # never accidentally cross into the variable-size construction --
+            # the two are not a symmetric pair the way the light-leak sizes
+            # are, because Min already has an established meaning on its own
+            # and Max is purely "how much further can it stretch".
+            gcell_max = max(gcell, p["global_size_max"] * scale)
+            variable = (gcell_max - gcell) > 1e-3
+
+            gg = self._global_grain_field(
+                h, w, y0, x0, p, gcell, gcell_max, variable,
             )
-            # Before the normalise-and-clamp, not after: the clamp is what
-            # gives the field its hard tails, and smoothing a clamped field
-            # would leave the plateaus it created and merely round their
-            # corners. Smoothed first, the clamp bites on a field that has
-            # already lost its extremes, so the rails are reached less often.
-            gg = _smooth_noise(gg, gcell, p["global_smooth"])
-            gg = gg * 2.0 - 1.0
-
-            # Chroma: decorrelate the three channels without touching the
-            # monochrome field.
-            #
-            # The obvious construction is `_grain_field`'s -- draw three
-            # independent fields, take their rescaled mean as the monochrome
-            # component and blend outward. It is not used here for two reasons.
-            # It would replace the single field this layer has always been built
-            # from, rerolling every existing preset's global grain at chroma 0;
-            # and that blend does not hold amplitude, because the mean and the
-            # per-channel fields are correlated -- measured pre-clamp, it dips
-            # to 88.8% of its own strength at chroma 0.5 and returns to 99.9% by
-            # 1.0, so the slider quietly moves loudness as well as colour.
-            #
-            # Instead the mono field `m` is kept exactly as it was and a
-            # *mean-zero* deviation `d` is added on top, from its own seed.
-            # Because `d` sums to zero across channels its statistics are fixed
-            # -- var 2/3 and covariance -1/3 of a single field -- and the two
-            # coefficients can be solved rather than guessed:
-            #
-            #     g_c = A*m + B*d_c,   A = sqrt(1 - 2/3 c),  B = sqrt(c)
-            #
-            # gives unit variance and cross-channel correlation exactly `1 - c`
-            # at every setting. Measured: correlation 1.000 / 0.501 / 0.001 at
-            # chroma 0 / 0.5 / 1, pre-clamp amplitude flat to 0.6%, and chroma 0
-            # bit-identical to the old layer (max channel spread 0.0).
-            #
-            # The one thing that does move is the clamp below. Mixing in `d`
-            # gaussianises the field, so it reaches the rails less often --
-            # clipping falls 25.4% -> 22.8% across the slider -- and since a
-            # clipped sample sits at exactly +-1 rather than wherever it was
-            # headed, less clipping means slightly less measured sigma. Rendered
-            # amplitude therefore drifts 100% -> 96.8% from chroma 0 to 1. That
-            # is the hard tails doing their job, not the blend, and it is a
-            # third of the wobble the other construction has.
-            gc = p["global_chroma"]
-            if gc > 0.001:
-                gs = _fbm(
-                    h, w, y0, x0, gcell,
-                    int(p["seed"]) + 3391, 3, 2, 0.5, self.device,
-                )
-                gs = _smooth_noise(gs, gcell, p["global_smooth"])
-                gs = gs * 2.0 - 1.0
-                gd = gs - gs.mean(dim=1, keepdim=True)
-                gg = gg * math.sqrt(1.0 - (2.0 / 3.0) * gc) + gd * math.sqrt(gc)
-
-            gg = (gg / _GNORM).clamp(-1.0, 1.0)
             out = out + gg * ((gi / 100.0) * _AMP_SCALE * go)
 
         # 14. Output sharpening -- deliberately the last thing in the pipeline.
@@ -2257,7 +2982,8 @@ class GrainEngine:
     def pad_for(self, p: dict, scale: float) -> int:
         """Overlap needed so a rendered region matches the full-image render.
 
-        Must cover every blur kernel in the pipeline: the high-pass chain, the
+        Must cover every blur kernel in the pipeline: the clarity high-pass at
+        the very top, the high-pass chain, the
         acutance blur (the widest at 1.5x), the pre-blur and micro-blur, the
         edge-softening blur, the global-grain smoothing blur, the output
         sharpening blur and halation, plus the
@@ -2271,6 +2997,16 @@ class GrainEngine:
         # micro-blur reads pixels the pre-blur has already spread, so their
         # reaches add rather than the widest winning.
         mb = (p["micro_blur"] + p["pre_blur"]) * scale
+        # Clarity's high-pass is the only kernel in the whole colour-grading
+        # section -- the other four stages are per-pixel and reserve nothing.
+        # It is a real reach even though the stage runs first: the band it
+        # subtracts is measured over this radius, so a tile that cannot see far
+        # enough computes a different band at its own edge, and that difference
+        # then propagates through everything below it.
+        clar = (
+            p["grade_clarity_radius"] * scale
+            if abs(p["grade_clarity"]) > 0.001 else 0.0
+        )
         halo = p["halation_radius"] * scale if p["halation"] > 0.01 else 0.0
         soft = p["edge_soften_radius"] * scale if p["edge_soften"] > 0.01 else 0.0
         shr = p["sharpen_radius"] * scale if p["sharpen"] > 0.01 else 0.0
@@ -2310,11 +3046,35 @@ class GrainEngine:
         # Global-grain smoothing is a blur on the noise field, so it reaches
         # like every other kernel here. It is gated on the layer being on --
         # with intensity or opacity at zero the field is never built.
+        #
+        # Referenced against the *effective* cell -- max(Min, Max) after the
+        # same up-clamp `render()` applies -- not against Min alone. Above Min,
+        # the field itself is built on a lattice pitched at Max, and the blur
+        # is measured against that same reference, so a tile computed here
+        # with only Min in view would under-reserve and the export would seam
+        # exactly where Max exceeds Min.
         gsm = 0.0
+        # Same floored min and up-clamped max render() computes, not the raw
+        # slider values -- matched exactly, including the floor, so this gate
+        # and render()'s own `variable` decision can never disagree about
+        # whether the field switched construction.
+        gcell_lo = max(_MIN_CELL, p["global_size"] * scale)
+        g_eff = max(gcell_lo, p["global_size_max"] * scale)
+        variable_gate = (g_eff - gcell_lo) > 1e-3
         if (p["global_intensity"] > 0.01 and p["global_opacity"] > 0.001
                 and p["global_smooth"] > 0.001):
-            gsm = (p["global_smooth"] * _SMOOTH_MAX
-                   * max(_MIN_CELL, p["global_size"] * scale))
+            gsm = p["global_smooth"] * _SMOOTH_MAX * g_eff
+        # `_variable_cell_noise` reads lattice cells up to `_VARCELL_RINGS` away
+        # from a pixel's own -- a real read reach, not merely an addressing
+        # convenience, because the render pipeline only ever hands it a padded
+        # window rather than the whole image. Under-reserve this and a pixel
+        # near a tile edge silently substitutes a clamped boundary cell for the
+        # true neighbour, which two different tile splits do differently --
+        # invisible in a single preview, a seam in a tiled export.
+        varcell_r = 0.0
+        if (p["global_intensity"] > 0.01 and p["global_opacity"] > 0.001
+                and variable_gate):
+            varcell_r = _VARCELL_RINGS * g_eff
         mask_r = max(1.0, 3.0 * scale)
         # Scatter reads a pixel up to its full reach away. It displaces rather
         # than blurring, so it belongs with the warps below and not in the
@@ -2353,11 +3113,81 @@ class GrainEngine:
             jit += _SAND_PASSES * (2.0 * sr + dir_reach)
         return int(
             math.ceil(
-                3.0 * (hp_r * 3.3 + mb + halo + soft + shr + tex_r + mask_r
-                       + gsm + aa_r)
+                3.0 * (hp_r * 3.3 + mb + clar + halo + soft + shr + tex_r
+                       + mask_r + gsm + aa_r + varcell_r)
                 + jit + aa_tap
             )
         ) + 4
+
+    # ------------------------------------------------------------------ #
+    def tile_for(
+        self, p: dict, scale: float, h: int, w: int, ss: int,
+    ) -> int:
+        """Largest tile whose working set fits the memory budget.
+
+        Tiling is pure overhead: `pad_for` overlap is read, rendered and thrown
+        away on all four sides, so a smaller tile does strictly more work for the
+        same output. Measured on a 2400x1600 `Stock` proxy at supersample 2,
+        fresh process each, best of 3:
+
+        | tile | tiles | overdraw | time  |
+        |------|-------|----------|-------|
+        | 1024 |   6   |  1.59x   | 4.46s |
+        | 1536 |   4   |  1.32x   | 3.70s |
+        | 2048 |   2   |  1.15x   | 3.30s |
+        | 4096 |   1   |  1.00x   | 2.77s |
+
+        Interior *export* tiles are the worst case, since they pad on all four
+        sides: 1024 + 2*178 = 1380 square rendered for 1024 square kept, 1.82x.
+
+        **So why not simply always use one tile?** Because memory is the binding
+        constraint and it is the thing this codebase's own "quality beats speed"
+        licence does not cover -- an out-of-memory render is not slow, it is
+        broken. Peak driver-allocated memory on the sweep above went 6.0GB at
+        tile 1536 to 8.0GB at 2048. On an 8GB machine that swaps or dies, and an
+        8GB machine is exactly where the tiling matters most.
+
+        Hence a budget rather than a constant. Note the coupling this creates
+        with `pad_for`, which is the right one and which the old hard-coded 1024
+        and 1536 got wrong in both directions: a wide-kernel preset pads more, so
+        it *gets a smaller tile*, because its working set per tile is larger for
+        the same nominal tile.
+
+        `_WORKING_BYTES_PER_PX` is measured, not guessed -- see its comment. The
+        answer is clamped into `_TILE_MIN`..`_TILE_MAX` and never exceeds what
+        the image actually needs, so a small frame still renders in one pass.
+        """
+        pad = self.pad_for(p, scale)
+        budget = _render_budget_bytes()
+        ss = max(1, int(ss))
+        longest = max(h, w)
+
+        def fits(tile: int) -> bool:
+            # The padded read window is *clamped to the image* (see
+            # `render_image`), so the worst tile is bounded by the frame, not by
+            # `tile + 2 * pad`. Solving the square upper bound in closed form
+            # instead over-predicts badly once the tile approaches the image
+            # size -- it wanted 2 tiles for a proxy that comfortably fits in one.
+            th = min(h, min(tile, h) + 2 * pad)
+            tw = min(w, min(tile, w) + 2 * pad)
+            return (th * ss) * (tw * ss) * _WORKING_BYTES_PER_PX <= budget
+
+        # Descending search rather than closed form: `fits` is monotonic in
+        # `tile`, the candidate list is short, and this keeps the memory model in
+        # one readable place instead of inverted through algebra.
+        tile = _TILE_MIN
+        for cand in range(min(_TILE_MAX, longest), _TILE_MIN, -128):
+            if fits(cand):
+                tile = cand
+                break
+        # Never below _TILE_MIN even if the budget says so: there the overlap
+        # dominates the useful area so completely that the extra work costs more
+        # than the memory it saves, and every supported backend can hold a tile
+        # this size.
+        tile = max(_TILE_MIN, tile)
+        # No point in a tile larger than the image -- `render_image`
+        # short-circuits to a single untiled pass when `tile >= max(h, w)`.
+        return min(tile, longest)
 
     def render_view(
         self, arr: np.ndarray, p: dict, box: tuple[int, int, int, int],
@@ -2431,16 +3261,28 @@ class GrainEngine:
     def render_image(
         self, arr: np.ndarray, p: dict, scale: float = 1.0,
         tile: int = 1024, supersample: int = 2, progress=None,
+        should_cancel=None,
     ) -> np.ndarray:
         """Render a whole image, tiling when it is larger than ``tile``.
 
         ``arr`` is HxWx3 float32 in 0..1. Returns the same shape.
+
+        ``should_cancel``, if given, is polled once per tile and once before the
+        single-tile path; returning true raises `RenderCancelled`. Tile
+        granularity is deliberate: it needs no plumbing inside `render`, and it
+        bounds the wasted work at one tile. It matters because the caller cannot
+        interrupt this any other way -- a Starlette threadpool worker runs to
+        completion whatever the client does, so an abandoned preview would
+        otherwise keep the render lock for its full duration and every request
+        behind it would queue on work nobody is waiting for.
         """
         # Nothing switched on: hand the input straight back. Not merely an
         # optimisation -- see params.is_neutral for why rendering it would
         # *not* return the input.
         if P.is_neutral(p):
             return arr
+        if should_cancel is not None and should_cancel():
+            raise RenderCancelled()
         ss = max(1, int(supersample))
         h, w, _ = arr.shape
         if max(h, w) <= tile:
@@ -2461,6 +3303,8 @@ class GrainEngine:
         done = 0
         for ty in range(ny):
             for tx in range(nx):
+                if should_cancel is not None and should_cancel():
+                    raise RenderCancelled()
                 y_a, y_b = ty * tile, min((ty + 1) * tile, h)
                 x_a, x_b = tx * tile, min((tx + 1) * tile, w)
                 # padded read window, clamped to the image

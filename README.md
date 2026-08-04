@@ -40,7 +40,8 @@ already held.
 ./build.sh                # compile a distribution into build/
 ./build.sh --venv         # ...and install its dependencies (slow -- torch)
 ./build.sh --clean        # wipe build/ first
-cd build && ./run.sh      # run the distribution
+./build/run.sh            # run the distribution (or: cd build && ./run.sh)
+./run-prod.sh             # rebuild and run in one step, reusing this project's env
 ```
 
 `build/` is self-contained apart from the Python environment: the compiled
@@ -54,8 +55,12 @@ it says so and prints the two commands that fix it. To reuse this project's
 environment without installing a second copy of torch:
 
 ```bash
-cd build && FILM_GRAIN_PYTHON=../.venv/bin/python ./run.sh
+FILM_GRAIN_PYTHON=../.venv/bin/python ./build/run.sh
 ```
+
+`./run-prod.sh` does exactly this automatically -- it rebuilds via `./build.sh`
+and then launches `build/run.sh`, pointing it at this project's own `.venv`
+unless `build/.venv` already exists or `$FILM_GRAIN_PYTHON` is already set.
 
 `HOST=0.0.0.0 ./run.sh` will expose it on the network. There is no auth and no
 rate limiting, so only do that on a network you trust.
@@ -120,6 +125,71 @@ process without one is broken rather than degraded and should not boot.
 * Choose **PNG 16-bit** when the file is going on for further grading — 8-bit
   visibly posterises grain in smooth areas, and JPEG's edge ringing compounds
   through another round of processing.
+
+### Colour Grading, and 3D LUTs
+
+The first section in the panel, and the first thing in the pipeline — above
+Pre Blur and above every film stage. Everything below it models an emulsion;
+this is the decision about what the photograph *is* before any of that runs.
+It all ships at 0, so nothing here changes an existing look until you ask.
+
+The section reads in the order it runs:
+
+* **Temperature** — a warm/cool shift, done as channel gains in *linear* light,
+  which is where a white balance physically happens. The gains are normalised
+  against the luma weights, so warming a frame does not also expose it (measured:
+  overall luminance holds to within 1% across the whole slider).
+* **Shadows** / **Highlights** — a lift or a crush on each half of the range,
+  over a broad quintic ramp so there is no line across a gradient. Both are a
+  share of the headroom that is actually there, so **neither can clip and neither
+  can break a hue** at any setting — that is by construction, not by a clamp
+  afterwards. Their masks are read from the frame as it arrived, so the two do
+  not pull on each other. Negative Highlights is the useful direction most of the
+  time: it pulls blown highlights back *before* the LUT and the film pipeline get
+  hold of them, which is the one thing no amount of Shoulder can recover later.
+* **Clarity**, two-way — positive adds local contrast, negative takes it away.
+  Above 0 it is mid-frequency punch without the halos of a small-radius sharpen;
+  below 0 it flattens the same band into a soft, hazy, lifted look. **The two
+  directions are deliberately not the same strength**: negative stops exactly
+  where the band is *gone* (−1 removes 100% of it) and cannot go further into
+  inverted contrast, which would put dark halos on the light side of every edge.
+  Positive has no such ceiling and goes to 255% of the band. It runs on luminance
+  only, so it holds hue **exactly** and costs one single-channel blur rather than
+  three. **Clarity Radius** picks which band, as a length at full resolution.
+* **LUT** — pick a `.cube` from the `luts/` folder, or **Load .cube…** to use one
+  from disk for this session. **LUT Mix** cross-fades it in; part-way is the
+  normal way to use a film LUT that is stronger than the photograph wants.
+  Picking a LUT raises Mix to 1 if it was at 0, because a picker that appears to
+  do nothing is worse than one that commits.
+
+The LUT is applied display-referred, on the source, before every film stage —
+which is what a `.cube` expects, and it means the grain, halation and texture
+below all land on the graded picture instead of being graded themselves.
+
+**Adding a LUT is dropping a `.cube` in `luts/`**, exactly like `presets/`. They
+are referenced **by filename**, not by position in the folder: an index would be
+silently renumbered by the next file you added, changing the look of every preset
+that named one. A preset file carries its LUT as a `lut` key beside
+`reference_mp`, and a name that no longer resolves renders with no LUT and says
+so in the picker rather than pretending the grade is still there.
+
+Both 3D LUT sizes in the wild are handled (35- and 64-cube here); `DOMAIN_MIN` /
+`DOMAIN_MAX`, comments and vendor keywords are all read, 1D LUTs are refused with
+a reason. Uploads are capped at 24MB and live in process memory, so they do not
+survive a restart — a folder LUT does.
+
+**It is cheap, which was the point.** Four of the five stages are pure per-pixel
+arithmetic: no kernel, no neighbourhood, nothing added to the tile overlap.
+Clarity is the only one that costs anything, and only when it is on. Measured on
+a 6MP render at 2×, best of 3 in fresh processes:
+
+| | time | tile overlap |
+|---|---|---|
+| section off | 0.67s | 108px |
+| Temperature, Shadows, Highlights, or a LUT at Mix 1 | 0.67–0.73s (inside MPS variance) | 108px |
+| Clarity at the default 14px radius | 0.75s | 150px |
+| Clarity at 40px | 0.88s | 228px |
+| everything at once | 0.82s | 150px |
 
 ### Light leaks
 
@@ -324,11 +394,11 @@ Effectively free, and it widens the tile overlap by a few pixels.
 
 ### Global Grain goes blocky, and Global Smoothness is why
 
-Past about 8px of **Global Size** the layer stops looking like grain and starts
-looking pixelated. That is the noise itself, not a bad setting: it is built on
-an axis-aligned lattice, so its cells read as rectangles once they are large
-enough to see. Adding octaves or changing the seed cannot help — every octave
-sits on the same kind of lattice.
+Past about 8px of **Global Size Min** the layer stops looking like grain and
+starts looking pixelated. That is the noise itself, not a bad setting: it is
+built on an axis-aligned lattice, so its cells read as rectangles once they
+are large enough to see. Adding octaves or changing the seed cannot help —
+every octave sits on the same kind of lattice.
 
 **Global Smoothness** blurs the layer by up to half a clump, which measurably
 removes 82% of the grid and leaves rounded clumps. It is free to use in the one
@@ -336,7 +406,19 @@ way that matters: the strength is held constant as you raise it (within 2.5%
 across the whole slider), so it changes the *shape* of the grain and not how
 much there is. Global Intensity remains the only amplitude control.
 
-Global Size now runs to 20px.
+Global Size Min now runs to 20px.
+
+### Global Size Max: clumps that genuinely differ from their neighbours
+
+**Global Size** is now **Global Size Min**, and a **Global Size Max** sits
+next to it, defaulting equal to Min so nothing changes until you move it. Above
+Min, the layer stops drawing one uniform grain size and switches to clumps that
+each independently pick their own diameter somewhere between the two — the fix
+for Global Grain reading as too even and manufactured. This is not a gradual
+blend: the moment Max moves past Min the layer changes *kind*, not just range,
+so expect a visible shift in character rather than a smooth fade-in. A wide gap
+between Min and Max can leave visible clear patches between grains — real film
+has them too, but narrow the gap if it reads as too sparse.
 
 Sliders only render on release, not during the drag — a fit preview is seconds
 of work, so rendering every intermediate position just queues frames that are
@@ -404,10 +486,13 @@ server/
   params.py    parameter schema -- single source of truth for engine and UI
   engine.py    the grain pipeline (see module docstring for the invariants)
   imageio.py   decode/encode, including a 16-bit RGB PNG writer
+  lut.py       .cube 3D LUT loading, from the folder and from an upload
   main.py      FastAPI service
 web/src/
   App.tsx      UI, schema-driven slider panel
   api.ts       typed client
+presets/       preset library -- files, not code
+luts/          3D LUTs -- drop a .cube in and it is in the menu
 ```
 
 ## Verify
@@ -417,8 +502,8 @@ pipenv run python tests/verify.py
 ```
 
 Checks tile independence, crop fidelity, colour pass-through, luminance
-response, edge bias, scatter, blue compensation and 16-bit PNG validity — 116
-checks. Run it after
+response, edge bias, scatter, blue compensation, the colour-grading section and
+its `.cube` parsing, and 16-bit PNG validity — 188 checks. Run it after
 touching `server/engine.py`; it exits non-zero on failure.
 
 ## Invariants worth not breaking
