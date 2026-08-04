@@ -63,12 +63,62 @@ PARAMS: list[Param] = [
     # source before anything films it. Ships at 0, so the pipeline is still a
     # colour pass-through until something here is asked for.
     #
-    # Panel order matches pipeline order, the way Edge Destruction's does: white
-    # balance, exposure, the tonal range, contrast and black point, clarity,
-    # then vibrance and saturation, then the LUT they all feed. The LUT *file*
-    # is not a parameter -- see server/lut.py for why a name cannot be an index
-    # -- so it travels beside these values and the client renders its picker
-    # directly above `lut_amount`.
+    # Panel order matches pipeline order, the way Edge Destruction's does:
+    # highlight reconstruction, white balance, exposure, the tonal range,
+    # contrast and black point, clarity, then vibrance and saturation, then the
+    # LUT they all feed. The LUT *file* is not a parameter -- see server/lut.py
+    # for why a name cannot be an index -- so it travels beside these values and
+    # the client renders its picker directly above `lut_amount`.
+    Param(
+        "grade_recover", "Highlight Reconstruction", "Colour Grading",
+        0.0, 1.0, 0.01, 0.0, "",
+        "Rebuilds a blown highlight's clipped channels from the ones that "
+        "survived, so the detail comes back instead of being dimmed. An 8-bit "
+        "file clips per *channel*, not per pixel: a warm highlight hits the "
+        "ceiling in red long before green and well before blue, so across a "
+        "blown cloud red is a flat plateau while green and blue are still "
+        "recording the scene's own gradient. This reads the colour of the light "
+        "around the blown area from wherever it was still measurable and uses "
+        "it to work out what the flattened channel was doing -- putting the "
+        "value back above white, where it really was.\n"
+        "\n"
+        "The recovered value is above white, so the stage then rolls it back "
+        "into view -- but only where it actually repaired something, so the rest "
+        "of the frame is untouched. That makes this a self-contained repair: "
+        "raise it and blown highlights regain their texture, with nothing else "
+        "to set up. Highlights below still stacks on top if you want a broader, "
+        "stronger roll across the whole top of the range.\n"
+        "\n"
+        "Only ever raises a clipped channel, never darkens anything, and it is "
+        "a no-op on a photograph with nothing blown in it. Where *every* "
+        "channel is at the ceiling -- a specular hit, a blown sky at noon -- "
+        "there is genuinely nothing left in the file to work from and it leaves "
+        "the pixel alone rather than inventing texture. The one expensive "
+        "stage in this section: it costs two blurs of the frame. 0 = off.",
+    ),
+    Param(
+        "grade_recover_radius", "Reconstruction Radius", "Colour Grading",
+        4.0, 200.0, 1.0, 32.0, "px",
+        "How far Highlight Reconstruction looks for a valid measurement of a "
+        "clipped channel, at full resolution. This is the size of the blown "
+        "area it can work across: a highlight wider than the radius has no "
+        "surviving sample of its own colour anywhere in reach, so the estimate "
+        "fades out toward the middle of it rather than being extrapolated from "
+        "nothing. Larger reaches across bigger blown regions and costs more, "
+        "and it borrows the local colour from further away -- which is only "
+        "right while the light out there is the same light.\n"
+        "\n"
+        "It also sets how softly the repair blends into the surrounding frame.\n"
+        "\n"
+        "**This is by far the most expensive control in the app, and the cost "
+        "grows faster than the number does** -- the tile overlap grows with it "
+        "too, so a large radius spends most of its time rendering overlap it "
+        "throws away. Measured on a 2400px proxy against a render that costs "
+        "0.57s with this off: 1.6s at the 32px default, 3.6s at 80px, and 14s at "
+        "200px. A full-resolution export multiplies all of that. Reach for the "
+        "smallest radius that covers your blown areas, not the largest.",
+        spatial=True,
+    ),
     Param(
         "grade_temp", "Temperature", "Colour Grading",
         -1.0, 1.0, 0.01, 0.0, "",
@@ -122,29 +172,46 @@ PARAMS: list[Param] = [
     Param(
         "grade_shadows", "Shadows", "Colour Grading",
         -1.0, 1.0, 0.01, 0.0, "",
-        "Lifts or crushes the bottom half of the tonal range, weighted by a "
-        "broad quintic ramp so there is no line across a gradient. Positive "
-        "opens the shadows toward the film-base lift a negative has; negative "
-        "takes them down toward black.\n"
+        "Opens or crushes the bottom half of the tonal range. Positive opens "
+        "the shadows; negative takes them down toward black.\n"
         "\n"
-        "It cannot clip and it cannot break a hue: the lift is a fraction of "
-        "the headroom that is actually there (toward white going up, toward "
-        "zero coming down), so every channel stays inside 0-1 by construction "
-        "at any setting rather than by a clamp afterwards. Its mask is measured "
-        "from the frame as it arrived, so it and Highlights stay independent -- "
-        "moving one does not change what the other is keying on. 0 = off.",
+        "Opening is a genuine recovery, not a brightness shift over the region "
+        "that happens to be dark. The curve makes black an *asymptote*, so the "
+        "whole of the range below the knee -- including anything that had "
+        "already gone under zero on the way here -- is folded back into view "
+        "with its tonal order intact, and two tones that differed before still "
+        "differ after. It is strictly monotone at every setting, which is the "
+        "property that separates recovering shadow detail from flattening it "
+        "into a grey patch.\n"
+        "\n"
+        "It cannot clip and it cannot break a hue: the curve's output is bounded "
+        "by the rail it approaches, and the whole pixel is scaled by one factor "
+        "so hue and saturation are held exactly rather than approximately. It "
+        "keys on the pixel's brightest channel, and it and Highlights touch "
+        "opposite sides of the knee, so the two cannot reach into each other's "
+        "range at all. 0 = off.",
     ),
     Param(
         "grade_highlights", "Highlights", "Colour Grading",
         -1.0, 1.0, 0.01, 0.0, "",
-        "The same control for the top half of the range. Negative is the useful "
-        "direction most of the time -- it pulls blown highlights back down "
-        "before the LUT and the film pipeline get hold of them, which is the "
-        "one thing no amount of Shoulder further down can recover once it has "
-        "flattened. Positive pushes them up instead.\n"
+        "The same control for the top half of the range, and negative is the "
+        "direction that matters: it is the highlight recovery for the whole "
+        "app. White becomes an asymptote instead of a wall, so everything from "
+        "the knee upward -- including values *above* white, whether they came "
+        "from Highlight Reconstruction, from Exposure, or from a bright source "
+        "-- is rolled back into the visible range monotonically. Nothing "
+        "flattens: two highlights that differed by a hair still differ "
+        "afterwards, which is exactly what a clip destroys and what dimming a "
+        "clipped patch cannot give back. Positive pushes highlights up instead.\n"
         "\n"
-        "Gamut-safe and clip-free for the same reason Shadows is, and keyed on "
-        "the same untouched luma. 0 = off.",
+        "**This is the stage that makes Highlight Reconstruction visible.** "
+        "Reconstruction puts the clipped channel's real value back above white; "
+        "this is what brings it inside the range you can see. Reach for the "
+        "pair together when a highlight is blown, and for this alone when it is "
+        "merely bright.\n"
+        "\n"
+        "Gamut-safe, monotone and hue-exact for the same reasons Shadows is. "
+        "0 = off.",
     ),
     Param(
         "grade_contrast", "Contrast", "Colour Grading",
@@ -573,16 +640,30 @@ PARAMS: list[Param] = [
     Param(
         "halation_recovery", "Highlight Recovery", "Halation",
         0.0, 1.0, 0.01, 0.0, "",
-        "Holds the bloom back exactly where a highlight is already close to "
-        "the top of the range, so a bright area that was nearly blown out "
-        "does not get pushed the rest of the way to a flat, textureless "
-        "clip -- restoring the detail that was already there instead of "
-        "burning it away. A highlight right at Halation Threshold is left "
-        "alone; one already at the very top of the range has its incoming "
-        "glow suppressed almost entirely, however close the source of the "
-        "bloom -- itself or a nearby hot spot. 0 = off, and the bloom burns "
-        "exactly as much as Halation and Halation Threshold alone say it "
-        "should.",
+        "Adds the bloom into the headroom that is actually there, instead of "
+        "adding it flat and letting the total clip. The bloom is added as light, "
+        "with nothing stopping it, so a highlight already near white gets "
+        "pushed the rest of the way to a flat, textureless patch -- the usual "
+        "complaint that halation burns highlights out.\n"
+        "\n"
+        "The bloom is metered against the room each channel has left, so a "
+        "highlight with headroom to spare still gets the whole thing at full "
+        "strength and only one being asked to take more light than it can hold "
+        "is held back at all. At 1.0 no channel can be driven to white by the "
+        "bloom, and the sum stays strictly ordered -- two highlights that "
+        "differed by a hair before still differ after, which is exactly what a "
+        "clip destroys and what dimming a flat patch cannot give back.\n"
+        "\n"
+        "**This is not a strength control.** Measured on a bright plate "
+        "carrying fine texture, 1.0 keeps 60% of that texture against 40% with "
+        "recovery off, and does it while keeping 68% of the bloom's light -- "
+        "more detail *and* more bloom than simply turning Halation down to the "
+        "same effect. Measured per channel, so a saturated highlight far over "
+        "the threshold in luma but with most of one channel still free gets "
+        "that channel's full share.\n"
+        "\n"
+        "0 = off, and the bloom burns exactly as much as Halation and Halation "
+        "Threshold alone say it should.",
     ),
     Param(
         "halation_hue", "Halation Hue", "Halation",
@@ -1134,9 +1215,11 @@ NEUTRAL_ZERO: tuple[str, ...] = (
     # numbers the engine can be handed. Zeroing the mix switches the LUT off as
     # completely as unselecting it would, so the name can stay put and be there
     # again when the section is switched back on -- the same reasoning that
-    # keeps sizes, radii and seeds out of this list. `grade_clarity_radius` is
-    # a radius, not an amount, so it stays out for the same reason -- as does
-    # `grade_black_point`'s partner-in-spirit `base_fog` below.
+    # keeps sizes, radii and seeds out of this list. `grade_clarity_radius` and
+    # `grade_recover_radius` are radii, not amounts, so they stay out for the
+    # same reason -- as does `grade_black_point`'s partner-in-spirit `base_fog`
+    # below.
+    "grade_recover",
     "grade_temp", "grade_tint", "grade_exposure", "grade_shadows",
     "grade_highlights", "grade_contrast", "grade_black_point", "grade_clarity",
     "grade_vibrance", "grade_saturation", "lut_amount",

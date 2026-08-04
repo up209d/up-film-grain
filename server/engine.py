@@ -137,10 +137,12 @@ _GRADE_TEMP_GAIN = 0.40
 # brings the worst case to 1.4%, in the same envelope as Temperature.
 _GRADE_TINT_GAIN = 0.30
 #
-# Where the shadow and highlight ramps meet. Both are quintic over half the
-# range, so every pixel is in exactly one of them and a smooth gradient shows
-# no seam between them. Not exposed: a knee plus a falloff per end would be four
-# more sliders for a section that is meant to stay cheap and quick.
+# Where the shadow and highlight ramps meet. Each control acts on one side of
+# it only -- so every pixel is in exactly one of them, the two are independent
+# by construction rather than by bookkeeping, and both curves leave the knee at
+# slope exactly 1, which is what makes the join invisible on a gradient without
+# a ramp to fade them in. Not exposed: a knee plus a falloff per end would be
+# four more sliders for a section that is meant to stay cheap and quick.
 _GRADE_TONE_KNEE = 0.5
 #
 # How far a tone lift can travel at +/-1, as a share of the headroom it has.
@@ -155,7 +157,69 @@ _GRADE_TONE_KNEE = 0.5
 # is a fair thing to find at the end of the travel -- and +0.3 gives the natural
 # one-stop-ish lift you actually reach for. Same lesson as `_JITTER_MAX`, from
 # the other direction: a control whose whole range has to be usable.
+#
+# Applies to the *expanding* half of each control only -- Shadows negative and
+# Highlights positive, which push a tone toward the rail it is already nearest.
+# The recovering halves (Shadows positive, Highlights negative) do not use it:
+# they are asymptotic rolls whose endpoint is fixed by the curve's own shape,
+# and a share-of-headroom cap is exactly what made them non-monotonic. See
+# `_tone_roll`.
 _GRADE_TONE_MAX = 0.35
+#
+# Where a channel starts counting as clipped, for highlight reconstruction: the
+# soft window over which "this is a real measurement" becomes "this hit the
+# ceiling and the true value is somewhere above it".
+#
+# Soft rather than a single threshold because the window doubles as the blend
+# weight, and a hard switch would draw a visible contour around every blown
+# region. The top is just short of 1.0 rather than at it because an 8-bit
+# ceiling is 255/255 and JPEG ringing puts real clipped pixels a code value or
+# two either side of it.
+_RECON_LO = 0.94
+_RECON_HI = 0.999
+#
+# How much local evidence a channel needs before its reconstruction is trusted,
+# as a share of the neighbourhood that still holds a valid measurement of that
+# channel. Below this the estimate fades out rather than being divided into
+# existence: in the middle of a region blown wide in every channel there is
+# genuinely nothing to recover from, and saying so is better than inventing it.
+_RECON_MIN_EVIDENCE = 0.02
+#
+# Ceiling on a reconstructed value, in display-referred units -- two stops above
+# white. The estimate divides by the local chromaticity of whichever channels
+# survived, so a highlight lit by something the surviving channel barely sees
+# (deep blue in tungsten light) has a small denominator and would otherwise run
+# away. Two stops is more headroom than any 8-bit source can justify and still
+# bounded.
+_RECON_CEIL = 4.0
+#
+# Knee for reconstruction's own roll -- the curve that brings what it recovered
+# back inside the visible range, without which the whole stage is invisible.
+#
+# High, at 0.80, and that is the point: the recovered data lands just above
+# white, so only the top fifth of the range has to give way to make room for it.
+# A knee at `_GRADE_TONE_KNEE` (0.5) would work too and would be the wrong
+# control -- that is a broad highlight roll, i.e. what `grade_highlights` is
+# for, and duplicating it here would mean reconstruction quietly graded the
+# picture as well as repairing it.
+_RECON_ROLL_KNEE = 0.80
+#
+# How wide to smooth the roll's gate, as a fraction of the reconstruction
+# radius. The gate is the reconstruction's own weight field, so the roll engages
+# only where something was actually repaired -- but a per-pixel gate would draw
+# an edge around every repaired region, so it is dilated and feathered.
+#
+# 0.25 rather than the 0.5 first tried, and it is better on every axis measured,
+# which is worth recording because the larger value looks like the safer one. The
+# gate only has to be wide enough not to contour: swept against the second
+# derivative of a repaired ramp, 0.05 starts introducing curvature the source
+# does not have (3.2e-03 against the source's own 2.2e-03) while 0.10, 0.25 and
+# 0.50 all sit at 1.4e-03, so 0.25 clears it with a 5x margin. Going wider then
+# only costs -- the recovered span holds flatter across the radius at 0.25
+# (0.0736 / 0.0736 / 0.0735 / 0.0657 against 0.5's 0.0736 / 0.0735 / 0.0650 /
+# 0.0654 at 8/16/32/64px) and `pad_for` at the top of the radius range is 933px
+# against 1233px.
+_RECON_ROLL_GATE_FRAC = 0.25
 # Gain on the positive side of Clarity. The negative side is pinned at exactly
 # 1.0 and cannot be raised: at gain 1 a setting of -1 removes precisely 100% of
 # the local-contrast band, and anything past that does not flatten further, it
@@ -819,6 +883,266 @@ def _soft_knee(x: torch.Tensor, amount: float, span: float) -> torch.Tensor:
     denom = max(1.0 - knee, 1e-4)
     t = ((x - knee) / denom).clamp_min(0.0)
     return torch.where(x > knee, knee + denom * torch.tanh(t), x)
+
+
+def _shoulder(t: torch.Tensor) -> torch.Tensor:
+    """``1 - exp(-t)``: the roll every recovery in this file blends toward.
+
+    Slope 1 at the knee, so it joins the identity without a seam; asymptotes at
+    1, so an unbounded input lands inside a bounded output; strictly increasing
+    everywhere, so ordering -- and therefore detail -- is never lost. Shared by
+    `_tone_roll` and by highlight reconstruction's own local roll so the two
+    cannot drift apart.
+    """
+    return 1.0 - torch.exp(-t)
+
+
+def _tone_roll(t: torch.Tensor, amount: float) -> torch.Tensor:
+    """The one monotone curve behind both tone-recovery directions.
+
+    ``t`` is distance from the knee toward a rail, in units of the distance to
+    that rail: ``t = 0`` is the knee, ``t = 1`` is the rail itself, and
+    ``t > 1`` is a value that has already left the cube -- which is the whole
+    reason this exists. Returns the rolled distance, to be mapped back the same
+    way it came in.
+
+    ``amount > 0`` recovers: a convex blend of the identity and the exponential
+    shoulder ``1 - exp(-t)``, so at 1.0 the rail becomes an *asymptote*. Two
+    properties fall out of that and both are the point:
+
+    * **Strictly monotone at every setting.** The slope is
+      ``1 - amount * (1 - exp(-t))``, which for ``amount <= 1`` is bounded below
+      by ``exp(-t) > 0``. Ordering is never lost, so neither is detail: two
+      tones that differ before the curve still differ after it.
+    * **Unbounded input, bounded output.** Anything from the knee to infinity
+      lands inside the cube, monotonically. That is what makes over-range data
+      -- from reconstruction, from exposure, from a bright source -- *visible*
+      rather than clipped flat, and it is the difference between recovering a
+      highlight and merely dimming it.
+
+    ``amount < 0`` expands instead, and keeps the old share-of-headroom form:
+    ``t + |amount| * _GRADE_TONE_MAX * quintic(t) * (1 - t)``. Also monotone
+    (measured slope stays above ``1 - _GRADE_TONE_MAX``), and it cannot drive an
+    in-gamut value out of the cube, which is the guarantee that half of each
+    control has always made.
+
+    The asymmetry is deliberate and is the same shape of decision Clarity's is:
+    pushing a tone toward a rail and pulling one back off it are different
+    operations, and one formula that did both would do neither well. What made
+    the previous single formula fail was precisely that its strength was a
+    function of the pixel's own level -- ``x + a * m(x) * (1 - x)`` with ``m``
+    rising steeply through the band it was gating -- so in the recovering
+    direction the ``m'`` term overwhelmed the ``1`` and the transfer *inverted*:
+    measured slope **-0.21 over 16% of the range at 1.0**, which does not
+    compress highlight detail, it destroys and flips it. Hence a curve whose
+    monotonicity is a property of its own algebra rather than of how far the
+    slider happens to be pushed.
+    """
+    if amount >= 0.0:
+        # (1 - a) * t + a * shoulder(t), written so a = 0 returns t exactly.
+        return t + amount * (_shoulder(t) - t)
+    ramp = _smootherstep(0.0, 1.0, t)
+    return t + (-amount) * _GRADE_TONE_MAX * ramp * (1.0 - t)
+
+
+def _recon_estimate(
+    img: torch.Tensor, amount: float, radius: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The estimate half of highlight reconstruction: what was the clipped value?
+
+    Returns ``(out, w)`` -- the image with clipped channels raised to their
+    estimated true values, which are **above 1.0** by design, and the per-channel
+    weight that raising was applied with. `_reconstruct_highlights` then rolls
+    that back into the visible range; the two are split so the estimate's
+    accuracy can be checked as an equality against a known unclipped scene
+    without the roll's compression in the way, which is exactly what
+    ``verify.py`` does.
+
+    An 8-bit file clips per channel, not per pixel, and that asymmetry is the
+    opening this works through: a warm highlight reaches the ceiling in red
+    long before green and well before blue, so across a blown cloud the red
+    channel is a flat plateau while green and blue are still recording the
+    scene's own gradient. The detail is *in the file*; it is only missing from
+    one channel at a time. Where every channel is at the ceiling there is
+    genuinely nothing left, and this says so rather than inventing it.
+
+    Per channel, in display-referred space:
+
+    * ``clipped`` is the soft indicator over ``_RECON_LO.._RECON_HI``, and
+      ``valid = 1 - clipped`` marks what is still a real measurement.
+    * ``q`` is each channel's local level, blurred over ``radius`` but averaged
+      **only over whole clean pixels** -- ones with nothing clipped in any
+      channel -- so a plateau of ceiling values contributes nothing to the
+      estimate of what its own colour should be, and every channel's mean is a
+      mean over the *same* pixels. That second half is load-bearing; see the
+      comment in the body for the 6% ratio error that using each channel's own
+      mask produced, and for why that error made the whole stage a no-op.
+      Normalising ``q`` by its own luma-weighted mean across channels gives
+      ``k``, the local chromaticity: the colour of the light around here,
+      measured where it could be measured.
+    * ``guide`` is this pixel's own brightness read off whichever channels are
+      still valid, divided back through ``k`` so a surviving channel that the
+      local light happens to be poor in does not read as a darker pixel. With
+      one channel valid it reduces exactly to ``x_c / k_c``.
+    * ``recon = k * guide`` is then the pixel's brightness wearing the local
+      chromaticity -- and it exceeds 1.0 exactly as far as the clipped channel
+      really did.
+
+    Only ever *raises* a channel, and only ever a clipped one, weighted by how
+    clipped it is and by whether there was evidence to work from -- so an
+    unblown photograph is untouched and this half cannot darken anything.
+
+    Tile-independent for the ordinary reason: two fixed-radius blurs and
+    per-pixel arithmetic, no statistic of the region anywhere.
+    """
+    lw = torch.tensor(_LUMA, device=img.device, dtype=img.dtype).view(1, 3, 1, 1)
+    clipped = _smoothstep(_RECON_LO, _RECON_HI, img)
+    valid = 1.0 - clipped
+
+    # Local chromaticity, averaged over **whole clean pixels** -- ones with
+    # nothing clipped in any channel -- rather than over each channel's own
+    # valid mask.
+    #
+    # That distinction is the difference between this working and this quietly
+    # not working, and it took a measurement to see. Averaging each channel over
+    # wherever *it* was valid compares means taken over different sets of
+    # pixels: red's mask stops at the clip boundary while green's runs on into
+    # the brighter region past it, so red's mean is drawn from a darker
+    # neighbourhood than green's and the ratio between them comes out
+    # compressed. Measured on a warm ramp clipping in red only, the estimate
+    # landed at k_R = 1.136 against a true 1.205 -- a 6% underestimate, which is
+    # enough to put the reconstruction *below* the ceiling it was recovering
+    # from, so the ``clamp_min(0)`` swallowed it and the stage did precisely
+    # nothing. One shared mask makes every channel's mean a mean over the same
+    # pixels, and the ratio exact.
+    #
+    # Note the two masks answer different questions and both are needed:
+    # `clean` is "is this *pixel* a trustworthy sample of the local colour",
+    # `valid` below is "is this *channel* of this pixel a trustworthy reading of
+    # its brightness".
+    clean = valid.amin(dim=1, keepdim=True)
+    den = _blur(clean, radius)
+    q = _blur(img * clean, radius) / den.clamp_min(1e-3)
+    ev = _smoothstep(0.0, _RECON_MIN_EVIDENCE, den)
+
+    # Normalised so a neutral neighbourhood gives k = 1 in every channel.
+    # `_LUMA` sums to 1, so this is a mean and not merely a sum.
+    qg = (q * lw).sum(dim=1, keepdim=True)
+    k = q / qg.clamp_min(1e-4)
+
+    # This pixel's brightness from its surviving channels, read through the same
+    # chromaticity so the two are on one scale. With a single channel valid it
+    # reduces to x_c / k_c.
+    wv = lw * valid
+    guide = (wv * img).sum(dim=1, keepdim=True) / (wv * k).sum(
+        dim=1, keepdim=True).clamp_min(1e-4)
+    recon = (k * guide).clamp(0.0, _RECON_CEIL)
+
+    # Two more things have to be true before a value is trusted. There has to
+    # have been a clean pixel within reach to read the colour from (`ev`), and
+    # this pixel has to have at least one channel of its own left to read its
+    # brightness off -- one white in all three has nothing to be recovered from
+    # and must come through untouched rather than through a division by an
+    # epsilon.
+    w = amount * clipped * ev
+    return img + w * (recon - img).clamp_min(0.0), w
+
+
+def _reconstruct_highlights(
+    img: torch.Tensor, amount: float, radius: float,
+) -> torch.Tensor:
+    """`_recon_estimate`, then the roll that makes its result *visible*.
+
+    Kept as one stage behind one slider because either half alone is useless: the
+    estimate without the roll is invisible, and the roll without the estimate is
+    just a highlight dimmer. ``pad_for`` carries all three of the kernels
+    involved, in series.
+    """
+    out, w = _recon_estimate(img, amount, radius)
+
+    # The roll that makes any of that *visible*, which the first version of this
+    # stage left out and which made the whole control read as dead.
+    #
+    # Reconstruction's output is above 1.0 -- that is the entire point, it is
+    # where the clipped channel really was -- and the section's final clamp then
+    # took it straight back off, so the slider moved 0.0004 of mean level on a
+    # real photograph. Reported as "I don't see any effect from those sliders at
+    # all", and correct. Pairing it with Highlights did work (0.395 of max change
+    # against 0.05) but a control that needs a second, differently-named control
+    # to do anything is broken however clearly the help text says so.
+    #
+    # There is a hard constraint here worth stating, because it rules out the
+    # tidier designs: **any curve that brings over-range data into view must move
+    # in-gamut highlights too.** A gamut map with its knee exactly at 1.0 has to
+    # jump -- it would send v = 1 to 1 - d -- so a smooth one needs its knee
+    # below 1, and everything above that knee moves. "Visible on its own" and
+    # "bit-exact no-op" are therefore in genuine conflict for a *global* curve.
+    #
+    # The way out is to make it **local**: gate the roll on reconstruction's own
+    # weight field, blurred. Then the conflict dissolves rather than being
+    # traded off --
+    #
+    # * where nothing was repaired the gate is 0, the roll is the identity, and
+    #   an unblown photograph comes through **bit-exactly** untouched, which is
+    #   the property that keeps this a repair tool and not a second highlight
+    #   grade;
+    # * where something was repaired the roll engages and the recovered detail
+    #   appears;
+    # * and the gate is smooth, so there is no contour at the boundary -- a
+    #   per-pixel gate would outline every repaired region.
+    #
+    # Same `_shoulder` as `_tone_roll`, but applied **per channel** -- the
+    # opposite of the tone stage's channel-max-and-uniform-scale, and the
+    # difference is not stylistic.
+    #
+    # Uniform scaling holds hue *exactly*, which is a virtue in the tone stage
+    # because its input is near the cube already. Here the input can be 2-4x over
+    # white in **one** channel, and holding the ratio exact then means dragging
+    # the other two down by the same factor. Measured on a real photograph before
+    # this was changed: a bright warm highlight at (1.000, 0.871, 0.634) came out
+    # (1.000, 0.305, 0.222) -- luma 0.882 -> 0.447, a **dark saturated red where a
+    # bright highlight had been**, on about 6% of the frame. Exactly the artifact
+    # this stage exists to remove, introduced by the stage itself.
+    #
+    # Per channel, each rolls against its own headroom: the reconstructed 2.0 in
+    # red comes back to just under white while green barely moves and blue, below
+    # the knee, is untouched. The highlight stays bright and loses a little
+    # saturation -- which is what film does as a dye layer approaches saturation,
+    # and is the same behaviour `highlight_desat` models further down the
+    # pipeline. Fitting an out-of-gamut brightness into the cube costs either
+    # saturation or luminance; for a highlight, saturation is the right one to
+    # spend.
+    # **Dilate before feathering, or the radius fights the repair.** A plain blur
+    # of the weight field dilutes it: a blown region 120px across, gated through
+    # a sigma-100 blur, comes out with a peak well under 1, so the roll weakens
+    # and *less* of the recovered range becomes visible. Measured before this
+    # was added, the recovered span ran 0.069 at a 16px radius down to 0.041 at
+    # 200px -- i.e. reaching further to find the colour made the repair fainter,
+    # which is not what the control says it does.
+    #
+    # Growing the mask first and feathering the grown version is the standard fix
+    # and it decouples the two: the gate stays saturated across everything that
+    # was repaired, whatever the radius, and only its outer ramp widens.
+    # Separable, as two 1-D max pools, because a single 2-D pool at a 200px
+    # radius is a 401x401 window.
+    # Dilate **wider than the feather**, or the gate never saturates: a blur of a
+    # mask dilated by exactly its own sigma pulls the peak back below 1 near the
+    # mask's edge, so the roll runs at partial strength and leaves over-range
+    # values for the hard clamp to flatten -- the original bug, in miniature.
+    # Growing by 2x the feather leaves the interior at a clean 1.0.
+    rg = max(1, int(round(radius * _RECON_ROLL_GATE_FRAC)))
+    rd = 2 * rg
+    gate = w.amax(dim=1, keepdim=True)
+    gate = F.max_pool2d(gate, (1, 2 * rd + 1), stride=1, padding=(0, rd))
+    gate = F.max_pool2d(gate, (2 * rd + 1, 1), stride=1, padding=(rd, 0))
+    gate = _blur(gate, float(rg))
+    d = 1.0 - _RECON_ROLL_KNEE
+    t = ((out - _RECON_ROLL_KNEE) / d).clamp_min(0.0)
+    return torch.where(
+        out > _RECON_ROLL_KNEE,
+        _RECON_ROLL_KNEE + d * (t + gate * (_shoulder(t) - t)),
+        out,
+    )
 
 
 # Middle grey (0.18 linear) sits near here once sRGB-encoded; the straight-line
@@ -1645,20 +1969,29 @@ class GrainEngine:
         exposure and the tonal adjustments set the light and the tonal range,
         then the LUT reads the picture it was meant to read.
 
-        Written to be cheap, which was the explicit ask, and there is only one
-        thing in here that is not free: every stage but Clarity is pure
-        per-pixel arithmetic with no kernel and no neighbourhood at all, so they
-        cost a couple of passes over the frame and add nothing to ``pad_for``.
-        Clarity is the exception -- it needs a blurred copy to find its band --
-        and it is a *single-channel* blur rather than three, because the detail
-        it extracts is added back to all three channels equally.
+        Written to be cheap, which was the explicit ask, and two of the twelve
+        stages are the only ones that are not free: everything else is pure
+        per-pixel arithmetic with no kernel and no neighbourhood at all, so it
+        costs a couple of passes over the frame and adds nothing to ``pad_for``.
+        Clarity needs a blurred copy to find its band, and it is a
+        *single-channel* blur rather than three because the detail it extracts is
+        added back to all three channels equally. Highlight reconstruction needs
+        two three-channel blurs to find what the light was doing around a blown
+        region -- the one stage here that was accepted as expensive on purpose,
+        because the alternative is losing the highlight.
 
-        Tile independence comes for free everywhere except clarity, for the same
-        reason: nothing here reads a statistic of the region. The LUT is a fixed
-        table, temperature/tint are constant vectors, exposure is a constant
-        multiply, and the tone, contrast, black-point, vibrance and saturation
-        stages are all thresholds or gains on each pixel's own luma. Clarity's
-        blur is a kernel like any other and is paid for in ``pad_for``.
+        Tile independence comes for free everywhere except those two, for the
+        same reason: nothing here reads a statistic of the region. The LUT is a
+        fixed table, temperature/tint are constant vectors, exposure is a
+        constant multiply, and the tone, contrast, black-point, vibrance and
+        saturation stages are all curves or gains on each pixel's own level.
+        Both blurs are kernels like any other and are paid for in ``pad_for``.
+
+        Clamping happens **once**, after the tone stage, and not after each
+        stage. That is load-bearing rather than tidy: white balance and exposure
+        can push a value out of the cube, and clipping it there is precisely
+        what made the highlight control a brightness shift over an already-flat
+        patch instead of a recovery.
         """
         temp = p["grade_temp"]
         tint = p["grade_tint"]
@@ -1670,8 +2003,27 @@ class GrainEngine:
         cl = p["grade_clarity"]
         vib = p["grade_vibrance"]
         sat = p["grade_saturation"]
+        rec = p["grade_recover"]
         lut = p.get("lut")
         mix = p["lut_amount"]
+
+        # -1z. Highlight reconstruction, above everything including white
+        #      balance -- the only stage in this section that adds information
+        #      rather than rearranging it.
+        #
+        #      First because every stage below reads the picture and this
+        #      changes what the picture *is*: white balance multiplying a
+        #      channel that is sitting on the ceiling multiplies a wrong number,
+        #      exposure raises a plateau as a plateau, and the tone curve can
+        #      only roll off what it was given. Restore the channel first and
+        #      all three are working on the scene instead of on the file's
+        #      ceiling.
+        #
+        #      The one kernel here besides Clarity, and `pad_for` carries it.
+        if rec > 0.001:
+            img = _reconstruct_highlights(
+                img, rec, max(1.0, p["grade_recover_radius"] * scale),
+            )
 
         # -1a. White balance: temperature (blue/amber) and tint (green/magenta),
         #      in linear light.
@@ -1699,7 +2051,11 @@ class GrainEngine:
             gain = torch.tensor(
                 [c / norm for c in gain], device=img.device, dtype=img.dtype,
             ).view(1, 3, 1, 1)
-            img = _linear_to_srgb(_srgb_to_linear(img) * gain).clamp(0.0, 1.0)
+            # Deliberately not clamped here. A clamp would clip whichever
+            # channel the new illuminant raises, which both breaks the hue it
+            # was setting and throws away the headroom the tone stage below
+            # exists to recover; the section clamps once, after that stage.
+            img = _linear_to_srgb(_srgb_to_linear(img) * gain)
 
         # -1b. Exposure, in linear light, ahead of every luma-keyed mask below --
         #      Shadows, Highlights, Clarity, Vibrance and Saturation all measure
@@ -1709,32 +2065,90 @@ class GrainEngine:
         #      stops multiply that lets the sRGB encoding roll the highlights
         #      off on the way back, instead of a display-referred stretch that
         #      would clip them flat.
+        #
+        #      Not clamped, for the same reason white balance above is not: a
+        #      stop of exposure that clips here is a stop of highlight the
+        #      recovery curve below can never give back, and clipping it is
+        #      exactly the "no recovery, just a brightness shift" failure this
+        #      section had. The over-range value survives to the tone stage,
+        #      which rolls it back inside the cube with its detail intact -- or
+        #      to the single clamp after it, which is bit-identical to clamping
+        #      here when the tone controls are off.
         if abs(ev) > 0.001:
-            img = _linear_to_srgb(_srgb_to_linear(img) * (2.0 ** ev)).clamp(0.0, 1.0)
+            img = _linear_to_srgb(_srgb_to_linear(img) * (2.0 ** ev))
 
-        # -1c/d. Shadows and highlights, display-referred.
+        # -1c/d. Shadows and highlights, display-referred: tone *recovery*, not
+        #        a brightness shift over the region that happens to be bright.
         #
-        #        Both are a fraction of the headroom that is *actually there*:
-        #        going up, a share of the distance to white; coming down, a
-        #        share of the distance to zero. That is what makes them
-        #        clip-free by construction rather than by a clamp -- for any
-        #        setting in range the map is affine with a positive slope and
-        #        both endpoints inside 0..1, so no channel can leave the cube
-        #        and none can cross another, which is what would break a hue.
+        #        Two decisions, and each fixes something the share-of-headroom
+        #        version above them got wrong.
         #
-        #        One luma, measured before either runs, shared by both masks.
-        #        Recomputing it between them would make lifting the shadows
-        #        change what the highlight control considers a highlight, and
-        #        the two sliders would pull on each other -- the same
-        #        independence `lum_ref` buys the grain masks further down.
+        #        **The curve is `_tone_roll`, which is monotone by algebra.**
+        #        The previous formula scaled its own strength by the pixel's
+        #        level through a steep quintic, and in the recovering
+        #        directions -- Shadows up, Highlights down, the two anyone
+        #        actually reaches for -- that term overwhelmed the identity and
+        #        the transfer inverted: slope **-0.21 across 16% of the range**
+        #        at full travel. A control that reverses tonal order does not
+        #        recover a highlight, it flattens it into exactly the
+        #        textureless patch it was supposed to rescue, which is what was
+        #        reported. Here the rail is an asymptote instead, so the whole
+        #        of ``[knee, infinity)`` folds into ``[knee, rail)`` with
+        #        ordering intact -- over-range data from reconstruction, from
+        #        exposure or from a bright source becomes *visible detail*
+        #        rather than a clip.
+        #
+        #        **It keys on the channel maximum and scales all three
+        #        together.** The value, not the luma, is the right question for
+        #        a control about clipping: a saturated red at (1, 0, 0) has a
+        #        channel hard against the ceiling while its luma is 0.21, and
+        #        the old luma key called that a shadow. And because the whole
+        #        pixel is scaled by one factor, hue and HSV saturation are
+        #        preserved *exactly* rather than approximately -- a uniform
+        #        scale cannot move a ratio -- while gamut safety is structural:
+        #        the curve's output is bounded by the rail, so every channel,
+        #        being at or below the maximum, is too.
+        #
+        #        The two halves need no shared reference and no ordering rule.
+        #        Highlights only touches ``v > knee`` and cannot push a value
+        #        below it; Shadows only touches ``v < knee`` and cannot push one
+        #        above. Their supports are disjoint, so they are independent by
+        #        construction -- a stronger version of what one shared luma was
+        #        buying, and it cannot be got wrong by a later edit.
         if abs(sh) > 0.001 or abs(hl) > 0.001:
-            lum = _luma(img)
-            if abs(sh) > 0.001:
-                m = (1.0 - _smootherstep(0.0, _GRADE_TONE_KNEE, lum)) * _GRADE_TONE_MAX
-                img = img + (sh * m) * ((1.0 - img) if sh > 0 else img)
+            v = img.amax(dim=1, keepdim=True)
+            vt = v
             if abs(hl) > 0.001:
-                m = _smootherstep(_GRADE_TONE_KNEE, 1.0, lum) * _GRADE_TONE_MAX
-                img = img + (hl * m) * ((1.0 - img) if hl > 0 else img)
+                d = 1.0 - _GRADE_TONE_KNEE
+                t = ((vt - _GRADE_TONE_KNEE) / d).clamp_min(0.0)
+                vt = torch.where(
+                    vt > _GRADE_TONE_KNEE,
+                    _GRADE_TONE_KNEE + d * _tone_roll(t, -hl),
+                    vt,
+                )
+            if abs(sh) > 0.001:
+                d = _GRADE_TONE_KNEE
+                t = ((_GRADE_TONE_KNEE - vt) / d).clamp_min(0.0)
+                vt = torch.where(
+                    vt < _GRADE_TONE_KNEE,
+                    _GRADE_TONE_KNEE - d * _tone_roll(t, sh),
+                    vt,
+                )
+            img = img * (vt / v.clamp_min(1e-4))
+
+        # The section's one gamut clamp, and it is *here* rather than after each
+        # stage above so that white balance and exposure can hand their
+        # over-range result to the tone stage instead of having it clipped away
+        # first. That is the difference between "recover the highlight" and
+        # "recover what is left of the highlight after we threw it away": raise
+        # exposure a stop and pull Highlights back, and the picture comes back,
+        # because nothing between the two ever rounded it off to white.
+        #
+        # With both tone controls at 0 this lands on exactly the old behaviour,
+        # since a monotone brightening followed by a clamp is the same picture
+        # whichever end the clamp sits at -- and it is bit-exactly a no-op on
+        # in-gamut input, which is what keeps the neutral render untouched.
+        img = img.clamp(0.0, 1.0)
 
         # -1e. Contrast: a two-way pivot about the same middle grey the
         #      (deferred) film characteristic curve uses, done directly rather
@@ -2210,30 +2624,6 @@ class GrainEngine:
             hi = ((lum0 - thr_lin) / max(1.0 - thr_lin, 0.02)).clamp(0.0, 1.0)
             glow = _blur(hi, max(1.0, p["halation_radius"] * scale))
 
-            # 2a0. Highlight recovery: hold the bloom back exactly where the
-            #      *receiving* pixel is already this close to the top of the
-            #      range, so a highlight that was already nearly blown does
-            #      not get pushed the rest of the way to a flat clip.
-            #
-            #      Reuses `hi` rather than computing anything new: it is
-            #      already "how far this pixel sits above the threshold,
-            #      0..1", the same per-pixel field the glow's own shape is
-            #      built from -- so a pixel right at the threshold (hi=0) is
-            #      untouched and a pixel already at the top of the range
-            #      (hi=1) has its incoming glow suppressed entirely,
-            #      regardless of whether that glow originated there or
-            #      bled in from a neighbouring hot spot after the blur. That
-            #      is the point: recovery protects what the *receiving*
-            #      pixel had left, not what the source of the bloom was.
-            #
-            #      Applied to `glow` itself, before the tint and the master
-            #      amount, so it composes with both rather than needing its
-            #      own copy of either. Purely per-pixel, so `pad_for` is
-            #      unaffected -- same reasoning as blue compensation below.
-            recover = p["halation_recovery"]
-            if recover > 0.001:
-                glow = glow * (1.0 - recover * hi)
-
             # 2a. Blue compensation, applied to the image the wash is about to
             #     land on rather than to the result.
             #
@@ -2281,7 +2671,91 @@ class GrainEngine:
                 _hsv_to_rgb(p["halation_hue"], p["halation_sat"]),
                 device=lin.device, dtype=lin.dtype,
             ).view(1, 3, 1, 1)
-            lin = lin + glow * tint * (hal * 0.9)
+            add = glow * tint * (hal * 0.9)
+
+            # 2b. Highlight recovery: add the bloom into the headroom that is
+            #     actually there, instead of adding it flat and letting the
+            #     total clip.
+            #
+            #     The stage exists because halation adds light in linear space
+            #     with no ceiling until display space, so a highlight already
+            #     near white gets pushed the rest of the way to a flat,
+            #     textureless clip -- reported as halation burning highlights
+            #     out. Holding the *glow* back was the first answer and it is
+            #     the wrong one: it buys headroom by deleting the bloom, so the
+            #     highlights stop burning because the effect stopped happening
+            #     there. It also cannot restore anything, because two pixels
+            #     that both clipped are still both at 1.0 afterwards.
+            #
+            #     What this does instead is meter the light against the room
+            #     that is actually left. With ``H = 1 - lin`` the headroom each
+            #     channel still has,
+            #
+            #         add' = add * (H + add * (1 - r)) / (H + add)
+            #
+            #     which at ``r = 1`` is ``add * H / (H + add)``. Three
+            #     properties, and each is why it is this expression and not one
+            #     of the others tried:
+            #
+            #     * **Free where there is room.** For ``add << H`` it is ``add``
+            #       to first order, so an ordinary highlight with headroom to
+            #       spare gets the whole bloom at full strength and the control
+            #       costs nothing there. Only a pixel being asked to take more
+            #       light than it can hold is metered at all.
+            #     * **Cannot reach white at r = 1**, since ``add' < H`` strictly.
+            #     * **Strictly increasing in ``lin``**: d(out)/d(lin) =
+            #       ``1 - r * a^2 / (H + a)^2``, bounded below by ``1 - r`` and
+            #       positive throughout. Nothing flattens, so nothing is lost.
+            #
+            #     An exponential soft-add -- ``lin + H(1 - exp(-add/H))``, the
+            #     obvious tone-mapping answer -- was built and measured first
+            #     and is *worse*, which is worth recording because it looks
+            #     better on paper. It bends from the origin, so it compresses
+            #     hard even where the bloom was modest: on a bright plate
+            #     carrying real fine texture it held only 51% of that texture
+            #     against this expression's 60%, at less bloom retained. Bending
+            #     late beats bending smoothly when what you are protecting is
+            #     local contrast rather than the peak value.
+            #
+            #     Measured on that plate (mean 0.93, fine texture, halation 0.9
+            #     at threshold 0.6), against holding the glow back at the same
+            #     setting -- highlight texture kept / bloom light kept:
+            #
+            #     | recovery | hold the glow back | meter against headroom |
+            #     |---|---|---|
+            #     | 0.5 | 56% / 82% | 53% / 91% |
+            #     | 1.0 | 55% / 52% | **60% / 68%** |
+            #
+            #     At full strength it is better on both axes at once, which is
+            #     the whole claim: more of the highlight's detail survives *and*
+            #     more of the bloom does.
+            #
+            #     Keyed on real per-channel headroom rather than on `hi`, the
+            #     threshold field the old version used. `hi` answers "is this
+            #     pixel bright enough to bloom", which is not the question: a
+            #     saturated highlight can sit far above the threshold in luma
+            #     while one of its channels still has most of its range free,
+            #     and only that channel's own headroom knows so.
+            #
+            #     What is left on the table, measured: the remaining loss is
+            #     compression, not clipping, and it is forced -- red here is
+            #     asked to absorb 0.63 of linear light into 0.15 of headroom, so
+            #     no metering can be free. The way past it is not a better curve
+            #     but a better *model*: real halation is light that *left* the
+            #     highlight to re-expose its surroundings, so an
+            #     energy-conserving bloom would darken the core as it lights the
+            #     halo and the core's texture would survive intact. That is a
+            #     change to what halation *is* rather than to this dial, and it
+            #     would move every preset that uses the stage, so it is not done
+            #     here.
+            #
+            #     Still purely per-pixel, so `pad_for` is unaffected -- same as
+            #     blue compensation above.
+            recover = p["halation_recovery"]
+            if recover > 0.001:
+                head = (1.0 - lin).clamp_min(1e-4)
+                add = add * (head + add * (1.0 - recover)) / (head + add)
+            lin = lin + add
 
         # ---- DEVELOPMENT STAGE (density / display space) ------------------
         base = _linear_to_srgb(lin)
@@ -3110,16 +3584,36 @@ class GrainEngine:
         # micro-blur reads pixels the pre-blur has already spread, so their
         # reaches add rather than the widest winning.
         mb = (p["micro_blur"] + p["pre_blur"]) * scale
-        # Clarity's high-pass is the only kernel in the whole colour-grading
-        # section -- the other four stages are per-pixel and reserve nothing.
-        # It is a real reach even though the stage runs first: the band it
-        # subtracts is measured over this radius, so a tile that cannot see far
-        # enough computes a different band at its own edge, and that difference
-        # then propagates through everything below it.
+        # Clarity's high-pass and highlight reconstruction's neighbourhood are
+        # the only two kernels in the whole colour-grading section -- the other
+        # ten stages are per-pixel and reserve nothing. Both are real reaches
+        # even though the section runs first, and for the same reason: what they
+        # measure over their radius feeds a value that then propagates through
+        # every stage below, so a tile that cannot see far enough is wrong from
+        # the top of the pipeline down rather than only at its own border.
+        #
+        # Summed rather than the widest winning: they are stages in series, and
+        # reconstruction runs *above* clarity, so clarity's band is measured on
+        # pixels reconstruction has already changed from up to its own radius
+        # away.
         clar = (
             p["grade_clarity_radius"] * scale
             if abs(p["grade_clarity"]) > 0.001 else 0.0
         )
+        if p["grade_recover"] > 0.001:
+            # Two kernels in series inside the one stage: the chromaticity
+            # estimate reads `radius`, and its own weight field is then blurred
+            # again by `radius * _RECON_ROLL_GATE_FRAC` to gate the roll. The
+            # second reads pixels the first already spread, so they add.
+            # Three kernels in series inside the one stage: the chromaticity
+            # estimate reads `radius`, then its weight field is dilated by
+            # `radius * _RECON_ROLL_GATE_FRAC` and feathered by the same again to
+            # gate the roll. Each reads pixels the previous one already spread,
+            # so all three add. The dilation is a hard reach like a warp rather
+            # than a kernel, but it is counted in here with the others because it
+            # sits between two blurs and the sum is what has to be covered.
+            rr = max(1.0, p["grade_recover_radius"] * scale)
+            clar += rr * (1.0 + 2.0 * _RECON_ROLL_GATE_FRAC)
         halo = p["halation_radius"] * scale if p["halation"] > 0.01 else 0.0
         soft = p["edge_soften_radius"] * scale if p["edge_soften"] > 0.01 else 0.0
         shr = p["sharpen_radius"] * scale if p["sharpen"] > 0.01 else 0.0

@@ -194,6 +194,7 @@ def main() -> int:
             "aa_radius",
             "dust_size", "edge_jitter", "edge_sand_grit", "edge_soften_radius",
             "global_size", "global_size_max", "grade_clarity_radius",
+            "grade_recover_radius",
             "grain_size", "hair_length",
             "halation_radius", "highpass_radius", "leak_feather",
             "leak_size_max", "leak_size_min",
@@ -387,13 +388,43 @@ def main() -> int:
         f"mean {float(plate.mean()):.3f} -> {float(evm2.mean()):.3f}",
     )
 
-    # Shadows and highlights. Two properties: each end only moves its own end,
-    # and neither can leave the cube at any setting -- the lift is a share of
-    # the headroom that is there, not an addition that then needs a clamp.
+    # Shadows and highlights. Four properties, and the first is the one the
+    # whole rewrite exists for.
     ramp = np.linspace(0.0, 1.0, 256, dtype=np.float32)
     ramp = np.repeat(np.repeat(ramp[None, :, None], 32, 0), 3, 2)
     ramp = np.ascontiguousarray(ramp)
     lo_i, hi_i = slice(0, 40), slice(216, 256)
+
+    # 1. **Strictly monotone at every setting.** This is what separates
+    #    recovering tonal detail from destroying it, and it is not a tolerance
+    #    to be relaxed: the previous share-of-headroom construction scaled its
+    #    strength by the pixel's own level through a steep quintic, and in the
+    #    two *recovering* directions -- Shadows up, Highlights down, the ones
+    #    anyone actually reaches for -- that term overwhelmed the identity and
+    #    the transfer inverted, measured slope -0.21 over 16% of the range. A
+    #    control that reverses tonal order does not pull a highlight back, it
+    #    flattens it into the textureless patch it was meant to rescue. So the
+    #    check is on the *slope of the transfer*, not on the mean level: a
+    #    mean-only test passes happily on a curve that has folded over.
+    worst_slope = 1.0
+    where = ""
+    for k in ("grade_shadows", "grade_highlights"):
+        for a in (-1.0, -0.7, -0.4, 0.4, 0.7, 1.0):
+            prof = graded({k: a}, ramp)[0, :, 0].astype(np.float64)
+            sl = float(np.diff(prof).min() * (len(prof) - 1))
+            if sl < worst_slope:
+                worst_slope, where = sl, f"{k} {a:+.1f}"
+    check(
+        "the tone curves are strictly monotone -- no setting flattens or "
+        "inverts detail",
+        worst_slope > 0.0,
+        f"worst transfer slope over 12 settings: {worst_slope:+.3f} at {where} "
+        "(the share-of-headroom construction this replaced measured -0.211)",
+    )
+
+    # 2. Neither can leave the cube from in-gamut input: the recovering halves
+    #    approach their rail asymptotically, the expanding halves are a share of
+    #    the headroom that is there.
     worst = 0.0
     for a in (-1.0, -0.5, 0.5, 1.0):
         for k in ("grade_shadows", "grade_highlights"):
@@ -403,17 +434,61 @@ def main() -> int:
         "tone lifts cannot clip", worst <= 1e-6,
         f"worst excursion outside 0..1 over 8 settings: {worst:.2e}",
     )
+
+    # 3. Each end still keys on its own end. Their supports are disjoint about
+    #    the knee now, so the far end must be *bit-exactly* untouched rather
+    #    than merely close -- a stronger claim than the shared-luma version
+    #    could make.
     s_up = graded({"grade_shadows": 1.0}, ramp)
     h_dn = graded({"grade_highlights": -1.0}, ramp)
     ds_lo = float((s_up[:, lo_i] - ramp[:, lo_i]).mean())
-    ds_hi = float((s_up[:, hi_i] - ramp[:, hi_i]).mean())
+    ds_hi = float(np.abs(s_up[:, hi_i] - ramp[:, hi_i]).max())
     dh_hi = float((h_dn[:, hi_i] - ramp[:, hi_i]).mean())
-    dh_lo = float((h_dn[:, lo_i] - ramp[:, lo_i]).mean())
+    dh_lo = float(np.abs(h_dn[:, lo_i] - ramp[:, lo_i]).max())
     check(
         "each end keys on its own end",
-        ds_lo > 0.15 and abs(ds_hi) < 0.02 and dh_hi < -0.15 and abs(dh_lo) < 0.02,
-        f"shadows +1: {ds_lo:+.3f} low / {ds_hi:+.3f} high; "
-        f"highlights -1: {dh_lo:+.3f} low / {dh_hi:+.3f} high",
+        ds_lo > 0.10 and ds_hi < 1e-6 and dh_hi < -0.10 and dh_lo < 1e-6,
+        f"shadows +1: {ds_lo:+.3f} low / {ds_hi:.2e} worst high; "
+        f"highlights -1: {dh_lo:.2e} worst low / {dh_hi:+.3f} high",
+    )
+
+    # 4. Hue and HSV saturation are held *exactly*, not approximately, because
+    #    the whole pixel is scaled by one factor taken from its brightest
+    #    channel -- a uniform scale cannot move a ratio. The old per-channel
+    #    lift keyed on a shared luma could not make this claim.
+    rng_t = np.random.default_rng(7)
+    cols = np.ascontiguousarray(rng_t.random((48, 48, 3)).astype(np.float32))
+
+    def hsv_sat(a: np.ndarray) -> np.ndarray:
+        mx, mn = a.max(-1), a.min(-1)
+        return (mx - mn) / np.clip(mx, 1e-4, None)
+
+    worst_hs = 0.0
+    for k, a in (("grade_highlights", -1.0), ("grade_shadows", 1.0)):
+        worst_hs = max(worst_hs, float(
+            np.abs(hsv_sat(graded({k: a}, cols)) - hsv_sat(cols)).max()))
+    check(
+        "tone recovery holds hue and saturation exactly", worst_hs < 1e-5,
+        f"worst HSV-saturation change at full travel: {worst_hs:.2e}",
+    )
+
+    # 5. And the point of it all: an exposure that pushed the frame past white
+    #    is *recoverable*, because nothing between white balance and the tone
+    #    stage clips it away first. Without the recovery the top of the frame is
+    #    a flat plateau; with it, the gradient is back.
+    up = np.linspace(0.30, 0.92, 400, dtype=np.float32)
+    up = np.ascontiguousarray(np.repeat(np.repeat(up[None, :, None], 32, 0), 3, 2))
+    ev_flat = graded({"grade_exposure": 1.0}, up)
+    ev_rec = graded({"grade_exposure": 1.0, "grade_highlights": -1.0}, up)
+
+    def flat_frac(a: np.ndarray) -> float:
+        return float((a >= 0.999).mean())
+
+    check(
+        "an over-exposed highlight is recoverable, not merely dimmable",
+        flat_frac(ev_flat) > 0.2 and flat_frac(ev_rec) < 1e-6,
+        f"+1 stop leaves {flat_frac(ev_flat) * 100:.1f}% of the frame flat at "
+        f"white; Highlights -1 takes it to {flat_frac(ev_rec) * 100:.2f}%",
     )
 
     # Contrast. Unlike Shadows/Highlights above, this one is allowed to clip --
@@ -543,12 +618,161 @@ def main() -> int:
         " > ".join(f"{g * 100:.0f}%" for g in ggains),
     )
 
-    # pad_for has to know about the one kernel in this section. Everything else
+    # -- highlight reconstruction ------------------------------------------
+    # An 8-bit file clips per *channel*, so a warm highlight is a flat plateau
+    # in red while green and blue are still recording the scene's gradient --
+    # the detail is in the file, missing from one channel at a time. This
+    # rebuilds the flattened channel from the local chromaticity measured
+    # wherever it was still measurable, and puts it back *above* white where it
+    # really was; Highlights then rolls it into view.
+    #
+    # The plate is the whole test: a warm ramp (1.00, 0.80, 0.62) running from
+    # 0.40 to 1.45, so `truth` is what the scene was and `shot` is what an
+    # 8-bit file could hold of it. That gives an exact answer to check against
+    # rather than a "looks recovered" judgement.
+    print("\ncolour grading: highlight reconstruction")
+    rh_h, rh_w, rh_edge = 400, 400, 280
+    rt = np.concatenate([
+        np.linspace(0.40, 1.00, rh_edge), np.linspace(1.00, 1.45, rh_w - rh_edge),
+    ]).astype(np.float32)[None, :]
+    truth = np.ascontiguousarray(
+        (np.stack([rt * 1.00, rt * 0.80, rt * 0.62], -1)
+         * np.ones((rh_h, 1, 1), np.float32)).astype(np.float32))
+    shot = np.ascontiguousarray(np.clip(truth, 0.0, 1.0))
+    blown = shot[..., 0] >= 0.999
+
+    # Trilinear-exact in spirit: the reconstruction of a channel whose true
+    # value is known must *equal* it, not merely move toward it, wherever there
+    # is a clean sample of the local colour within reach. Checked at 0/20/40px
+    # into the blown zone at a 64px radius, which reaches all of it.
+    from server.engine import _recon_estimate  # noqa: E402
+    from server.engine import _RECON_ROLL_KNEE as _RECON_ROLL_KNEE_V  # noqa: E402
+    ten = torch.from_numpy(shot).permute(2, 0, 1).unsqueeze(0).to(eng.device)
+    prof = _recon_estimate(ten, 1.0, 64.0)[0].cpu().numpy()[0, 0].mean(0)
+    tprof = truth[..., 0].mean(0)
+    errs = [abs(prof[rh_edge + d] - tprof[rh_edge + d]) / tprof[rh_edge + d]
+            for d in (0, 20, 40, 60, 90)]
+    check(
+        "reconstruction recovers the true clipped value, not an approximation",
+        max(errs) < 0.01,
+        "worst error against the unclipped scene at 0/20/40/60/90px into the "
+        "blown zone: " + " / ".join(f"{e * 100:.1f}%" for e in errs),
+    )
+
+    # Beyond the radius there is no surviving sample of the channel's own colour
+    # anywhere in reach, and the honest answer is to stop rather than
+    # extrapolate. Checked as a *degradation*, so a future change that silently
+    # started inventing values out there would fail here.
+    prof16 = _recon_estimate(ten, 1.0, 16.0)[0].cpu().numpy()[0, 0].mean(0)
+    deep = rh_edge + 100
+    check(
+        "reconstruction fades out past its radius instead of extrapolating",
+        abs(prof16[deep] - shot[..., 0].mean(0)[deep]) < 1e-4,
+        f"at 100px into the blown zone with a 16px radius it leaves the pixel "
+        f"at {prof16[deep]:.4f}, the file's own value",
+    )
+
+    # **The slider has to do something on its own.** The first version left the
+    # estimate above white and relied on Highlights to bring it into view, so it
+    # measured 0.0004 of mean change on a real photograph and was reported as
+    # having no effect at all. The stage now finishes with its own locally-gated
+    # roll, and this is the regression test for that: reconstruction *alone*, no
+    # other control touched, must put real spread back into a channel the file
+    # has flat.
+    rec_p = {"grade_recover": 1.0, "grade_recover_radius": 32.0}
+
+    def red_span(a: np.ndarray) -> float:
+        r = a[..., 0][blown]
+        return float(r.max() - r.min())
+
+    spans = [red_span(graded({"grade_recover": a}, shot))
+             for a in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)]
+    check(
+        "reconstruction alone recovers visible detail, monotonically in the slider",
+        spans[0] < 1e-6 and spans[-1] > 0.02
+        and all(b >= a - 1e-6 for a, b in zip(spans, spans[1:])),
+        "red's span inside the blown region across the slider: "
+        + " -> ".join(f"{s:.4f}" for s in spans)
+        + f" (the file itself: {red_span(shot):.4f})",
+    )
+    hl_only = graded({"grade_highlights": -1.0}, shot)
+    check(
+        "and Highlights alone cannot -- it can only dim the flat patch",
+        red_span(hl_only) < 1e-5,
+        f"Highlights -1 leaves the blown region flat at {red_span(hl_only):.2e} "
+        "spread, which is the whole reason reconstruction exists",
+    )
+
+    # Safety. Two properties survive from the estimate-only version and one had
+    # to be replaced.
+    #
+    # It can no longer be "never darkens": the roll pulls the top of the range
+    # down to make room for what was recovered, and *any* curve that brings
+    # over-range data into view must move in-gamut values too. What replaces it
+    # is a bound on how far -- and that bound is a real regression test, because
+    # the first roll applied a uniform scale to the channel maximum (holding hue
+    # exactly, as the tone stage does) and a pixel whose red had been rebuilt to
+    # 2x its neighbours therefore had its other channels dragged down with it:
+    # (1.000, 0.871, 0.634) came out (1.000, 0.305, 0.222), a **dark saturated red
+    # where a bright highlight had been**, on 6% of the frame. Rolling per channel
+    # instead spends saturation rather than luminance, which is what film does.
+    unblown = np.ascontiguousarray(np.clip(truth * 0.55, 0, 1).astype(np.float32))
+    d_noop = float(np.abs(graded(rec_p, unblown) - graded({}, unblown)).max())
+    white = np.ascontiguousarray(np.full((rh_h, rh_w, 3), 1.0, np.float32))
+    d_white = float(np.abs(graded(rec_p, white) - white).max())
+    check(
+        "reconstruction is a bit-exact no-op unblown, and invents nothing at white",
+        d_noop < 1e-6 and d_white < 1e-6,
+        f"unblown frame {d_noop:.2e}, all-white frame {d_white:.2e}",
+    )
+    # The exact form of that claim, and the one that pins the mechanism: a channel
+    # sitting **below the roll's knee** must come out bit-identical, however far
+    # the channel beside it was rebuilt. Under the uniform scale it did not -- it
+    # was divided by the same factor as the rebuilt channel however dark it was,
+    # which is precisely how a bright warm highlight became a dark red one.
+    #
+    # Below the knee rather than merely unclipped, because the roll is a genuine
+    # per-channel highlight roll-off: a channel above 0.80 inside a repaired
+    # region is legitimately compressed a little (blue peaks at 0.90 here and
+    # moves 2.4e-03), which is the stage rolling the top of the range off, not
+    # the pixel being dragged.
+    lw_v = np.array([0.2126, 0.7152, 0.0722], np.float32)
+    base_r = graded({}, shot)
+    on_r = graded(rec_p, shot)
+    below = shot[..., 2] < _RECON_ROLL_KNEE_V
+    d_blue = float(np.abs(on_r[..., 2][below] - base_r[..., 2][below]).max())
+    drop = (base_r * lw_v).sum(-1) - (on_r * lw_v).sum(-1)
+    check(
+        "the roll spends saturation, not luminance -- a channel under the knee is "
+        "bit-exact",
+        d_blue < 1e-6 and float(drop.max()) < 0.10,
+        f"blue below the knee moves {d_blue:.2e} beside a red rebuilt to 1.45; "
+        f"worst luminance the roll spends lowering the rebuilt channel "
+        f"{float(drop.max()):.3f} (the channel-max uniform scale this replaced "
+        "dragged every channel down together and cost 0.435)",
+    )
+
+    a = graded({**rec_p, "grade_highlights": -0.6}, shot)
+    b = eng.render_image(
+        shot, {**P.sanitize({**{k: 0.0 for k in P.NEUTRAL_ZERO}, **rec_p,
+                             "grade_highlights": -0.6}), "lut": None},
+        1.0, tile=256, supersample=1)
+    d = float(np.abs(a - b).max())
+    check("tile independence with reconstruction on", d < 2e-3, f"max delta {d:.2e}")
+
+    # pad_for has to know about the two kernels in this section. Everything else
     # here is per-pixel and must reserve nothing.
     pad_off = eng.pad_for(P.sanitize({k: 0.0 for k in P.NEUTRAL_ZERO}), 1.0)
     pad_cl = eng.pad_for(
         P.sanitize({**{k: 0.0 for k in P.NEUTRAL_ZERO},
                     "grade_clarity": 1.0, "grade_clarity_radius": 40.0}), 1.0)
+    pad_rc = eng.pad_for(
+        P.sanitize({**{k: 0.0 for k in P.NEUTRAL_ZERO},
+                    "grade_recover": 1.0, "grade_recover_radius": 40.0}), 1.0)
+    pad_both = eng.pad_for(
+        P.sanitize({**{k: 0.0 for k in P.NEUTRAL_ZERO},
+                    "grade_clarity": 1.0, "grade_clarity_radius": 40.0,
+                    "grade_recover": 1.0, "grade_recover_radius": 40.0}), 1.0)
     pad_rest = eng.pad_for(
         P.sanitize({**{k: 0.0 for k in P.NEUTRAL_ZERO}, "grade_temp": 1.0,
                     "grade_tint": 1.0, "grade_exposure": 1.0,
@@ -556,11 +780,17 @@ def main() -> int:
                     "grade_contrast": 1.0, "grade_black_point": 0.2,
                     "grade_vibrance": 1.0, "grade_saturation": 1.0,
                     "lut_amount": 1.0}), 1.0)
+    # Reconstruction reserves more than its nominal radius: the estimate reads
+    # `radius`, then its weight field is dilated and feathered to gate the roll,
+    # and all three are in series. Under-reserve any of them and a tiled export
+    # seams along exactly that reach while every preview looks fine.
     check(
-        "pad_for reserves for clarity and nothing else here",
-        pad_cl >= pad_off + 3 * 40 and pad_rest == pad_off,
-        f"{pad_off}px off, {pad_cl}px at 40px clarity, {pad_rest}px with the "
-        "per-pixel stages on",
+        "pad_for reserves for clarity and reconstruction, and nothing else here",
+        pad_cl >= pad_off + 3 * 40 and pad_rc >= pad_off + 3 * 1.5 * 40
+        and pad_both >= pad_off + 3 * 2.5 * 40 and pad_rest == pad_off,
+        f"{pad_off}px off, {pad_cl}px at 40px clarity, {pad_rc}px at 40px "
+        f"reconstruction (its three kernels in series), {pad_both}px with both, "
+        f"{pad_rest}px with the per-pixel stages on",
     )
 
     # And the seam check that all of that is for: the whole section on, at
@@ -1954,12 +2184,16 @@ def main() -> int:
 
     # -- 5e5. halation highlight recovery ------------------------------------
     # The bloom is additive in linear light with no upper clamp until display
-    # space, so a highlight already close to white gets pushed the rest of
-    # the way to a flat clip -- reported as burning highlights out. Recovery
-    # holds the glow back in proportion to how little headroom the
-    # *receiving* pixel already has, reusing `hi`, the same per-pixel field
-    # the glow's own shape is built from.
-    print("\nhalation highlight recovery (hold the bloom back near white)")
+    # space, so a highlight already close to white gets pushed the rest of the
+    # way to a flat clip -- reported as burning highlights out. Recovery meters
+    # the added light against the headroom each channel *actually* has left:
+    # free where there is room, and at 1.0 unable to reach white at all.
+    #
+    # Keyed on real per-channel headroom rather than on `hi`, the threshold
+    # field the first version used -- `hi` answers "is this bright enough to
+    # bloom", which is not the same question as "how much more light can this
+    # take".
+    print("\nhalation highlight recovery (meter the bloom against headroom)")
 
     def rec_iso(over: dict, im: np.ndarray) -> np.ndarray:
         return eng.render_image(
@@ -1992,26 +2226,80 @@ def main() -> int:
     ).max())
     check("recovery 0 is bit-exactly the old behaviour", d == 0.0, f"max delta {d:.2e}")
 
-    # A flat, meaningfully-above-threshold plate has a uniform `hi`, so the
-    # attenuation on the glow it adds must equal exactly (1 - recover * hi) --
-    # an exact claim rather than "less clipping", checked against the
-    # isolated glow contribution alone (rendered minus a halation-off render
-    # of the same flat field).
+    # The exact claim, on a flat plate where every quantity is a scalar: the
+    # added light must be metered by exactly (H + a(1-r)) / (H + a), with H the
+    # channel's own linear headroom and `a` the light the bloom wanted to add.
+    # Solved from the recovery-off render's own added light rather than from the
+    # glow field, so the check does not have to reimplement the bloom -- and it
+    # is an equality, not a "less clipping" judgement.
     flat_val = 0.68
-    flat = np.full((32, 32, 3), flat_val, np.float32)
+    flat = np.full((256, 256, 3), flat_val, np.float32)
     off = rec_iso({"halation": 0.0}, flat)
-    on0 = rec_iso(rec_hal, flat)
-    on1 = rec_iso({**rec_hal, "halation_recovery": 1.0}, flat)
-    added0 = on0 - off
-    added1 = on1 - off
-    thr_lin = ((rec_hal["halation_threshold"] + 0.055) / 1.055) ** 2.4
-    lum_lin = ((flat_val + 0.055) / 1.055) ** 2.4
-    hi_expected = min(1.0, max(0.0, (lum_lin - thr_lin) / max(1.0 - thr_lin, 0.02)))
-    ratio = float((added1 / np.clip(added0, 1e-6, None)).mean())
+    added0 = rec_iso(rec_hal, flat) - off
+    lin_of = ((flat_val + 0.055) / 1.055) ** 2.4
+    head = 1.0 - lin_of
+    worst = 0.0
+    for r in (0.35, 0.7, 1.0):
+        added_r = rec_iso({**rec_hal, "halation_recovery": r}, flat) - off
+        for c in range(3):
+            # `a` in linear light, from the recovery-off result for this channel.
+            a_lin = (((flat_val + added0[..., c].mean() + 0.055) / 1.055) ** 2.4
+                     - lin_of)
+            want_lin = lin_of + a_lin * (head + a_lin * (1.0 - r)) / (head + a_lin)
+            want = 1.055 * want_lin ** (1.0 / 2.4) - 0.055
+            got = flat_val + float(added_r[..., c].mean())
+            worst = max(worst, abs(got - want))
     check(
-        "recovery attenuates the added glow by exactly (1 - recover * hi)",
-        abs(ratio - (1.0 - hi_expected)) < 0.02,
-        f"expected attenuation {1.0 - hi_expected:.3f}, measured {ratio:.3f}",
+        "recovery meters the added light by exactly (H + a(1-r)) / (H + a)",
+        worst < 2e-3,
+        f"worst deviation from the closed form over 3 settings x 3 channels: "
+        f"{worst:.2e}",
+    )
+
+    # The property that makes it a recovery rather than a dimmer: at 1.0 the
+    # bloom cannot flatten anything. Measured as the transfer slope along the
+    # ramp -- with recovery off the top of it is a clipped plateau, and a
+    # plateau is precisely what destroys highlight detail.
+    def min_step(a: np.ndarray) -> float:
+        return float(np.diff(a.mean(-1).mean(0)).min())
+
+    off_ramp = rec_iso(rec_hal, rec_plate)
+    on_ramp = rec_iso({**rec_hal, "halation_recovery": 1.0}, rec_plate)
+    check(
+        "at full recovery the bloom cannot flatten a highlight gradient",
+        min_step(off_ramp) <= 0.0 < min_step(on_ramp),
+        f"minimum step along the ramp: {min_step(off_ramp):+.2e} at recovery 0 "
+        f"(flat, i.e. detail gone) -> {min_step(on_ramp):+.2e} at 1.0",
+    )
+
+    # And that it buys that by *metering* the light rather than deleting it: on
+    # a bright plate carrying real fine texture, full recovery has to keep more
+    # of the texture than recovery off -- which is the complaint -- while still
+    # depositing most of the bloom. Both halves matter: holding the glow back
+    # would pass a texture-only test by simply turning the effect off.
+    hry, hrx = np.mgrid[0:256, 0:256].astype(np.float32)
+    hfine = (np.sin(hrx / 2.3) * np.sin(hry / 2.7)
+             + 0.6 * np.sin(hrx / 5.1 + 1.0)) / 1.6
+    bright = np.ascontiguousarray(
+        (np.clip(0.93 + 0.035 * hfine[..., None], 0, 1)
+         * np.ones((1, 1, 3), np.float32)).astype(np.float32))
+
+    def hf(a: np.ndarray) -> float:
+        m = a.mean(-1)
+        return float((m[1:-1, 1:-1] - 0.25 * (m[:-2, 1:-1] + m[2:, 1:-1]
+                                              + m[1:-1, :-2] + m[1:-1, 2:])).std())
+
+    b_off = rec_iso({"halation": 0.0, "micro_blur": 0.3}, bright)
+    b_0 = rec_iso(rec_hal, bright)
+    b_1 = rec_iso({**rec_hal, "halation_recovery": 1.0}, bright)
+    t_src, t_0, t_1 = hf(bright), hf(b_0), hf(b_1)
+    light = float((b_1 - b_off).mean()) / max(float((b_0 - b_off).mean()), 1e-9)
+    check(
+        "full recovery keeps highlight texture *and* most of the bloom",
+        t_1 / t_src > t_0 / t_src * 1.3 and light > 0.6,
+        f"fine texture kept {t_0 / t_src * 100:.1f}% at recovery 0 -> "
+        f"{t_1 / t_src * 100:.1f}% at 1.0, with {light * 100:.1f}% of the "
+        "bloom's light still deposited",
     )
 
     d = float(np.abs(
