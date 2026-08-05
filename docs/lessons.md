@@ -196,3 +196,32 @@
   test of the encoder. `tests/verify.py` decodes the chunks directly; `sips` is
   a good independent second opinion.
 
+* **A colour name in a parameter can mean the mask or the channel, and picking
+  the wrong one builds a different feature that looks fine.** "Source Red,
+  masked with the red channel" was first built as a grain layer confined to the
+  red channel and masked by `R`. Both halves were wrong: what was wanted was a
+  *full-colour* layer masked by how red the picture is, `R - max(G, B)`. Neither
+  version fails a "does grain appear" check, and the wrong one renders something
+  perfectly plausible. Two tells that generalise — a channel-value mask fires at
+  full strength on **white and grey**, where every channel is high, so three
+  colour masks collapse into one brightness mask; and if a mask is a hue, it has
+  to be *zero* on neutrals, which is an exact assertion rather than a tolerance.
+  When a request names a colour, establish whether it selects a region or a
+  channel before writing anything.
+* **A mid-tone bell and a brightness ramp pass the same one-ended test.** Both
+  are quiet in the shadows. What separates them is the *highlight* end, where a
+  ramp is loudest and a bell is silent, so a mask test that only measures the
+  dark end confirms nothing. Measure both ends of anything shaped like a band.
+* **Do not measure a tonal response on a ramp.** Slicing a gradient to compare
+  "dark end" against "mid" samples a *different patch of the noise field* at
+  each end, and the field's own local sigma varies enough between patches
+  (measured 0.029 against 0.042 on neighbouring 24-column slices) to swamp the
+  effect. Three flat plates at the same coordinates read the identical field and
+  differ only in what is underneath it. This cost a real debugging detour: the
+  "Add is flat across the tonal range" check failed at 79% and looked like a
+  pipeline non-linearity for a while.
+* **Test plates clip.** Layers stack, so a patch at 0.85 carrying a flat layer
+  at ±0.076 and a masked layer at ±0.098 hits the final `clamp(0, 1)` — and a
+  clamp does not fail a test loudly, it quietly eats one tail so every sigma
+  measured afterwards is measuring the clamp. Add up every layer's peak swing
+  when choosing a level, not just the one under test.

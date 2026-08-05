@@ -118,8 +118,9 @@ anti-aliasing, the pre-blur, edge
 softening, edge jitter and its direction bias, edge sanding, scatter, output
 sharpening, the master opacity cross-fade, the colour-grading section with its
 3D LUT lookup, `.cube` parsing, monotone tone recovery and highlight
-reconstruction, and the film-texture section — 253
-checks. It exits non-zero on failure.
+reconstruction, the four source-masked global layers with their hue masks and
+mid-tone bell, the six Global Grain blend modes, `global_seed` as an offset, and
+the film-texture section — 318 checks. It exits non-zero on failure.
 
 One of those is a different *kind* of assertion again and is worth copying when
 adding a tonal control: the tone-curve check measures the **slope of the
@@ -171,7 +172,7 @@ optional reading before touching the area it covers.
 | [docs/colour-grading.md](docs/colour-grading.md) | Step −1: LUTs as *resources*, the twelve adjustments, the Shadows/Highlights rewrite, highlight reconstruction |
 | [docs/halation.md](docs/halation.md) | Blue compensation and why it runs before the wash; highlight recovery metered against real headroom |
 | [docs/edge-destruction.md](docs/edge-destruction.md) | Scatter (diffusion without the average) and anti-aliasing (filter along the contour) |
-| [docs/global-grain.md](docs/global-grain.md) | Why value noise quilts, the two superseded constructions, the tilted point field, the chroma slider |
+| [docs/global-grain.md](docs/global-grain.md) | Why value noise quilts, the two superseded constructions, the tilted point field, the chroma slider, the five layers (hue mask vs channel value, mask vs seed) and the blend modes |
 | [docs/film-texture.md](docs/film-texture.md) | Dust, scratches, hair — drawn, never scattered — and light leaks as beams |
 | [docs/presets.md](docs/presets.md) | The mark-count dead zone, and `reference_mp` rescaling across image sizes |
 | [docs/panel-layout.md](docs/panel-layout.md) | `GROUPS` reorgs and where each parameter's section went |

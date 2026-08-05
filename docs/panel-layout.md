@@ -59,3 +59,26 @@ light behaves rather than how detail is destroyed, sit together right after it,
 directly ahead of Tone Response. Grouping by request rather than by re-deriving
 a rationale from scratch — the four moves were independent asks and this is
 simply where they land in combination.
+
+## The Global Grain section grew four sliders and a menu (2026-08-05)
+
+Source Red / Green / Blue / Lightness, added inside the existing **Global
+Grain** group rather than in a new one — no `GROUPS` change. They belong beside
+Global Intensity because they share every shape control it has (Size Min, Size
+Max, Smoothness, Chroma) and are on the same 0–100 amplitude scale, so splitting
+them out would have implied a second, independent layer stack when they are five
+layers of one section. Global Opacity governs all five, and its help text says
+so. See `docs/global-grain.md` for what they do and why masking, not seeding.
+
+`Global Seed` goes **last in the group**, after Global Opacity, matching where
+`Texture Seed` sits in Film Texture — a seed is the thing you reach for least
+often and it belongs under the controls it rerolls, not among them.
+
+`Blend Mode` goes **first in the group**, above Global Intensity, which is the
+one departure from this panel's usual pipeline order. It governs all five
+sliders under it, and a control that changes what everything below it means
+reads wrong sitting underneath them. It is the section's second `choices`
+parameter after `scatter_pattern`, so the client renders it as a menu with no
+change to `App.tsx` — the value is still a number everywhere else, and the
+names live in `params.GLOBAL_BLENDS` where the engine imports them rather than
+in two literal tuples that would have to agree on an index.

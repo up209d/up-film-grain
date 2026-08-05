@@ -92,6 +92,38 @@ _AMP_SCALE = 0.38
 # lattice is clamped. Below Nyquist it would simply alias.
 _MIN_CELL = 0.8
 
+# The Global Grain section renders **five layers**, and they are built
+# identically: same Size Min, Size Max, Smoothness, Chroma and Seed, through the
+# same `_global_grain_field`. They differ in exactly two things -- the seed
+# offsets that decide where their grains fall, and the mask that decides where
+# they are visible. Index 0 is the flat layer (`global_intensity`, no mask);
+# 1-4 are the source-masked set.
+#
+# The amount sliders for 1-4, in that index order. Their *names* refer to the
+# mask and nothing else -- Source Red is a full-colour grain layer masked by how
+# red the picture is, not a layer confined to the red channel. All five write
+# into all three channels and all five take `global_chroma`.
+_GSRC_KEYS = ("global_src_r", "global_src_g", "global_src_b", "global_src_l")
+
+# Per layer: (mono seed offset, chroma seed offset).
+#
+# Layer 0's pair is the flat layer's historical 7717/3391 and **must not
+# change** -- every shipped preset was dialled in against that exact field, and
+# a different offset would reroll all of them while rendering something
+# perfectly plausible.
+#
+# The other four are spaced so that no offset equals another's `+991`, which is
+# the cluster draw inside `_grain_points`. A collision there would have two
+# layers sharing the clump pattern that decides where grain bunches up -- not
+# obviously wrong in a render, and the pair would quietly read as one layer.
+_GLAYER_SEEDS = (
+    (7717, 3391),
+    (11003, 12007),
+    (13009, 14011),
+    (15013, 16033),
+    (17011, 18013),
+)
+
 # Global-grain smoothing: a blur on the finished grain field, with the
 # amplitude it costs put back analytically.
 #
@@ -1534,8 +1566,21 @@ _GRAIN_CLUSTER_ROUGHNESS = 0.7
 # happened to exceed Min. The target is the *point* field's old level, which
 # keeps the default preset's global layer where it was; the four presets that
 # used the value-noise path get about 31% quieter. See CLAUDE.md.
+#
+# The cubic was **scaled, not re-fitted**, when the per-grain opacity draw was
+# removed on 2026-08-05 (see `bri` in `_grain_points`). Full-density grains make
+# the raw field louder by the ratio of the brightness term's own sigma --
+# Rademacher +-1 against uniform[-1, 1), so sqrt(3) less what the weighted-mean
+# readout averages away -- and that factor is *independent of the size ratio*,
+# because the brightness draw shares no hash channel with the geometry. Measured
+# across the whole sweep it is 1.711x with a spread of 0.2% (1.708-1.712), so
+# every coefficient carries the same multiplier and the ratio dependence -- the
+# only thing this cubic exists to describe -- is provably untouched. Scaling
+# rather than re-fitting is what makes that a statement about the shape rather
+# than a new set of numbers that happen to fit; it also holds rendered loudness
+# *exactly* where it was, since the gain divides out the factor it multiplied in.
 _GRAIN_TARGET_STD = 0.29
-_GRAIN_STD_FIT = (-0.02885, -0.01261, 0.09356, 0.28253)
+_GRAIN_STD_FIT = (-0.04938, -0.02158, 0.16008, 0.48341)
 
 
 def _grain_gain(lo: float, hi: float) -> float:
@@ -1656,8 +1701,9 @@ def _grain_points(
       jobs, which keeps the per-cell hash cost down where the lattice is dense.
       Conditional on being present the radius is still uniform on ``[lo, hi]``,
       so the size distribution is exactly what the two sliders promise.
-    * Position jitters over the **whole** cell, and brightness is drawn signed
-      per output field, then scaled by that cell's cluster multiplier.
+    * Position jitters over the **whole** cell. Brightness is a *sign* drawn per
+      output field -- every grain that exists is at full density, never a random
+      fraction of it -- scaled by that cell's cluster multiplier.
     * A pixel's amplitude is the single largest falloff over every candidate
       (so a gap stays a gap), and its brightness is those candidates' brightness
       averaged under ``falloff ** _GRAIN_SHARE`` (so overlapping grains trade
@@ -1668,8 +1714,12 @@ def _grain_points(
     something else at 0.5 would be blurred about the wrong point. A gap has
     every falloff at zero and therefore lands exactly on 0.5 whatever the
     brightness of anything nearby, which is what "nothing is here" has to mean;
-    brightness is drawn signed in ``[-1, 1)`` so a grain is lighter or darker
-    with equal odds, as real grain is.
+    brightness is ``+-1`` with equal odds so a grain is lighter or darker, as
+    real grain is. Note what "lighter or darker" does *not* mean here: it is a
+    coin flip on direction, not a draw on strength. Density varies across the
+    frame -- it has to, or the layer is a screen -- but it varies through how
+    many grains land where, how they overlap and the cluster field, never by
+    handing an individual grain a fractional opacity.
 
     Returns ``[1, nfields, h, w]``. Geometry -- which cells hold grains, where,
     and how big -- is shared across fields and only brightness is drawn per
@@ -1740,7 +1790,31 @@ def _grain_points(
             u < _GRAIN_FILL, rad_lo + rad_span * (u / _GRAIN_FILL),
             torch.zeros_like(u),
         )
-        bri = (lat[b + 3: b + 3 + nfields] * 2.0 - 1.0) * camp
+        # **Sign only -- a grain that exists is at full density.** This draw used
+        # to be `u * 2 - 1`, uniform on [-1, 1), which gave every grain its own
+        # random *opacity* as well as its own direction: half of all grains came
+        # out at under half strength and a grain near u = 0.5 contributed
+        # essentially nothing while still occupying its cell slot. That is the
+        # wrong model twice over. A developed silver halide crystal is opaque and
+        # an undeveloped one is clear -- there is no half-developed crystal -- so
+        # density variation in real emulsion comes from how many grains land in a
+        # region and how they overlap, which `_GRAIN_FILL`, the radius draw and
+        # `_GRAIN_CLUSTER` already supply. And it read as veiling: a population of
+        # weak grains is a low-amplitude haze spread over the whole frame, which
+        # the amplitude normaliser then has to *amplify* to hit its target sigma,
+        # so the few full-strength grains got pushed into the clamp to pay for the
+        # faint ones.
+        #
+        # Signed rather than all-positive because the field must stay mean-zero
+        # about 0.5 (see the docstring) and because real grain is lighter *or*
+        # darker with equal odds. `torch.where` against 0.5 rather than
+        # `torch.sign(u - 0.5)`: lattice values are exact multiples of 2**-24, so
+        # 0.5 is attainable, and `sign` would hand that slot a zero-density grain
+        # -- reintroducing the thing this removes, rarely enough to never be seen
+        # and often enough to exist.
+        su = lat[b + 3: b + 3 + nfields]
+        bri = torch.where(su < 0.5, -torch.ones_like(su),
+                          torch.ones_like(su)) * camp
         py = cell_iy + lat[b]
         px = cell_ix + lat[b + 1]
         for dy in range(-_GRAIN_RINGS, _GRAIN_RINGS + 1):
@@ -1961,6 +2035,125 @@ def _smooth_noise(
     return 0.5 + _blur(n - 0.5, sigma) * gain
 
 
+def _source_masks(m: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """The four visibility envelopes of the source-masked global layers.
+
+    ``m`` is the frame **already clamped to 0..1** -- the caller's job, and not
+    optional: `render` leaves `out` unclamped until the very end because step 14
+    needs the headroom, and halation routinely drives a channel past 1.0. An
+    unclamped envelope would run a layer louder than its own slider in
+    highlights and *invert* it wherever a channel had gone negative.
+
+    Returns ``(red, green, blue, lightness)``, each ``[1,1,h,w]`` in 0..1 and
+    each broadcasting across all three channels: these select *where* a layer
+    shows, never which channel it lands in.
+
+    **The colour three are hue masks, not channel values.** ``R - max(G, B)``,
+    which factors exactly into "how red in hue" x "how bright" -- so grain grows
+    both as an area gets redder and as it gets lighter, which is what was asked
+    for, and it needs no calibration constant to say it. The literal alternative,
+    ``mask = R``, was rejected: white and grey have all three channels high, so
+    all three layers would fire at full strength on neutral content and pile up
+    into what is really just a brightness mask wearing three sliders.
+
+    Two consequences worth knowing. The three are **mutually exclusive** -- only
+    one channel can be the largest, so at most one is non-zero at any pixel and
+    they can never stack on each other. And on a real photograph hue dominance
+    rarely passes 0.3-0.5, so at equal slider settings these read quieter than
+    Global Intensity; the mask is taking its share, which is the whole point.
+
+    **Lightness is a mid-tone bell**, not a ramp: grain peaks at mid grey and
+    fades to nothing toward *both* white and black. ``1 - |2L - 1|`` is that
+    shape as a triangle; the smoothstep on top rounds off the kink at grey and,
+    more usefully, flattens the approach to both ends, so the layer leaves the
+    highlights and the shadows gradually instead of at a constant rate. Zero at
+    pure black and pure white, ~0.10 at L=0.1 and L=0.9, 1.0 at grey.
+
+    Reads the frame as it stands *before* any of the five layers is added, so
+    the envelopes come from the picture rather than from the grain already laid
+    on it. They still carry the main grain's own noise, which is uncorrelated
+    with these fields and zero-mean -- grain modulating grain, which is what
+    print grain sitting on negative grain actually does.
+
+    The one construction worth checking rather than assuming is ``clamp_min(0)``
+    on a *neutral* area: the hue difference there is wandering either side of
+    zero, so rectifying it leaves a small positive envelope where the answer
+    should be nothing at all, and the three colour layers would bleed onto grey.
+    Measured on a flat 0.5 plate with the main grain at 40 and the flat layer at
+    20: Source Red at 100 renders sigma 0.000197 against the flat layer's
+    0.038469, which is 0.5% of it, and a mean shift of +1e-6. Blurring the mask
+    would remove even that, and would cost `pad_for` a kernel it does not
+    otherwise need, for something already three orders of magnitude down.
+    """
+    r, g, b = m[:, 0:1], m[:, 1:2], m[:, 2:3]
+    lum = _luma(m)
+    t = 1.0 - (lum * 2.0 - 1.0).abs()
+    return (
+        (r - torch.maximum(g, b)).clamp_min(0.0),
+        (g - torch.maximum(r, b)).clamp_min(0.0),
+        (b - torch.maximum(r, g)).clamp_min(0.0),
+        t * t * (3.0 - 2.0 * t),
+    )
+
+
+def _grain_delta(base: torch.Tensor, g: torch.Tensor, mode: int) -> torch.Tensor:
+    """What one grain layer at **full strength** does to ``base``, as a delta.
+
+    The five Global Grain layers composite the way layers in an image editor do:
+    the grain is an image, ``L = 0.5 + g/2``, mid grey where there is no grain;
+    the blend mode combines it with what is underneath; and the layer's amount
+    and mask together act as its opacity. Returning the *difference* rather than
+    the blended result is what makes that last part a plain lerp at the call
+    site -- ``out + alpha * delta`` -- so every mode fades to nothing at 0 and
+    the per-pixel mask needs no second code path.
+
+    ``mode`` indexes `params.GLOBAL_BLENDS`.
+
+    **Add returns ``g`` untouched, and that is deliberate rather than an
+    optimisation.** Reconstructing it as ``(base + g) - base`` is not the same
+    float, and Add is the default: every shipped preset has to render bit for
+    bit what it rendered before this function existed.
+
+    Every other mode is computed against ``base`` **clamped to 0..1**, because
+    Overlay and friends are only defined there and `out` is deliberately
+    unclamped at this point in the pipeline. The delta is still added to the
+    unclamped frame by the caller, so a blown highlight keeps the headroom step
+    14 relies on instead of being flattened to 1.0 on its way past.
+
+    A note on the two that are not symmetric about mid grey: Multiply and Screen
+    have no neutral value in 0..1 at all -- multiplying by a mid-grey layer
+    halves the picture -- so their delta is dominated by a constant darkening or
+    lightening that the grain then modulates. That is what those modes *are*,
+    and the amount slider is the only thing holding them back. They are here
+    because they were asked for; Overlay and Soft Light are the two that behave
+    like a grain control.
+    """
+    if mode == 0:                                        # Add
+        return g
+    b = base.clamp(0.0, 1.0)
+    lay = g * 0.5 + 0.5
+    if mode == 1:                                        # Overlay
+        o = torch.where(b <= 0.5, 2.0 * b * lay,
+                        1.0 - 2.0 * (1.0 - b) * (1.0 - lay))
+    elif mode == 2:                                      # Soft Light
+        # The W3C / Photoshop curve, not the cheap `2*b*lay + b*b*(1-2*lay)`
+        # approximation: that one has a discontinuous derivative where the
+        # layer crosses mid grey, and a grain layer crosses mid grey at roughly
+        # half of all pixels, so the kink would be everywhere at once.
+        d = torch.where(b <= 0.25, ((16.0 * b - 12.0) * b + 4.0) * b, torch.sqrt(b))
+        o = torch.where(lay <= 0.5,
+                        b - (1.0 - 2.0 * lay) * b * (1.0 - b),
+                        b + (2.0 * lay - 1.0) * (d - b))
+    elif mode == 3:                                      # Hard Light
+        o = torch.where(lay <= 0.5, 2.0 * b * lay,
+                        1.0 - 2.0 * (1.0 - b) * (1.0 - lay))
+    elif mode == 4:                                      # Multiply
+        o = b * lay
+    else:                                                # Screen
+        o = 1.0 - (1.0 - b) * (1.0 - lay)
+    return o - b
+
+
 # --------------------------------------------------------------------------- #
 # pipeline
 # --------------------------------------------------------------------------- #
@@ -1982,6 +2175,14 @@ class GrainEngine:
         # plausible texture, so "the numbers changed" is not enough of a test.
         self.gg_hits = 0
         self.gg_misses = 0
+        # Layers 1-4 are counted apart from the flat one. All five are the same
+        # construction through the same function and share the one LRU and the
+        # one byte budget -- they compete for the same memory, and a second
+        # budget would silently double it -- but a test that wants to say "the
+        # flat layer hit while a source layer missed" needs two counters to say
+        # it with.
+        self.gs_hits = 0
+        self.gs_misses = 0
 
     def clear_caches(self) -> None:
         """Drop the Global Grain texture cache."""
@@ -2029,13 +2230,39 @@ class GrainEngine:
     # ------------------------------------------------------------------ #
     def _global_grain_field(
         self, h: int, w: int, y0: float, x0: float, p: dict,
-        gcell: float, gcell_max: float,
+        gcell: float, gcell_max: float, idx: int = 0,
     ) -> torch.Tensor:
-        """The Global Grain texture layer, normalised and clamped. Cached.
+        """One Global Grain texture layer, normalised and clamped. Cached.
 
         Shape is ``[1,1,h,w]`` at chroma 0 and ``[1,3,h,w]`` above it; both
         broadcast against the frame, which is why the channel count is allowed to
         depend on a parameter.
+
+        ``idx`` picks the layer -- 0 is the flat one, 1-4 the source-masked set
+        -- and it selects **nothing but a pair of seed offsets** out of
+        `_GLAYER_SEEDS`. All five layers are otherwise the same field through the
+        same code: same size range, same smoothing, same chroma construction,
+        same normalise-and-clamp. That is what puts the five amount sliders on
+        one scale before their masks take a share, and what makes Size Min, Size
+        Max, Smoothness and Chroma Grain mean one thing across the section
+        rather than five.
+
+        Different offsets per layer is the whole reason they are separate calls
+        rather than five brightness fields off one geometry: a red-masked grain
+        and a blue-masked grain have to sit in genuinely *different places*, the
+        way separate emulsion layers do. `global_seed` moves all five together
+        and leaves those relative offsets alone, so reshuffling the section
+        cannot accidentally collapse two layers onto each other. Sharing geometry is the deliberate
+        choice one level down, inside `global_chroma`, where a single grain takes
+        a colour without its edge moving from channel to channel -- both are
+        wanted, which is why they are two mechanisms and not one slider.
+
+        Layer 0 with ``idx`` at its default is byte for byte the field this
+        method built before the set existed, because `_GLAYER_SEEDS[0]` is its
+        historical ``7717/3391``. That is the property every shipped preset
+        depends on, and folding the source layers in here rather than into a
+        parallel copy of this function is what keeps it *provable* -- a second
+        implementation is a second thing to drift.
 
         **Cached because it reads no image data at all.** Every input is either a
         parameter or the tile's own global coordinates, so nudging Halation or
@@ -2059,7 +2286,10 @@ class GrainEngine:
           working cell genuinely produce the same field and should share an
           entry, and this folds in both `scale` and the supersample level for
           free, since the caller has already multiplied them in.
-        * ``seed`` -- both field draws offset from it.
+        * ``idx`` -- five different fields live in the one dict.
+        * ``seed + global_seed`` -- their **sum**, since that is all the field
+          sees. Keying on the two separately would be equally correct and would
+          miss on a pair that had merely swapped which slider carried the total.
         * ``global_smooth`` -- `_smooth_noise` is inside this boundary.
         * ``global_chroma`` -- decides whether the second field is built at all,
           and changes the returned channel count.
@@ -2076,25 +2306,46 @@ class GrainEngine:
         points per output pixel (see `_lattice_np`). This is one plane per
         channel at working resolution.
         """
+        # `global_seed` is an *offset* on the frame seed, not a seed of its own,
+        # so it folds in here and the key needs only their sum. Two properties
+        # come out of that shape rather than out of a convention anyone has to
+        # remember: Seed still rerolls this section along with the whole frame,
+        # and `global_seed` at 0 is bit-identical to the layer that existed
+        # before the slider did -- for every preset, including the one that
+        # ships a non-default Seed, which an absolute seed here would have
+        # rerolled.
+        base_seed = int(p["seed"]) + int(p["global_seed"])
         key = (
-            h, w, float(y0), float(x0), gcell, gcell_max,
-            int(p["seed"]), p["global_smooth"], p["global_chroma"],
+            idx, h, w, float(y0), float(x0), gcell, gcell_max,
+            base_seed, p["global_smooth"], p["global_chroma"],
             str(self.device),
         )
         hit = self._gg_cache.get(key)
         if hit is not None:
             self._gg_cache.move_to_end(key)
-            self.gg_hits += 1
+            # Counted apart so a test can tell *which* layer missed. The two
+            # share the one LRU and the one byte budget, deliberately -- five
+            # layers competing for one allowance rather than five allowances --
+            # so a hit rate alone could not say that.
+            if idx:
+                self.gs_hits += 1
+            else:
+                self.gg_hits += 1
             return hit
-        self.gg_misses += 1
+        if idx:
+            self.gs_misses += 1
+        else:
+            self.gg_misses += 1
+
+        off_mono, off_chroma = _GLAYER_SEEDS[idx]
 
         def field(seed_off: int, nfields: int) -> torch.Tensor:
             return _grain_points(
                 h, w, y0, x0, gcell, gcell_max,
-                int(p["seed"]) + seed_off, self.device, nfields,
+                base_seed + seed_off, self.device, nfields,
             )
 
-        gg = field(7717, 1)
+        gg = field(off_mono, 1)
         # Before the normalise-and-clamp, not after: the clamp is what
         # gives the field its hard tails, and smoothing a clamped field
         # would leave the plateaus it created and merely round their
@@ -2151,7 +2402,7 @@ class GrainEngine:
             # radius across channels and only randomises its per-channel
             # brightness, which is what gives a coloured grain its speckle
             # without moving its edge from channel to channel.
-            gs = field(3391, 3)
+            gs = field(off_chroma, 3)
             gs = _smooth_noise(gs, gcell_max, p["global_smooth"],
                                gcell / gcell_max)
             gs = gs * 2.0 - 1.0
@@ -3267,8 +3518,8 @@ class GrainEngine:
         if acut > 0.01:
             out = out + (base - _blur(base, hp_r * 1.5)) * (0.35 * acut)
 
-        # 13. Global grain -- a flat overlay, applied last and masked by
-        #     nothing.
+        # 13. Global grain -- five overlay layers, applied last. The first is
+        #     masked by nothing; the other four by the picture itself.
         #
         #     Everything above is masked: by the luminance band, by the edge
         #     envelope, by the smooth-area guard. That is emulsion behaviour,
@@ -3293,21 +3544,67 @@ class GrainEngine:
         #     the layer's whole character, and 43% of its loudness, turned on
         #     whether Max happened to exceed Min. Both were also reported as
         #     showing a visible grid, from different causes. See `_GRAIN_ROT`.
-        gi = p["global_intensity"]
+        #
+        #     Since 2026-08-05 the section renders **five** such layers, not
+        #     one. The other four are the same field on their own seeds, each
+        #     multiplied by an envelope read off the picture -- see the masks
+        #     below. The flat layer stays exactly what it was and stays first,
+        #     so a shadow the masks turn down is never left perfectly clean.
         go = p["global_opacity"]
-        if gi > 0.01 and go > 0.001:
-            gcell = max(_MIN_CELL, p["global_size"] * scale)
-            # Max can never pull the effective ceiling *below* Min: clamped up
-            # to it rather than swapped with it -- the two are not a symmetric
-            # pair the way the light-leak sizes are, because Min already has an
-            # established meaning on its own and Max is purely "how much
-            # further can it stretch".
-            gcell_max = max(gcell, p["global_size_max"] * scale)
+        # Amounts in layer order: the flat layer, then the four masked ones,
+        # matching `_GLAYER_SEEDS` and `_source_masks`.
+        gamt = (p["global_intensity"],) + tuple(p[k] for k in _GSRC_KEYS)
+        gmode = int(round(p["global_blend"]))
+        gcell = max(_MIN_CELL, p["global_size"] * scale)
+        # Max can never pull the effective ceiling *below* Min: clamped up
+        # to it rather than swapped with it -- the two are not a symmetric
+        # pair the way the light-leak sizes are, because Min already has an
+        # established meaning on its own and Max is purely "how much
+        # further can it stretch".
+        #
+        # Derived out here rather than inside the branch because all five
+        # layers need the identical pair: two derivations that could drift
+        # apart would put them on different lattices while every slider
+        # claimed otherwise.
+        gcell_max = max(gcell, p["global_size_max"] * scale)
 
-            gg = self._global_grain_field(
-                h, w, y0, x0, p, gcell, gcell_max,
-            )
-            out = out + gg * ((gi / 100.0) * _AMP_SCALE * go)
+        if go > 0.001 and any(a > 0.01 for a in gamt):
+            # The four envelopes, read off the frame **before** any of the five
+            # layers goes on, so they describe the picture rather than the grain
+            # already laid over it. Built once and only if something wants one.
+            masks = None
+            if any(a > 0.01 for a in gamt[1:]):
+                masks = _source_masks(out.clamp(0.0, 1.0))
+
+            # Composited in order, each onto the result of the one before, the
+            # way a stack of layers in an image editor behaves -- which is what
+            # `Blend Mode` has to mean for the menu to be worth having. Under
+            # Add, the default, that is identical to summing them.
+            #
+            # **Masking, not seeding.** The obvious reading of "grain that
+            # follows the picture" is to derive each grain's *seed* from the
+            # source pixel, and it fails three ways at once: a flat region
+            # hashes every pixel the same, rebuilding the axis-aligned 1px grid
+            # `_GRAIN_ROT` exists to destroy; one grain per pixel centred on
+            # that pixel makes every falloff 1, so the construction collapses to
+            # a blur of white noise with no gaps and no grain edges; and a seed
+            # drawn from the frame changes with every upstream slider, so grain
+            # rerolls and swims while you grade. A mask has none of that. The
+            # pattern comes from the seed as it always did and only the envelope
+            # moves, which is also what keeps the fields cacheable -- they read
+            # no image data, the mask does, and the mask is applied out here.
+            #
+            # The five amounts are likewise applied out here, outside the cache
+            # boundary, so dragging any of them cannot miss it.
+            for li, amt in enumerate(gamt):
+                if amt <= 0.01:
+                    continue
+                g = self._global_grain_field(
+                    h, w, y0, x0, p, gcell, gcell_max, li,
+                )
+                a = (amt / 100.0) * _AMP_SCALE * go
+                d = _grain_delta(out, g, gmode)
+                out = out + (d * a if li == 0 else d * (a * masks[li - 1]))
 
         # 14. Output sharpening -- deliberately the last thing in the pipeline.
         #
@@ -3876,7 +4173,16 @@ class GrainEngine:
         # never disagree about the field's reference scale.
         gcell_lo = max(_MIN_CELL, p["global_size"] * scale)
         g_eff = max(gcell_lo, p["global_size_max"] * scale)
-        if (p["global_intensity"] > 0.01 and p["global_opacity"] > 0.001
+        #
+        # The gate covers the source-masked layers too, and that is not
+        # cosmetic: they run through the same `_smooth_noise` against the same
+        # reference cell, so with Global Intensity at 0 and a source layer up
+        # the blur still happens. A gate that only knew about the flat layer
+        # would reserve nothing there and seam the export along exactly the
+        # smoothing radius, while every preview looked fine.
+        g_on = (p["global_intensity"] > 0.01
+                or any(p[k] > 0.01 for k in _GSRC_KEYS))
+        if (g_on and p["global_opacity"] > 0.001
                 and p["global_smooth"] > 0.001):
             gsm = p["global_smooth"] * _SMOOTH_MAX * g_eff
         # The grain field itself reserves **nothing**, and that is a real
