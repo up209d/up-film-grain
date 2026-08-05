@@ -27,6 +27,12 @@ cd web && npm install && npm run build && cd ..
 
 ## Run
 
+```
+./run-prod.sh   # http://127.0.0.1:8000  -- build production and run it at port 8000
+```
+
+## Run Dev
+
 ```bash
 ./dev.sh          # http://localhost:5173  -- Vite HMR + uvicorn --reload
 ./run.sh          # http://127.0.0.1:8000  -- production, from the source tree
@@ -390,37 +396,52 @@ Both controls above work *across* an edge; these work *along* it.
   at 0 it runs everywhere, which suits a CG render that aliases on gentle steps
   and will visibly soften a photograph (88%).
 * **Global Smoothness** belongs to the Global Grain layer and lives here
-  because it is the same job: see below.
+  because it is the same job — taking the pixel grid back out: see below.
 
 Effectively free, and it widens the tile overlap by a few pixels.
 
-### Global Grain goes blocky, and Global Smoothness is why
+### Global Grain is drawn as scattered grains (rewritten)
 
-Past about 8px of **Global Size Min** the layer stops looking like grain and
-starts looking pixelated. That is the noise itself, not a bad setting: it is
-built on an axis-aligned lattice, so its cells read as rectangles once they
-are large enough to see. Adding octaves or changing the seed cannot help —
-every octave sits on the same kind of lattice.
+The layer used to be built on an axis-aligned lattice, and it showed. Past
+about 8px of **Global Size Min** it stopped looking like grain and started
+looking pixelated — a visible quilt of rectangles — and at any size it read as
+an evenly spaced mesh once you stepped back from it. Neither was a bad setting;
+both were the noise itself.
 
-**Global Smoothness** blurs the layer by up to half a clump, which measurably
-removes 82% of the grid and leaves rounded clumps. It is free to use in the one
-way that matters: the strength is held constant as you raise it (within 2.5%
-across the whole slider), so it changes the *shape* of the grain and not how
-much there is. Global Intensity remains the only amplitude control.
+It is now drawn as discrete grains scattered over a lattice **tilted off the
+pixel grid**, with several per cell and a fraction of them missing, and with
+every grain's strength modulated by a multi-scale clumping field. In practice:
 
-Global Size Min now runs to 20px.
+* **No grid, at any size.** Measured on the metric that diagnosed the old
+  quilt, the layer scores 0.03–0.05 where the old field scored 1.4–1.7.
+* **No repeating mesh when you zoom out.** The clumping field gives the layer
+  real variation at scales far above one grain — some regions grainier than
+  others, with no characteristic patch size.
+* **Consistent.** The old field lost up to 35% of its strength whenever the
+  clump size landed near a whole number of pixels — which is where a slider
+  lands — so the same settings could look good or flat for no visible reason.
+  The tilt removes that outright; strength now varies under 4% across sizes.
 
-### Global Size Max: clumps that genuinely differ from their neighbours
+**Global Size Min** and **Global Size Max** are the two ends of one grain-size
+distribution, and nothing else. Min is the smallest a grain can be, Max the
+largest; leave them equal for one uniform size, or open them up so each grain
+picks its own diameter between the two. It is a range, not a switch — widening
+it changes how much the sizes vary and nothing else. A very wide gap leaves
+visible clear patches between grains; real film has them too, but narrow the
+gap if it reads as sparse. Both run to 20px.
 
-**Global Size** is now **Global Size Min**, and a **Global Size Max** sits
-next to it, defaulting equal to Min so nothing changes until you move it. Above
-Min, the layer stops drawing one uniform grain size and switches to clumps that
-each independently pick their own diameter somewhere between the two — the fix
-for Global Grain reading as too even and manufactured. This is not a gradual
-blend: the moment Max moves past Min the layer changes *kind*, not just range,
-so expect a visible shift in character rather than a smooth fade-in. A wide gap
-between Min and Max can leave visible clear patches between grains — real film
-has them too, but narrow the gap if it reads as too sparse.
+**Global Smoothness** was the cure for the blockiness and no longer has
+anything to repair. It is now a shape control: it blurs the layer by up to half
+a clump, rounding grains off and softening where they meet. It still holds the
+strength constant as you raise it, so it changes the *shape* of the grain and
+not how much there is; Global Intensity remains the only amplitude control.
+
+**One thing to expect from the rewrite:** `global_intensity` used to mean two
+different loudnesses depending on whether Max exceeded Min — a 43% gap. It now
+means one. Presets that left Max at its default (Dramatic, Dreamy, Subtle,
+ExtraGrain) get a quieter global layer than before and can be brought back by
+raising their Global Intensity; the rest are within about 10% of where they
+were.
 
 Sliders only render on release, not during the drag — a fit preview is seconds
 of work, so rendering every intermediate position just queues frames that are

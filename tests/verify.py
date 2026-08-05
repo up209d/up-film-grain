@@ -27,11 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from server import imageio as iio  # noqa: E402
 from server import params as P  # noqa: E402
 from server.engine import (  # noqa: E402
-    _MIN_CELL, _VARCELL_JITTER_LO, _VARCELL_JITTER_SPAN, _VARCELL_RINGS,
-    _VARCELL_TIE_MARGIN, _VARCELL_WARP_AMOUNT, _VARCELL_WARP_CELL_FRAC,
-    GrainEngine, RenderCancelled, _lat_span, _lattice_np, _leak_anchor,
-    _leak_sites, _smoothstep, _value_noise, _variable_cell_noise, device_name,
-    pick_device,
+    _GRAIN_CLUSTER, _GRAIN_COS, _GRAIN_FILL, _GRAIN_SHARE, _GRAIN_SIN,
+    _GRAIN_SLOTS, GrainEngine, RenderCancelled, _grain_cluster, _grain_gain,
+    _grain_points, _lat_span, _lattice_np, _leak_anchor, _leak_sites,
+    _smoothstep, device_name, pick_device,
 )
 from tests.scene import patch as scene_patch  # noqa: E402
 from tests.scene import scene  # noqa: E402
@@ -50,6 +49,28 @@ def area_downsample(a: np.ndarray, f: int) -> np.ndarray:
     h -= h % f
     w -= w % f
     return a[:h, :w].reshape(h // f, f, w // f, f, 3).mean((1, 3))
+
+
+def gridiness(lum: np.ndarray, cell: float) -> float:
+    """|gradient| binned by phase within a cell -- how much a field's structure
+    lines up with its own lattice, and therefore with the pixel grid.
+
+    The metric the Global Grain quilt was diagnosed with and the one its
+    replacement is held to. A lattice-addressed field swings a long way between
+    phases, because its extrema sit *on* the lattice and the gradient vanishes
+    there; a field that does not care where the cell boundaries fall does not
+    swing. Value noise at a 20px cell scores 1.74; `_grain_points` scores 0.03.
+    """
+    gx = np.abs(np.diff(lum, axis=1))
+    xs = (np.arange(lum.shape[1] - 1) + 0.5) / cell
+    ph = np.floor((xs % 1.0) * 8).astype(int)
+    # Only bins that actually contain samples. A whole-number cell puts every
+    # pixel at one of exactly `cell` phases, so with a cell under 8 some bins
+    # are empty and averaging them is a nan, not a zero -- which silently makes
+    # the metric useless rather than making it fail.
+    m = np.array([gx[:, ph == b].mean() for b in range(8) if (ph == b).any()])
+    assert m.size >= 3, f"too few distinct phases at cell {cell}"
+    return float((m.max() - m.min()) / m.mean())
 
 
 def main() -> int:
@@ -1006,13 +1027,14 @@ def main() -> int:
     d = float(np.abs(a.astype(float) - b.astype(float)).max())
     check("inert with the global layer off", d == 0.0, f"max delta {d:.2e}")
 
-    # -- 5b-i-b. global size variation: independently-sized clumps ------------
-    # `global_size_max` swaps the whole construction, from `_fbm` (one size for
-    # every clump) to `_variable_cell_noise` (each clump draws its own size
-    # between Min and Max) -- so most of what has to be pinned here is the
-    # backward-compatibility boundary between the two, plus two failure modes
-    # discovered and fixed while building the replacement.
-    print("\nglobal size variation (independently-sized clumps)")
+    # -- 5b-i-b. the global grain point field ---------------------------------
+    # One construction at every setting since 2026-08-05 (`_grain_points`), so
+    # Min and Max are the two ends of one size distribution and nothing else.
+    # What is pinned here is the three defects the rewrite exists to fix -- a
+    # visible axis-aligned grid, an evenly-spaced mesh with no structure above
+    # the clump, and an amplitude that depended on where the sliders happened to
+    # sit -- plus the properties the old construction had that must survive.
+    print("\nglobal grain point field")
     gv_grey = np.full((400, 560, 3), 0.5, dtype=np.float32)
 
     def gv_render(lo: float, hi: float, smooth: float = 0.0,
@@ -1024,16 +1046,17 @@ def main() -> int:
         return eng.render_image(im, P.sanitize(over), 1.0, tile=tile,
                                 supersample=1).astype(np.float64) - 0.5
 
-    # At or below Min this must be the exact old field -- every shipped preset
-    # (none of which set global_size_max) sanitizes to Max == Min and has to
-    # keep rendering bit-for-bit what it always has.
+    # Max is clamped *up* to Min, never swapped with it -- the two are not a
+    # symmetric pair, because Min has a meaning on its own and Max is only "how
+    # much further can it stretch". So a Max below Min must render exactly as
+    # Max == Min...
     a = gv_render(4.0, 4.0)
-    b = gv_render(4.0, 3.5)  # Max below Min -- clamped up to Min, not swapped
-    check("max at or below min is the exact old field",
+    b = gv_render(4.0, 3.5)
+    check("max below min renders as max == min",
           float(np.abs(a - b).max()) == 0.0, "max delta 0.00e+00 required")
-    # The clamp is up, never a swap: raising Min alone, with Max left at its
-    # own untouched default, must never cross into the variable construction
-    # just because the default happens to be smaller than the new Min.
+    # ...and raising Min alone, with Max left at its own untouched default, must
+    # not quietly become a Min-to-default range because the default happens to
+    # be the smaller number.
     c = eng.render_image(gv_grey, P.sanitize({k: 0.0 for k in P.NEUTRAL_ZERO}
                          | {"global_intensity": 40.0, "global_size": 9.0,
                             "global_opacity": 1.0}), 1.0, tile=1024, supersample=1)
@@ -1041,16 +1064,72 @@ def main() -> int:
                          | {"global_intensity": 40.0, "global_size": 9.0,
                             "global_size_max": 1.6, "global_opacity": 1.0}),
                          1.0, tile=1024, supersample=1)
-    check("raising min alone cannot cross into the variable field",
+    check("raising min alone leaves max pinned to it",
           float(np.abs(c.astype(float) - d.astype(float)).max()) == 0.0,
           "max delta 0.00e+00 required")
 
-    # Above min the field has to actually be a different thing, not a
-    # cosmetic nudge -- measured against the fixed-size field at the same Min.
+    # A range has to actually be a range -- clumps of differing size, not a
+    # cosmetic nudge on one size.
     var = gv_render(4.0, 14.0)
-    check("above min the field visibly changes character",
+    check("a min-max range visibly differs from a single size",
           float(np.abs(a - var).max()) > 0.05,
           f"max delta {float(np.abs(a - var).max()):.3f}")
+
+    # -- the grid. This is the complaint the rewrite exists for --------------
+    # `gridiness` (defined with the smoothing checks below, and the metric this
+    # codebase already used for the quilt) bins the field's |gradient| by phase
+    # within a cell. A lattice-addressed field swings a long way between phases,
+    # because its extrema sit *on* the lattice and the gradient vanishes there;
+    # a field that does not care where the cell boundaries fall does not swing.
+    #
+    # The value-noise fBm this replaced -- what every Max == Min setting used to
+    # render, including three shipped presets at a 5px clump -- scores **1.41 to
+    # 1.49** on it, and that number is its visible quilt. The bar here is 0.35,
+    # four times under the worst reading below and thirty times under the field
+    # it replaced. Checked at Max == Min especially, since that is the setting
+    # that used to take the value-noise path.
+    for lo, hi in ((1.0, 3.0), (8.0, 8.0), (4.0, 8.0), (12.0, 12.0),
+                   (20.0, 20.0)):
+        f = _grain_points(768, 768, 0, 0, lo, hi, 4242,
+                          torch.device("cpu"), 1)[0, 0].numpy().astype(np.float64)
+        q = gridiness(f, hi)
+        check(f"no lattice grid at min={lo:g} max={hi:g}", q < 0.35,
+              f"phase-binned gridiness {q:.3f} (the value-noise field it "
+              "replaced scores 1.4-1.5)")
+
+    # -- structure above the clump -------------------------------------------
+    # A point process with uniform density averages to a featureless screen as
+    # you step back, and a featureless screen at a distance is precisely what
+    # "repetitive pattern when zooming out" describes. `_grain_cluster` is what
+    # supplies variation at scales far above one clump.
+    #
+    # Measured as the spread of *local contrast* -- the coefficient of variation
+    # of block standard deviations, at 16 clumps to a block -- and not as the
+    # spread of local means, which is the obvious metric and is blind to this.
+    # Clustering scales each grain's brightness *magnitude*, and brightness is
+    # signed, so it leaves every local mean alone and moves only how grainy one
+    # region is against another. A first version of this check measured block
+    # means, read a flat 0.99x, and was measuring nothing.
+    import server.engine as _E  # noqa: E402
+
+    def gv_contrast_cv(cluster: float) -> float:
+        keep = _E._GRAIN_CLUSTER
+        _E._GRAIN_CLUSTER = cluster
+        try:
+            f = _grain_points(1024, 1024, 0, 0, 2.0, 4.0, 77,
+                              torch.device("cpu"), 1)[0, 0].numpy()
+        finally:
+            _E._GRAIN_CLUSTER = keep
+        f = f.astype(np.float64) - 0.5
+        blk = 64                                   # 16 clumps at max size 4
+        b = f.reshape(1024 // blk, blk, 1024 // blk, blk).std(axis=(1, 3))
+        return float(b.std() / b.mean())
+
+    flat, clustered = gv_contrast_cv(0.0), gv_contrast_cv(_GRAIN_CLUSTER)
+    check("clustering gives the layer structure above the clump",
+          clustered > flat * 3.0 and clustered > 0.10,
+          f"local-contrast spread {clustered:.4f} clustered vs {flat:.4f} "
+          f"unclustered ({clustered / flat:.1f}x)")
 
     # Coverage gaps are the honest consequence of a wide min-max range, not a
     # bug -- but the frame's mean must stay unbiased regardless of how wide the
@@ -1063,35 +1142,82 @@ def main() -> int:
         check(f"gaps stay neutral at max={hi:.0f}", abs(v.mean()) < 0.01,
               f"frame mean {v.mean():+.4f}")
 
-    # The resonance: when the effective cell lands on an exact integer number
-    # of working pixels, the pixel grid and the point lattice used to phase-
-    # lock, capping the field's own amplitude well below what a neighbouring,
-    # non-integer size reaches -- a dead zone sitting exactly where a user's
-    # slider is likeliest to land. Regression-tested directly against the
-    # construction, not through the full pipeline, so the check pins the
-    # actual mechanism rather than a render that merely happens to look fine.
-    from server.engine import _variable_cell_noise  # noqa: E402
-    import torch  # noqa: E402
-
+    # The resonance -- "sometimes it does a good job, sometimes it does not,
+    # even with the same config". When the working cell lands on a whole number
+    # of pixels an axis-aligned lattice phase-locks with the pixel grid: every
+    # pixel sits at the same fractional offset inside its own cell, so none is
+    # ever near a point and the field cannot reach its own amplitude. Measured
+    # on the old construction, cell 1.00 scored 65% of what 1.05 and 0.95 did.
+    #
+    # The rotation is what fixes it, and the fix is structural rather than a
+    # tuned warp: an irrational slope leaves the two grids incommensurate at
+    # *every* size, so this is swept across whole numbers and their neighbours
+    # rather than spot-checked at one. Tested against the construction directly,
+    # so the check pins the mechanism and not a render that happens to look ok.
     def gv_std(cell: float) -> float:
-        f = _variable_cell_noise(500, 500, 0, 0, cell, cell, 555,
-                                 torch.device("cpu"), 1)
+        f = _grain_points(600, 600, 0, 0, cell, cell, 555,
+                          torch.device("cpu"), 1)
         return float((f - 0.5).std())
 
-    baseline = gv_std(1.6)
-    resonant = gv_std(1.0)
-    check("exact-integer cell size is not a dead zone",
-          abs(resonant - baseline) < 0.08 * baseline,
-          f"std {resonant:.4f} at cell 1.0 vs {baseline:.4f} at cell 1.6 "
-          f"({resonant / baseline * 100:.0f}%)")
+    sizes = (0.95, 1.0, 1.05, 1.6, 1.95, 2.0, 2.05, 3.0, 4.0, 5.0)
+    stds = {c: gv_std(c) for c in sizes}
+    lo_s, hi_s = min(stds.values()), max(stds.values())
+    check("no cell size is a dead zone",
+          (hi_s - lo_s) / (0.5 * (hi_s + lo_s)) < 0.08,
+          "std spread "
+          f"{(hi_s - lo_s) / (0.5 * (hi_s + lo_s)) * 100:.1f}% over "
+          + ", ".join(f"{c:g}:{stds[c]:.3f}" for c in sizes))
 
-    # Tile independence, the invariant this whole construction is riskiest
-    # against: it reads lattice cells beyond a pixel's own (pad_for has to
-    # cover that reach) and picks a winner by nearest falloff (a boundary
-    # decision that a first version left sensitive to which bit the coordinate
-    # arithmetic happened to round to differently between tile layouts).
-    # Checked at the exact resonant size, with smoothing on top of it, since
-    # both were where the two bugs actually showed up.
+    # Amplitude must not depend on where the size sliders sit. It used to,
+    # badly: the two old constructions disagreed by 43%, so `global_intensity`
+    # meant one thing below Max and another above it. `_grain_gain` normalises
+    # it with a closed form in the Min/Max ratio -- closed form because a
+    # measured `std()` would be a statistic of the region (invariant 1) and
+    # would normalise every tile of an export differently.
+    amps = {}
+    for lo, hi in ((0.8, 0.8), (1.0, 3.0), (2.0, 2.0), (4.0, 8.0),
+                   (1.0, 20.0), (10.0, 20.0), (20.0, 20.0)):
+        f = _grain_points(1024, 1024, 0, 0, lo, hi, 4242, torch.device("cpu"), 1)
+        amps[(lo, hi)] = float((f - 0.5).std())
+    lo_a, hi_a = min(amps.values()), max(amps.values())
+    check("amplitude is flat across the whole size range",
+          (hi_a - lo_a) / (0.5 * (hi_a + lo_a)) < 0.12,
+          f"spread {(hi_a - lo_a) / (0.5 * (hi_a + lo_a)) * 100:.1f}% over "
+          + ", ".join(f"{a:g}-{b:g}:{v:.3f}" for (a, b), v in amps.items()))
+
+    # Tile independence. `pad_for` reserves **nothing** for this field -- it
+    # derives its own lattice window from whichever window it is handed, with a
+    # ring of slack on every side, so a pixel always sees its true neighbouring
+    # cells however the frame was split. That is a claim worth testing directly
+    # rather than trusting: with the padding term gone there is no slack left
+    # over to hide a reach nobody accounted for.
+    gv_pad = _grain_points(384, 384, 0, 0, 1.0, 4.0, 31, torch.device("cpu"), 3)
+    gv_worst = 0.0
+    for oy, ox, th, tw in ((0, 0, 97, 61), (137, 89, 103, 151),
+                           (300, 217, 84, 84), (41, 300, 61, 79)):
+        sub = _grain_points(th, tw, oy, ox, 1.0, 4.0, 31,
+                            torch.device("cpu"), 3)
+        gv_worst = max(gv_worst, float(
+            (sub - gv_pad[:, :, oy:oy + th, ox:ox + tw]).abs().max()))
+    check("the field itself needs no tile overlap", gv_worst < 2e-3,
+          f"max delta {gv_worst:.2e} over 4 sub-windows at zero padding")
+    # ...and `pad_for` says so. Turning the layer on at any size must not widen
+    # the overlap by a pixel; only `global_smooth`, which is a real kernel, may.
+    gv_base = eng.pad_for(P.sanitize({k: 0.0 for k in P.NEUTRAL_ZERO}), 1.0)
+    for lo, hi in ((1.6, 1.6), (20.0, 20.0), (1.0, 20.0)):
+        n = eng.pad_for(P.sanitize({k: 0.0 for k in P.NEUTRAL_ZERO} | {
+            "global_intensity": 40.0, "global_size": lo,
+            "global_size_max": hi, "global_opacity": 1.0}), 1.0)
+        check(f"pad_for reserves nothing for the field (min={lo:g} max={hi:g})",
+              n == gv_base, f"{n}px against {gv_base}px with the layer off")
+    gv_sm = eng.pad_for(P.sanitize({k: 0.0 for k in P.NEUTRAL_ZERO} | {
+        "global_intensity": 40.0, "global_size": 20.0, "global_opacity": 1.0,
+        "global_smooth": 1.0}), 1.0)
+    check("pad_for still reserves for the smoothing kernel", gv_sm > gv_base,
+          f"{gv_base}px -> {gv_sm}px at smoothness 1, clump 20px")
+
+    # And the same thing end to end through the renderer, at the sizes and
+    # smoothing settings where a reach bug would actually bite.
     gv_scene = np.ascontiguousarray(
         (np.random.RandomState(9).rand(320, 480, 3) * 0.5 + 0.25).astype(np.float32)
     )
@@ -1107,8 +1233,8 @@ def main() -> int:
         check(f"tile independence (min={lo}, max={hi}, smooth={smooth})",
               d < 2e-3, f"max delta {d:.2e}")
 
-    # Chroma shares the construction (see `_global_field`), so a colour variant
-    # of the variable field must still decorrelate the channels.
+    # Chroma shares the geometry generator, so a colour variant of a wide
+    # size range must still decorrelate the channels.
     over = {k: 0.0 for k in P.NEUTRAL_ZERO}
     over.update({"global_intensity": 40.0, "global_size": 4.0,
                  "global_size_max": 14.0, "global_opacity": 1.0,
@@ -1116,7 +1242,7 @@ def main() -> int:
     gcv = eng.render_image(gv_grey, P.sanitize(over), 1.0, tile=1024,
                            supersample=1).astype(np.float64) - 0.5
     spread = float(np.abs(gcv[:, :, 0] - gcv[:, :, 1]).max())
-    check("chroma still decorrelates the variable field", spread > 0.05,
+    check("chroma decorrelates a wide size range", spread > 0.05,
           f"max channel spread {spread:.3f}")
 
     # -- 5b-ii. master opacity: a cross-fade over the untouched source --------
@@ -1169,23 +1295,15 @@ def main() -> int:
     d = float(np.abs(a - b).max())
     check("tile independence", d < 2e-3, f"max delta {d:.2e}")
 
-    # -- 5c-ii. global smoothness: kill the lattice, keep the amplitude -------
-    # Value noise is a quilt of axis-aligned cells, invisible at a 1.6px clump
-    # and plainly rectangular at 20px. `gridiness` measures exactly that: the
-    # field's |gradient| binned by phase within a cell. A gridded field swings
-    # a long way between phases -- its extrema sit *on* the lattice, so the
-    # gradient vanishes there -- and an organic one does not care where the
-    # cell boundaries are.
-    print("\nglobal grain smoothing (the lattice, not the strength)")
+    # -- 5c-ii. global smoothness: soften the grain, keep the amplitude -------
+    # This was built to remove the value-noise quilt, and there is no longer a
+    # quilt for it to remove -- `_grain_points` scores under 0.05 on `gridiness`
+    # before any smoothing, against that field's 1.4-1.7. So what it has to be
+    # now is what it always claimed to be for the strength half: a *shape*
+    # control that visibly softens the grain at constant loudness.
+    print("\nglobal grain smoothing (the shape, not the strength)")
     gs_grey = np.full((512, 512, 3), 0.5, np.float32)
     GS_CELL = 20.0
-
-    def gridiness(lum: np.ndarray, cell: float) -> float:
-        gx = np.abs(np.diff(lum, axis=1))
-        xs = (np.arange(lum.shape[1] - 1) + 0.5) / cell
-        ph = np.floor((xs % 1.0) * 8).astype(int)
-        m = np.array([gx[:, ph == b].mean() for b in range(8)])
-        return float((m.max() - m.min()) / m.mean())
 
     def gs_render(sm: float) -> np.ndarray:
         over = {k: 0.0 for k in P.NEUTRAL_ZERO}
@@ -1195,13 +1313,19 @@ def main() -> int:
             gs_grey, P.sanitize(over), 1.0, tile=1024, supersample=1)
 
     gs_off, gs_on = gs_render(0.0), gs_render(1.0)
-    q0 = gridiness(gs_off.mean(axis=2), GS_CELL)
-    q1 = gridiness(gs_on.mean(axis=2), GS_CELL)
-    check(
-        "the lattice is what gets removed", q0 > 1.2 and q1 < 0.5,
-        f"phase-binned gridiness {q0:.2f} -> {q1:.2f} "
-        f"({(1 - q1 / q0) * 100:.0f}% of the grid gone)",
-    )
+    # It starts ungridded and must stay that way -- pinned at both ends so a
+    # future field that reintroduced a lattice could not hide behind the blur.
+    for tag, im in (("unsmoothed", gs_off), ("smoothed", gs_on)):
+        q = gridiness(im.mean(axis=2), GS_CELL)
+        check(f"the field is free of the lattice grid ({tag})", q < 0.35,
+              f"phase-binned gridiness {q:.3f} (value noise scored 1.4-1.7)")
+    # Softening means the gradient falls while the amplitude does not -- the two
+    # together are what separate a shape control from a volume control, and
+    # either alone would pass on a stage that did the wrong thing.
+    g0 = float(np.abs(np.diff(gs_off.mean(axis=2), axis=1)).mean())
+    g1 = float(np.abs(np.diff(gs_on.mean(axis=2), axis=1)).mean())
+    check("it visibly softens the grain", g1 < 0.7 * g0,
+          f"mean |gradient| {g0:.5f} -> {g1:.5f} ({g1 / g0 * 100:.0f}%)")
     # The whole reason the blur carries an analytic gain: a structure control
     # that quietly turns the layer down leaves Global Intensity fighting it,
     # and "smoother" becomes indistinguishable from "less". Same rule `_fbm`
@@ -2805,64 +2929,96 @@ def main() -> int:
     check("lattice bounds computed in Python match the device ramp",
           span_bad == 0, f"{span_n} cases, {span_bad} differ")
 
-    # `_variable_cell_noise` now carries the winning *cell* through the 25-cell
-    # search and gathers brightness once at the end, instead of rewriting
-    # nfields full-frame planes on every iteration. Same candidates, same order,
-    # same tie margin, so the same point must win.
-    def varcell_ref(h, w, y0, x0, lo, hi, seed, device, nfields=1):
-        rings = _VARCELL_RINGS
+    # `_grain_points` searches only the 3x3 ring of cells around a pixel's own,
+    # and unrolls its `falloff ** _GRAIN_SHARE` weight into repeated multiplies.
+    # Both are shortcuts, and both are only correct if they change nothing --
+    # which "the render still looks like grain" cannot tell you. So this is a
+    # plain, deliberately slow reference: a wider 5x5 search and a real `pow`.
+    #
+    # The 5x5 half is the interesting one. It is the *proof* behind
+    # `_GRAIN_RINGS` written out as a measurement: a point two cells away is
+    # further than one cell from any pixel in the centre cell, and no radius can
+    # exceed one cell, so those candidates must contribute exactly nothing. If
+    # the jitter range or the lattice pitch is ever changed without redoing that
+    # argument, this is what fails.
+    def grain_ref(h, w, y0, x0, lo, hi, seed, device, nfields=1):
+        rings = 2
         cell = hi
-        iy0, hl = _lat_span(h, y0, cell, rings, rings)
-        ix0, wl = _lat_span(w, x0, cell, rings, rings)
+        ca, sa = _GRAIN_COS, _GRAIN_SIN
+        Y = (torch.arange(h, device=device, dtype=torch.float32)
+             + float(y0))[:, None]
+        X = (torch.arange(w, device=device, dtype=torch.float32)
+             + float(x0))[None, :]
+        Yr = (Y * ca + X * sa) / cell
+        Xr = (X * ca - Y * sa) / cell
+        ys = (float(y0), float(y0) + h - 1)
+        xs = (float(x0), float(x0) + w - 1)
+        vs = [(yy * ca + xx * sa) / cell for yy in ys for xx in xs]
+        us = [(xx * ca - yy * sa) / cell for yy in ys for xx in xs]
+        pad = rings + 1
+        iy0 = int(math.floor(min(vs))) - pad
+        hl = int(math.floor(max(vs))) + pad + 1 - iy0
+        ix0 = int(math.floor(min(us))) - pad
+        wl = int(math.floor(max(us))) + pad + 1 - ix0
+        per = 3 + nfields
         lat = torch.from_numpy(
-            _lattice_np(iy0, ix0, hl, wl, seed, 3 + nfields)
-        ).to(device)
-        jy = _VARCELL_JITTER_LO + _VARCELL_JITTER_SPAN * lat[0]
-        jx = _VARCELL_JITTER_LO + _VARCELL_JITTER_SPAN * lat[1]
-        rad = lo + lat[2] * (hi - lo)
-        bri = lat[3:] * 2.0 - 1.0
-        ciy = torch.arange(iy0, iy0 + hl, device=device, dtype=torch.float32)[:, None]
-        cix = torch.arange(ix0, ix0 + wl, device=device, dtype=torch.float32)[None, :]
-        py, px = (ciy + jy) * cell, (cix + jx) * cell
-        Y = (torch.arange(h, device=device, dtype=torch.float32) + float(y0))[:, None]
-        X = (torch.arange(w, device=device, dtype=torch.float32) + float(x0))[None, :]
-        piy = (torch.floor(Y / cell).long() - iy0).clamp(0, hl - 1)
-        pix = (torch.floor(X / cell).long() - ix0).clamp(0, wl - 1)
-        wc = max(_MIN_CELL, _VARCELL_WARP_CELL_FRAC * cell)
-        wn = _value_noise(h, w, y0, x0, wc, seed + 51, 2, device)
-        Yw = Y + (wn[0, 0] * 2.0 - 1.0) * (_VARCELL_WARP_AMOUNT * cell)
-        Xw = X + (wn[0, 1] * 2.0 - 1.0) * (_VARCELL_WARP_AMOUNT * cell)
-        bs = torch.zeros(h, w, device=device)
-        bb = torch.zeros(nfields, h, w, device=device)
-        for dy in range(-rings, rings + 1):
-            for dx in range(-rings, rings + 1):
-                ny = (piy + dy).clamp(0, hl - 1)
-                nx = (pix + dx).clamp(0, wl - 1)
-                dxp, dyp = Xw - px[ny, nx], Yw - py[ny, nx]
-                dn = torch.sqrt(dxp * dxp + dyp * dyp) / rad[ny, nx].clamp_min(1e-3)
-                sh = 1.0 - _smoothstep(0.0, 1.0, dn)
-                win = sh > bs + _VARCELL_TIE_MARGIN
-                bb = torch.where(win.unsqueeze(0), bri[:, ny, nx], bb)
-                bs = torch.where(win, sh, bs)
-        return (0.5 + 0.5 * bs.unsqueeze(0) * bb).unsqueeze(0)
+            _lattice_np(iy0, ix0, hl, wl, seed, _GRAIN_SLOTS * per)).to(device)
+        ciy = torch.arange(iy0, iy0 + hl, device=device,
+                           dtype=torch.float32)[:, None]
+        cix = torch.arange(ix0, ix0 + wl, device=device,
+                           dtype=torch.float32)[None, :]
+        camp = _grain_cluster(iy0, ix0, hl, wl, seed + 991, device)
+        piy = (torch.floor(Yr).long() - iy0).clamp(0, hl - 1)
+        pix = (torch.floor(Xr).long() - ix0).clamp(0, wl - 1)
+        peak = torch.zeros(h, w, device=device)
+        num = torch.zeros(nfields, h, w, device=device)
+        den = torch.zeros(h, w, device=device)
+        for s in range(_GRAIN_SLOTS):
+            b = s * per
+            u = lat[b + 2]
+            rad = torch.where(
+                u < _GRAIN_FILL,
+                (lo + (hi - lo) * (u / _GRAIN_FILL)) / cell,
+                torch.zeros_like(u),
+            )
+            bri = (lat[b + 3: b + 3 + nfields] * 2.0 - 1.0) * camp
+            py, px = ciy + lat[b], cix + lat[b + 1]
+            for dy in range(-rings, rings + 1):
+                for dx in range(-rings, rings + 1):
+                    ny = (piy + dy).clamp(0, hl - 1)
+                    nx = (pix + dx).clamp(0, wl - 1)
+                    dyp, dxp = Yr - py[ny, nx], Xr - px[ny, nx]
+                    sh = 1.0 - _smoothstep(
+                        0.0, 1.0,
+                        (torch.sqrt(dyp * dyp + dxp * dxp) + 1e-7)
+                        / rad[ny, nx].clamp_min(1e-12))
+                    wgt = sh ** _GRAIN_SHARE
+                    num = num + wgt * bri[:, ny, nx]
+                    den = den + wgt
+                    peak = torch.maximum(peak, sh)
+        val = num / den.clamp_min(1e-12)
+        return (0.5 + (0.5 * _grain_gain(lo, hi))
+                * peak.unsqueeze(0) * val).unsqueeze(0)
 
-    vc_worst = 0.0
-    # Integer and non-integer cells both, since the integer case is the
-    # pixel-grid resonance the domain warp exists to break.
+    gr_worst = 0.0
+    # Integer and non-integer cells both. The integer sizes are where the old
+    # construction phase-locked against the pixel grid, and they are the ones a
+    # slider actually lands on.
     for h_, w_, nf, lo_, hi_, oy, ox in (
         (256, 256, 1, 1.0, 3.0, 0.0, 0.0),
         (256, 256, 3, 1.0, 3.0, 17.0, 29.0),
         (192, 288, 3, 2.0, 6.0, 101.0, 7.0),
-        (160, 160, 3, 0.8, 1.0, 5.0, 11.0),
+        (160, 160, 3, 0.8, 0.8, 5.0, 11.0),
         (160, 160, 3, 1.0, 2.0, 0.0, 0.0),
+        (160, 240, 1, 0.5, 20.0, 63.0, 41.0),
     ):
         d = float((
-            _variable_cell_noise(h_, w_, oy, ox, lo_, hi_, 7717, dev, nf)
-            - varcell_ref(h_, w_, oy, ox, lo_, hi_, 7717, dev, nf)
+            _grain_points(h_, w_, oy, ox, lo_, hi_, 7717, dev, nf)
+            - grain_ref(h_, w_, oy, ox, lo_, hi_, 7717, dev, nf)
         ).abs().max())
-        vc_worst = max(vc_worst, d)
-    check("the variable-cell restructure changes nothing", vc_worst == 0.0,
-          f"worst deviation {vc_worst:.2e} over 5 configurations")
+        gr_worst = max(gr_worst, d)
+    check("the 3x3 search and unrolled weight change nothing",
+          gr_worst < 1e-6, f"worst deviation {gr_worst:.2e} over 6 configurations")
 
     # -- the Global Grain texture cache --------------------------------------
     #

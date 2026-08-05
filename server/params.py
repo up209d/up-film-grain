@@ -891,15 +891,16 @@ PARAMS: list[Param] = [
     Param(
         "global_smooth", "Global Smoothness", "Anti Aliasing",
         0.0, 1.0, 0.01, 0.0, "",
-        "Softens the blockiness of the Global Grain layer. That noise is "
-        "built on an axis-aligned lattice, so at large Global Sizes its cells "
-        "read as rectangles; this blurs the layer by up to half a clump, "
-        "which measurably removes 82% of that grid and leaves rounded clumps. "
-        "Strength is held constant as you raise it -- it changes the shape of "
-        "the grain, not how much there is -- so it is free to use. Scaled to "
-        "Global Size, so one setting stays right as you resize the clumps. "
-        "Here rather than under Global Grain because it is the same job as "
-        "the sliders above it: taking the pixel grid back out.",
+        "Blurs the Global Grain layer by up to half a clump, rounding its "
+        "grains off and softening the boundaries between them. It used to be "
+        "the cure for that layer breaking into rectangular blocks at large "
+        "sizes; the field is no longer built on a lattice that does that, so "
+        "this is now a shape control rather than a repair -- reach for it "
+        "when the grain reads as too crisp. Strength is held constant as you "
+        "raise it, so it changes the shape of the grain and not how much "
+        "there is. Scaled to Global Size, so one setting stays right as you "
+        "resize the clumps. Here rather than under Global Grain because it is "
+        "the same job as the sliders above it: taking the pixel grid back out.",
     ),
     # --------------------------------------------------------- global grain
     # Applied last and masked by nothing -- see step 13 in engine.render().
@@ -919,31 +920,26 @@ PARAMS: list[Param] = [
         "global_size", "Global Size Min", "Global Grain",
         0.1, 20.0, 0.05, 1.6, "px",
         "Clump diameter of the global layer, at full resolution -- the "
-        "smallest a clump can be once Global Size Max is raised above this, "
-        "and the only size that exists while Max stays at or below it. Set it "
-        "apart from Clump Size and the two layers read as separate "
-        "structures; match them and it just thickens the main grain. Past "
-        "about 8px the noise lattice starts to show as rectangular blocks -- "
-        "that is the field, not the setting, and Global Smoothness is the "
-        "cure.",
+        "smallest a clump can be, and the only size that exists while Global "
+        "Size Max stays at or below it. Set it apart from Clump Size and the "
+        "two layers read as separate structures; match them and it just "
+        "thickens the main grain. Large sizes are safe at any setting now: "
+        "the layer is drawn as scattered grains on a lattice tilted off the "
+        "pixel grid, so it no longer breaks into rectangular blocks the way "
+        "it did past about 8px.",
         spatial=True,
     ),
     Param(
         "global_size_max", "Global Size Max", "Global Grain",
         0.1, 20.0, 0.05, 1.6, "px",
         "The largest a global-grain clump can be. At or below Global Size Min "
-        "this does nothing -- every clump renders at exactly Min, bit-for-bit "
-        "the field this layer has always drawn. Raised above it, each clump "
+        "every clump renders at exactly Min; raised above it, each clump "
         "independently draws its own diameter somewhere between the two, so "
-        "the layer stops reading as one uniform grain size and starts reading "
-        "as real crystals of differing sizes scattered through the frame -- "
-        "the fix for Global Grain looking too even and digital. This is not a "
-        "gradual blend: the moment Max moves past Min the layer switches from "
-        "smooth stacked noise to discrete randomly-sized particles, which is "
-        "a change in *kind*, not just in range. A wide gap can leave visible "
-        "clear patches between clumps -- real grain has them too, but back "
-        "the gap off if it reads as too sparse. Ships equal to Min, so no "
-        "existing preset changes.",
+        "the layer reads as real crystals of differing sizes rather than one "
+        "uniform grain. It is a range, not a switch -- widening it changes "
+        "how much the sizes vary and nothing else about how the layer is "
+        "drawn. A very wide gap leaves visible clear patches between clumps; "
+        "real grain has them too, but narrow the gap if it reads as sparse.",
         spatial=True,
     ),
     Param(

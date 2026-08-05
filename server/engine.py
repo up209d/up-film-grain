@@ -92,33 +92,49 @@ _AMP_SCALE = 0.38
 # lattice is clamped. Below Nyquist it would simply alias.
 _MIN_CELL = 0.8
 
-# Global-grain smoothing. Value noise is a quilt -- its extrema sit on an
-# axis-aligned lattice and each cell is a separable patch -- so past roughly
-# 8px the cells read as rectangles. Measured on a cell-20 field, |gradient|
-# binned by phase within a cell swings by 1.74x its own mean, which is that
-# grid showing up as a number.
+# Global-grain smoothing: a blur on the finished grain field, with the
+# amplitude it costs put back analytically.
+#
+# It was built as a *repair*: the layer used to be value noise, whose extrema
+# sit on an axis-aligned lattice, so past roughly 8px its cells read as
+# rectangles -- measured on a cell-20 field, |gradient| binned by phase within
+# a cell swung by 1.74x its own mean. `_grain_points` has no such quilt to
+# remove (0.09 on the same metric before any smoothing), so this is now a shape
+# control: it rounds grains off and softens where they meet.
 #
 # _SMOOTH_MAX  peak blur sigma as a fraction of the clump, at Smoothness 1.
-#              Half a cell takes that 1.74 to 0.27 on the bare field and
-#              1.72 to 0.32 through a full render (the figure `verify.py`
-#              pins) -- the quilt is gone rather than merely softened -- and
-#              still leaves clump-scale structure behind.
-# _SMOOTH_GAIN_K  restores the amplitude the blur costs. Measured, the loss
-#              depends on sigma/cell *alone*: cells of 8, 16 and 32px attenuate
-#              within 0.5% of each other at every ratio tested, so one closed
-#              form covers every size. sqrt(1 + k(sigma/cell)^2) fits it to
-#              0.6% over the whole 0..0.5 range this stage can reach. Analytic
-#              on purpose -- reading the tile's own std would restore a
-#              different amount per tile and seam the export.
+#              Half a clump is where a grain's own edge is gone rather than
+#              merely eased, which is as far as a shape control needs to reach.
+# _SMOOTH_GAIN_K  restores the amplitude the blur costs, as
+#              sqrt(1 + k(sigma/cell)^2). Analytic on purpose: reading the
+#              tile's own std would restore a different amount per tile and
+#              seam the export.
 #
-#              **Fit it against the field it is actually used on.** Calibrated
-#              first on single-octave value noise it came out 7.7, but the
-#              global layer is a two-octave fBm whose coarse half survives a
-#              blur far better, so 7.7 over-restored and made full Smoothness
-#              10% louder than no smoothing -- exactly the amplitude coupling
-#              the gain exists to prevent.
+#              **Fit it against the field it is actually used on**, which this
+#              constant has now had to learn three times. Calibrated on
+#              single-octave value noise it came out 7.7; against the two-octave
+#              fBm the layer used to be, 5.62, because a coarse octave survives
+#              a blur far better and 7.7 over-restored enough to make full
+#              Smoothness 10% *louder* than none. `_grain_points` goes the other
+#              way: a field of discrete grains carries far more of its energy at
+#              its own edges, so the same blur takes much more of it. Shipping
+#              the old 5.62 against it under-restored by 21%, which `verify.py`
+#              caught as Smoothness quietly turning the layer down.
+#
+#              And on this field `k` is **not one number**: it depends on the
+#              Min/Max ratio, from 18.3 at a wide range down to 13.5 at a single
+#              size. Wide ranges contain small grains, small grains are fine
+#              structure, and fine structure is what a blur takes first --
+#              measured, 43% of the field survives sigma/cell 0.5 at ratio 0.25
+#              against 48% at ratio 1.0. One constant cannot hold better than 6%
+#              across that; the quadratic below holds **2.1%**, and it is the
+#              same device `_grain_gain` already uses for the same reason (a
+#              closed form in a scale-free ratio, never a measurement).
+#              Coefficients highest power first; the loss still depends on
+#              sigma/cell alone at a fixed ratio, so nothing here varies with
+#              the clump's absolute size.
 _SMOOTH_MAX = 0.5
-_SMOOTH_GAIN_K = 5.62
+_SMOOTH_GAIN_K_FIT = (-8.9785, 4.6986, 17.5924)
 
 # --- colour grading (step -1, above everything) ---------------------------- #
 #
@@ -1347,221 +1363,422 @@ def _cell_noise(
     return lat[:, iy][:, :, ix].unsqueeze(0)
 
 
-# Jitter range for `_variable_cell_noise`'s point placement, as a fraction of
-# the cell. Keeping every point in the middle half of its own cell -- never
-# closer than a quarter-cell to an edge -- is what lets the neighbour search
-# below be *exact* rather than a heuristic, given the search radius below.
-_VARCELL_JITTER_LO = 0.25
-_VARCELL_JITTER_SPAN = 0.5
-
-# How many rings of neighbouring cells the search below checks, each way --
-# 2 means 5x5 (25 candidates). Worked from the far corner case: a point in the
-# first excluded ring is at least ``(RINGS + 1 - 0.75)`` cells from a pixel in
-# the search centre's own cell, and no point's radius can exceed one cell (see
-# ``_variable_cell_noise``), so the domain-warp amplitude below has to leave
-# at least that much margin over the 1-cell radius. At 1 ring (3x3) the margin
-# is only 0.25 cells, which measurably was not enough room to fix the
-# resonance below without also risking the proof; at 2 rings (5x5) it is 1.25,
-# comfortable enough that the warp amplitude is the only thing this trades
-# against, not correctness.
-_VARCELL_RINGS = 2
-
-# A domain warp on the pixel side of the distance computation only -- never on
-# which cell a pixel is nominally assigned to, which would need the search
-# proof above re-done against a wider slack. It exists for one specific
-# failure mode: when the working-pixel cell size lands on (or very near) an
-# exact integer, every pixel's position falls at *exactly the same* fractional
-# offset within its own cell, for every row and column -- the sampling grid
-# and the cell grid are commensurate, so no pixel is ever nearer than
-# `_VARCELL_JITTER_LO` of a cell to any point, anywhere, and the field can
-# never reach its own full amplitude. Measured on a flat field: cell 1.00
-# scored 0.123 std against 0.193 at 1.05 or 0.95, a >35% amplitude hole
-# exactly where a user's slider is most likely to land, since round numbers
-# are round numbers before and after the working-scale multiply.
+# --------------------------------------------------------------------------- #
+# The Global Grain point field
+# --------------------------------------------------------------------------- #
 #
-# A first attempt warped by only 0.12 cells, the most a 3x3 (1-ring) search
-# could safely absorb, and it was not enough: measured, cell 1.00 only moved
-# 0.123 -> 0.128, because breaking a phase lock that pins *every* pixel at the
-# same offset takes a warp comparable to half a cell, not a tenth of one.
-# Widening the search to 5x5 buys room for that: swept 0.5 to 1.2 cells at
-# cell 1.00 against cell 1.6 as a control, and 0.7 is where the two agree to
-# within 0.3% (0.899 -> 0.997 -> back up past 1.0 and settling around 1 as the
-# warp overshoots and returns) -- comfortably inside the 1.25-cell budget the
-# 5x5 search allows. Sourced from `_value_noise` rather than a second point
-# lattice: interpolated noise does not itself suffer this failure mode (its
-# output varies smoothly pixel to pixel regardless of whether its own cell
-# aligns with the pixel grid), so it cannot reintroduce the same problem at
-# one remove.
-_VARCELL_WARP_CELL_FRAC = 0.37
-_VARCELL_WARP_AMOUNT = 0.7
-
-# How much better a candidate's falloff has to be than the current winner's
-# before it takes over. See the tie-break comment where this is used: the
-# coordinate arithmetic behind `dist` differs in its last bit or two between
-# computation paths, and without a margin comfortably above that noise floor
-# a near-tie between two candidates can resolve to a *different* winning
-# point -- and therefore a different brightness -- depending on how a tile
-# happened to be padded and cropped to get there.
+# Rewritten 2026-08-05. Reported as "renders repetitive pattern when zooming
+# out, I can clearly see and feel the grid even when zooming in, sometimes it
+# does a good job, sometimes it does not, even with the same config". All three
+# complaints were real and each had its own cause; see the section in CLAUDE.md
+# for the measurements. In short:
 #
-# Swept 1e-4 to 1e-2 against a scene that reproduced the failure: 1e-4 still
-# left a 4.9e-3 tile-independence gap (too close to the ~2e-5 noise floor to
-# fully cover it), 3e-4 to 1e-3 both closed it to 1.4e-4, and 1e-2 reopened a
-# much larger one (4.9e-2) -- a margin that wide starts treating pixels with a
-# genuine, non-noise difference in falloff as tied, which is a different
-# failure than the one this exists to fix. Set in the middle of the working
-# range rather than at its edge.
-_VARCELL_TIE_MARGIN = 1e-3
+#   * the field was addressed on an *axis-aligned* lattice, so its structure
+#     lined up with the pixel grid -- the grid you can see;
+#   * exactly one point per cell, jittered only within the middle half of that
+#     cell, is a near-lattice point process. Zoomed out, an evenly spaced mesh
+#     is exactly what "repetitive pattern" looks like;
+#   * a domain warp bolted on to hide the first two shredded the discs into
+#     torn-paper shapes, and it only *partly* hid the pixel-grid resonance it
+#     was added for -- which is the "sometimes good, sometimes not".
+#
+# What replaces it is one construction (`_grain_points`) used at every setting,
+# built out of four decisions, each of which is load-bearing:
+#
+#   1. the cell lattice is *rotated* against the pixel grid by an irrational
+#      slope, so the two grids are incommensurate at every cell size;
+#   2. points jitter over their *whole* cell, which the 3x3 search below is
+#      still exact for -- see `_GRAIN_RINGS`;
+#   3. several points per cell, a fraction of them absent, so the local density
+#      genuinely varies instead of being one point per cell everywhere;
+#   4. grain brightness is modulated by a multi-octave cluster field, which is
+#      what gives the layer structure at scales far above a single clump.
+
+# Rotation of the grain lattice against the pixel grid, in radians -- 31.717
+# degrees, the golden-ratio slope.
+#
+# **This is what replaced the domain warp, and it is a better answer to the
+# same problem.** The warp existed because when the working cell size lands on
+# (or near) a whole number of pixels the two grids phase-lock: every pixel sits
+# at the same fractional offset inside its own cell, so no pixel is ever near a
+# point and the field cannot reach its own amplitude. Measured on the old
+# construction, cell 1.00 scored 0.123 std against 0.193 at 1.05 or 0.95 -- a
+# 35% amplitude hole sitting exactly on the round numbers a slider lands on.
+#
+# A rotation removes the phase lock outright rather than papering over it: an
+# irrational slope means the cell grid and the pixel grid are never
+# commensurate at *any* cell size, so there is no setting left for the field to
+# resonate at. It is also strictly cheaper -- the warp cost a whole
+# `_value_noise` call of its own and forced the neighbour search out to 5x5 to
+# pay for its travel, where this is four multiplies on the coordinate ramp and
+# leaves the search at 3x3.
+#
+# And it is the only fix available for the *axis alignment*, which the warp
+# never addressed at all. Rotating a value-noise field would merely rotate its
+# quilt, because that quilt is made of plateaus at the lattice points; rotating
+# a *point* field genuinely de-aligns it, because the points have no preferred
+# direction of their own once they are off the grid.
+_GRAIN_ROT = math.atan(2.0 / (1.0 + 5.0**0.5))
+_GRAIN_COS = math.cos(_GRAIN_ROT)
+_GRAIN_SIN = math.sin(_GRAIN_ROT)
+
+# Candidate points per lattice cell, and the fraction of those slots that
+# actually hold a point.
+#
+# One point per cell -- what this used to be -- is a *stratified* process: the
+# count in any region is fixed by its area, so density cannot vary and the
+# layer reads as an even mesh however well the individual points are jittered.
+# That evenness is the "repetitive when zooming out" complaint, and no amount
+# of jitter fixes it, because jitter moves points without ever changing how
+# many there are.
+#
+# Three slots at 0.62 gives a count per cell of Binomial(3, 0.62) -- mean 1.86,
+# and genuinely 0, 1, 2 or 3 -- so clumps crowd in some places and leave gaps
+# in others. Swept 2 to 5 slots at matched mean density and the rendered fields
+# are hard to tell apart, so this is set at the cheapest count that still gives
+# real variation: 3 slots over a 3x3 search is 27 candidate evaluations, which
+# is what the old 5x5 single-slot search already cost.
+_GRAIN_SLOTS = 3
+_GRAIN_FILL = 0.62
+
+# Rings of neighbouring cells the search checks, each way -- 1 means 3x3.
+#
+# **Exact, not a heuristic, and the proof is what buys back full-cell jitter.**
+# Work in cell units. A pixel in cell (0,0) is somewhere in [0,1)^2. A point in
+# an *excluded* cell -- one at least two cells away on either axis -- has that
+# coordinate in [2, 3), so it is strictly more than 1 cell from the pixel. No
+# point's radius can exceed one cell, because the lattice is pitched at ``hi``
+# and radii are drawn from ``[lo, hi]``; and the falloff is exactly zero at and
+# beyond the radius. So an excluded point contributes exactly nothing, whatever
+# its jitter -- which is why the jitter may now cover the whole cell rather than
+# the middle half the old 5x5 search needed.
+#
+# Verified rather than merely argued: rendering the same field at 1 ring and at
+# 2 rings agrees to 2.7e-07 (float noise) across narrow and wide size ranges.
+_GRAIN_RINGS = 1
+
+# Exponent on a point's falloff when its brightness is mixed into a pixel.
+#
+# The old field read out the *winning* point's brightness -- a hard argmax --
+# and that leaves a visible discontinuity wherever two overlapping discs of
+# different brightness change places, which is a hard cusp cutting across an
+# otherwise round grain. Weighting every candidate by ``falloff ** SHARE``
+# instead makes the readout continuous while staying close to winner-take-all:
+# at 3 a disc dominates its own middle completely and only trades with a
+# neighbour where the two falloffs are genuinely comparable.
+#
+# **This is not the "sum the candidates" construction the old docstring warned
+# about**, and the difference matters. Summing would let a distant point add
+# light where there is none, which reads as fog; here the sum is *normalised*
+# (it is a weighted mean of brightness, not a total) and the field's amplitude
+# still comes from `peak`, the single largest falloff. So a gap is still exactly
+# a gap: with every falloff at zero the amplitude is zero regardless of what any
+# brightness nearby happens to be.
+#
+# It also removed the need for a tie-break margin. The old argmax could flip
+# winners on a last-bit difference in the distance arithmetic between two tile
+# layouts -- a discrete jump to another point's brightness, patched with a fixed
+# margin. A weighted mean has no winner to flip: measured tile independence went
+# from 2.6e-04 to 1.2e-06.
+_GRAIN_SHARE = 3
+
+# The cluster field: how deeply a grain's brightness is modulated by a smooth
+# multi-octave field, its base pitch in *cells*, and that field's own octave
+# count and roughness.
+#
+# **This is the answer to "no pattern when zooming out", and nothing else in
+# the construction can supply it.** Points, however well randomised, give a
+# process whose density is flat at large scales -- step back far enough and any
+# such field averages to a featureless screen, which is exactly what reads as a
+# repeating mesh. Real emulsion does not do that: crystals clump, clumps mottle,
+# and the mottling has no single size. So each grain's brightness is scaled by
+# ``1 + CLUSTER * (m * 2 - 1)`` with ``m`` a three-octave field, giving the
+# layer real contrast variation at 6, 12 and 24 cells at once.
+#
+# Single-octave clustering was built first and is visibly wrong: it gives every
+# clump-of-clumps the same diameter, so zoomed out the frame reads as regular
+# blobs -- a different repeating pattern rather than none. Three octaves is
+# where the eye stops finding a characteristic size.
+#
+# Depth 0.6 keeps ``1 + 0.6*(...)`` strictly positive, so the modulation can
+# thin a region out but never invert a grain's sign. Swept 0.4 / 0.6 / 0.8:
+# 0.4 is barely visible at a distance, 0.8 starts reading as patchiness in the
+# image rather than as grain.
+#
+# Pitched in *cells* rather than pixels on purpose, so the mottling scales with
+# the clump the way `reference_mp` scales everything else: a preset dialled in
+# at one grain size keeps the same relationship between clump and cluster when
+# the size slider moves.
+_GRAIN_CLUSTER = 0.6
+_GRAIN_CLUSTER_CELLS = 6.0
+_GRAIN_CLUSTER_OCTAVES = 3
+_GRAIN_CLUSTER_ROUGHNESS = 0.7
+
+# Amplitude normalisation. The field is scaled so its standard deviation is
+# `_GRAIN_TARGET_STD` at every Min/Max setting, using a closed form in the
+# Min/Max *ratio* -- `_GRAIN_STD_FIT` is a cubic in that ratio, highest power
+# first, giving the field's own std before the gain.
+#
+# **A closed form rather than a measurement, for invariant 1.** Dividing by
+# ``field.std()`` would be a statistic of the region and would normalise every
+# tile of an export differently while every preview looked fine. It does not
+# have to be measured: the point pattern in cell units is scale-free, so the
+# std depends on the ratio alone -- verified across an 8x range of absolute
+# size (pitch 4, 8 and 16 working px agree to 1.4%), and the cubic fits the
+# ratio sweep to 0.12%.
+#
+# Normalising at all is new, and it fixes a real inconsistency. The two old
+# constructions disagreed about loudness by 43% -- the value-noise field
+# measured 0.684 rendered sigma against the point field's 0.477 -- so
+# `global_intensity` meant two different things depending on whether Max
+# happened to exceed Min. The target is the *point* field's old level, which
+# keeps the default preset's global layer where it was; the four presets that
+# used the value-noise path get about 31% quieter. See CLAUDE.md.
+_GRAIN_TARGET_STD = 0.29
+_GRAIN_STD_FIT = (-0.02885, -0.01261, 0.09356, 0.28253)
 
 
-def _variable_cell_noise(
+def _grain_gain(lo: float, hi: float) -> float:
+    """Amplitude normaliser for `_grain_points`, a closed form in ``lo/hi``.
+
+    See `_GRAIN_TARGET_STD` for why this is a fitted constant rather than a
+    measurement of the field in hand.
+    """
+    r = min(max(lo / hi, 0.0), 1.0)
+    a, b, c, d = _GRAIN_STD_FIT
+    return _GRAIN_TARGET_STD / (((a * r + b) * r + c) * r + d)
+
+
+def _grain_lattice_noise(
+    iy0: int, ix0: int, hl: int, wl: int, pitch: float, seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Quintic value noise over *lattice cell indices*, pitch in cells.
+
+    The cluster field below is a property of a grain, not of a pixel -- every
+    point in a cell shares one value -- so it is evaluated on the lattice and
+    never on the pixel grid. That is why the most expensive-sounding part of
+    this rewrite costs almost nothing: the lattice is smaller than the frame by
+    the square of the clump size, and at the coarse pitches the cluster field
+    uses it is smaller again.
+
+    Addressed by absolute cell index, so two tiles asking about the same cell
+    agree -- the same discipline `_value_noise` follows one level down.
+    """
+    def span(i0: int, n: int) -> tuple[int, int]:
+        j0 = int(math.floor(i0 / pitch)) - 1
+        j1 = int(math.floor((i0 + n - 1) / pitch)) + 2
+        return j0, j1 - j0 + 1
+
+    j0, jn = span(iy0, hl)
+    k0, kn = span(ix0, wl)
+    lat = torch.from_numpy(_lattice_np(j0, k0, jn, kn, seed, 1)).to(device)
+
+    v = (torch.arange(iy0, iy0 + hl, device=device, dtype=torch.float32)
+         / pitch)[:, None]
+    u = (torch.arange(ix0, ix0 + wl, device=device, dtype=torch.float32)
+         / pitch)[None, :]
+
+    def remap(t: torch.Tensor) -> torch.Tensor:
+        fl = torch.floor(t)
+        f = t - fl
+        return fl + f * f * f * (f * (f * 6.0 - 15.0) + 10.0)
+
+    gy = ((remap(v) - j0) / max(jn - 1, 1) * 2.0 - 1.0).expand(hl, wl)
+    gx = ((remap(u) - k0) / max(kn - 1, 1) * 2.0 - 1.0).expand(hl, wl)
+    grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)
+    return F.grid_sample(
+        lat.unsqueeze(0), grid, mode="bilinear", align_corners=True,
+        padding_mode="border",
+    )[0, 0]
+
+
+def _grain_cluster(
+    iy0: int, ix0: int, hl: int, wl: int, seed: int, device: torch.device,
+) -> torch.Tensor:
+    """Per-cell brightness multiplier: the multi-octave clumping field.
+
+    Variance-preserving across octaves for `_fbm`'s reason -- otherwise adding
+    structure would quietly turn the modulation down, and the cluster depth
+    would stop meaning one thing.
+    """
+    total: torch.Tensor | None = None
+    wsum = 0.0
+    wsq = 0.0
+    for o in range(_GRAIN_CLUSTER_OCTAVES):
+        wgt = _GRAIN_CLUSTER_ROUGHNESS**o if o else 1.0
+        n = _grain_lattice_noise(
+            iy0, ix0, hl, wl, _GRAIN_CLUSTER_CELLS * (2.0**o),
+            seed + o * 1301, device,
+        )
+        total = n * wgt if total is None else total + n * wgt
+        wsum += wgt
+        wsq += wgt * wgt
+    m = 0.5 + (total / wsum - 0.5) * (wsum / math.sqrt(wsq))
+    return 1.0 + _GRAIN_CLUSTER * (m * 2.0 - 1.0)
+
+
+def _grain_points(
     h: int, w: int, y0: float, x0: float, lo: float, hi: float, seed: int,
     device: torch.device, nfields: int = 1,
 ) -> torch.Tensor:
-    """Cellular ("Worley-style") noise with an independently random radius per
-    point, drawn uniformly from ``[lo, hi]`` -- genuine per-clump size
-    variation, rather than one clump size for the whole field.
+    """The Global Grain layer's noise: discrete grains of independently drawn
+    size, scattered on a rotated lattice and clustered at every scale.
 
-    ``_fbm`` cannot do this: its lattice is addressed on a single uniform
-    pitch, so every "clump" it produces is the same size by construction --
-    Octaves and Roughness change how much *structure* stacks on top of the
-    base clump, never the base clump's own size. Getting an independently
-    sized clump means giving up the uniform lattice and its cheap
-    ``grid_sample`` interpolation trick, and building the field from discrete
-    points instead.
+    This is the *only* construction the global layer uses now, at every Min/Max
+    setting including Min == Max. It replaced two: a value-noise fBm below Max
+    and a cellular field above it. Both were reported as showing a grid, and the
+    measurements agreed -- see the comment block above `_GRAIN_ROT` and the
+    section in CLAUDE.md.
 
-    One point per cell of a base lattice pitched at ``hi`` -- the *largest*
-    radius any point can have, which is what makes the fixed-ring neighbour
-    search below exact rather than approximate (see ``_VARCELL_JITTER_LO`` and
-    ``_VARCELL_RINGS`` for the proof). Each point's position is jittered
-    within the middle half of its cell, and each draws its own radius
-    uniformly from ``[lo, hi]`` and its own brightness, all from one hash per
-    cell -- deterministic and addressed in global coordinates, so two tiles
-    asking about the same point agree.
+    **Why the fBm had to go rather than be repaired.** Value noise interpolates
+    between lattice points with a curve whose derivative vanishes *at* those
+    points, so every cell reads as a blob with flat corners and the blobs tile a
+    visible quilt: measured gridiness 1.47 at a 12px clump, with the field's own
+    autocorrelation peaking at exactly the lattice pitch (0.24 at lag 5 for a
+    5px cell). That is intrinsic to the interpolant, not to the lattice's
+    orientation -- rendering it through a rotated lattice was tried and simply
+    produces a rotated quilt. The only repair is a different kind of field.
 
-    A pixel takes its value from whichever of the candidate points has
-    the strongest claim on it -- the largest radial falloff (1 at that point's
-    own centre, 0 at its own radius, cubic in between), which is "closest
-    *relative to that point's own size*" rather than closest in raw distance.
-    That point's own signed brightness, scaled by the falloff, is the output.
-    Selecting by falloff rather than combining every candidate is what keeps
-    this reading as discrete particles with their own edges rather than as
-    fog, and it is what makes coverage gaps -- clear film base between grains,
-    where no point's falloff ever rises off zero -- an honest consequence of a
-    wide ``lo``-``hi`` range rather than a bug to paper over.
+    Grains rather than noise is also the better model for what this layer *is*.
+    It stands in for print stock and scanner grain, and a grain is a particle
+    with a position, a size and a density -- which is what a point field says
+    and what an interpolated lattice cannot.
 
-    **Centred on 0.5, the same convention `_fbm` returns, and for the same
-    reason `_smooth_noise` needs it**: that function re-centres explicitly
-    (``0.5 + blur(n - 0.5, sigma) * gain``), so a field that means something
-    different at 0.5 would be blurred around the wrong point. A gap -- every
-    candidate's falloff at zero -- must land exactly on 0.5, the shared
-    "no deviation" value both the blur and the caller's later ``*2-1`` remap
-    already assume; landing gaps on raw zero instead would read as the
-    strongest possible *darkening* over most of the frame the moment any
-    range wider than a sliver of ``lo``-``hi`` left real gaps, which is
-    backwards from "nothing is here". So brightness is drawn signed, in
-    ``[-1, 1)``, and the output is ``0.5 + 0.5 * falloff * brightness``: a gap
-    (falloff 0) is 0.5 regardless of any candidate's brightness, and a pixel
-    sitting in a point's centre reaches its own brightness at full amplitude,
-    lighter or darker with equal likelihood -- matching how real grain is not
-    one-sided either.
+    The construction, one point-slot at a time:
 
-    Returns shape ``[1, nfields, h, w]``, matching `_fbm`'s convention, so it
-    drops into the same normalise-and-clamp pipeline the mono and chroma
-    global-grain fields already share. Geometry (positions and radii) is
-    identical across fields and the winning point is chosen once, shared by
-    every field; only brightness is drawn independently per field and read
-    from whichever point won -- the same "shared shape, independent value"
-    pattern ``_lattice_np`` already gives ``_fbm``'s multi-field calls, and it
-    is what lets a chroma variant share every grain's position and size across
-    channels while still giving each channel its own intensity.
+    * The lattice is pitched at ``hi``, the largest radius any grain can have,
+      which is what makes the 3x3 neighbour search exact (see `_GRAIN_RINGS`).
+      It is **rotated** against the pixel grid (see `_GRAIN_ROT`).
+    * Each cell carries `_GRAIN_SLOTS` slots. A slot draws one uniform value
+      that decides both whether it holds a grain at all (`_GRAIN_FILL`) and, if
+      it does, that grain's radius in ``[lo, hi]`` -- one hash channel doing two
+      jobs, which keeps the per-cell hash cost down where the lattice is dense.
+      Conditional on being present the radius is still uniform on ``[lo, hi]``,
+      so the size distribution is exactly what the two sliders promise.
+    * Position jitters over the **whole** cell, and brightness is drawn signed
+      per output field, then scaled by that cell's cluster multiplier.
+    * A pixel's amplitude is the single largest falloff over every candidate
+      (so a gap stays a gap), and its brightness is those candidates' brightness
+      averaged under ``falloff ** _GRAIN_SHARE`` (so overlapping grains trade
+      smoothly instead of cutting a cusp across each other).
+
+    **Centred on 0.5**, the convention `_fbm` returned and `_smooth_noise`
+    requires -- that function re-centres explicitly, so a field meaning
+    something else at 0.5 would be blurred about the wrong point. A gap has
+    every falloff at zero and therefore lands exactly on 0.5 whatever the
+    brightness of anything nearby, which is what "nothing is here" has to mean;
+    brightness is drawn signed in ``[-1, 1)`` so a grain is lighter or darker
+    with equal odds, as real grain is.
+
+    Returns ``[1, nfields, h, w]``. Geometry -- which cells hold grains, where,
+    and how big -- is shared across fields and only brightness is drawn per
+    field, which is what lets the chroma variant give one grain its own
+    intensity per channel without moving its edge from channel to channel.
+
+    Needs **no tile overlap at all**: every quantity is a function of absolute
+    global coordinates, and the lattice window is derived per call from the
+    window it was asked for, so a pixel always sees its true neighbours however
+    the frame was split. Measured at 1.2e-06 between a whole-frame render and
+    arbitrary sub-windows with zero padding.
     """
     cell = hi
-    # The ramp is monotonically increasing (cell > 0 always), so its min and max
-    # are its first and last entries -- which `_lat_span` computes in Python,
-    # saving both the scalar reads and the two full-tensor reductions that used
-    # to feed them.
-    iy0, hl = _lat_span(h, y0, cell, _VARCELL_RINGS, _VARCELL_RINGS)
-    ix0, wl = _lat_span(w, x0, cell, _VARCELL_RINGS, _VARCELL_RINGS)
-
-    # Three geometry channels (jitter y, jitter x, radius fraction) plus one
-    # brightness channel per output field, all from the one hash so a single
-    # CPU call covers the whole lattice window.
-    lat = torch.from_numpy(_lattice_np(iy0, ix0, hl, wl, seed, 3 + nfields)).to(device)
-    jy = _VARCELL_JITTER_LO + _VARCELL_JITTER_SPAN * lat[0]
-    jx = _VARCELL_JITTER_LO + _VARCELL_JITTER_SPAN * lat[1]
-    rad = lo + lat[2] * (hi - lo)
-    bri = lat[3:] * 2.0 - 1.0  # [nfields, hl, wl], signed -- see the docstring
-
-    cell_iy = torch.arange(iy0, iy0 + hl, device=device, dtype=torch.float32)[:, None]
-    cell_ix = torch.arange(ix0, ix0 + wl, device=device, dtype=torch.float32)[None, :]
-    py = (cell_iy + jy) * cell  # [hl, wl], this cell's point in working px
-    px = (cell_ix + jx) * cell
+    ca, sa = _GRAIN_COS, _GRAIN_SIN
 
     Y = (torch.arange(h, device=device, dtype=torch.float32) + float(y0))[:, None]
     X = (torch.arange(w, device=device, dtype=torch.float32) + float(x0))[None, :]
-    # Cell assignment uses the true, unwarped position -- the search proof
-    # above is against this coordinate, and warping it would need a wider
-    # search to stay valid.
-    piy = (torch.floor(Y / cell).long() - iy0).clamp(0, hl - 1)  # [h, 1]
-    pix = (torch.floor(X / cell).long() - ix0).clamp(0, wl - 1)  # [1, w]
+    # Rotated, and in cell units. Rotation is an isometry, so distances -- and
+    # therefore radii and falloffs -- mean exactly what they did; only the cell
+    # grid's orientation against the pixel grid changes.
+    Yr = (Y * ca + X * sa) / cell
+    Xr = (X * ca - Y * sa) / cell
 
-    # See `_VARCELL_WARP_CELL_FRAC` -- breaks the pixel-grid/cell-grid
-    # resonance without touching which cell a pixel belongs to.
-    warp_cell = max(_MIN_CELL, _VARCELL_WARP_CELL_FRAC * cell)
-    wn = _value_noise(h, w, y0, x0, warp_cell, seed + 51, 2, device)
-    Yw = Y + (wn[0, 0] * 2.0 - 1.0) * (_VARCELL_WARP_AMOUNT * cell)
-    Xw = X + (wn[0, 1] * 2.0 - 1.0) * (_VARCELL_WARP_AMOUNT * cell)
+    # The rotated window's bounds. Both coordinates are affine in (y, x), so
+    # their extrema over the tile are attained at its four corners -- no device
+    # reduction and no scalar read-back, the same reasoning as `_lat_span`. The
+    # pad is `_GRAIN_RINGS + 1`: one cell for the ring the search reaches into,
+    # and one spare so the float64 bound here can never fall on the wrong side
+    # of an integer from the float32 ramp above. Over-covering is free -- the
+    # sampling grid is an affine map of the absolute lattice index, so unused
+    # rows simply go unread.
+    ys = (float(y0), float(y0) + h - 1)
+    xs = (float(x0), float(x0) + w - 1)
+    vs = [(yy * ca + xx * sa) / cell for yy in ys for xx in xs]
+    us = [(xx * ca - yy * sa) / cell for yy in ys for xx in xs]
+    pad = _GRAIN_RINGS + 1
+    iy0 = int(math.floor(min(vs))) - pad
+    hl = int(math.floor(max(vs))) + pad + 1 - iy0
+    ix0 = int(math.floor(min(us))) - pad
+    wl = int(math.floor(max(us))) + pad + 1 - ix0
 
-    # The winning candidate is chosen by falloff alone -- shared across every
-    # field -- and only afterward is that winner's own (per-field) brightness
-    # read out. Selecting by the product instead would let a dim, distant
-    # candidate's positive brightness beat a near-zero-falloff gap into
-    # registering as real signal, which is exactly backwards: a gap must stay
-    # a gap regardless of what any nearby point's brightness happens to be.
-    # Carries the *winning cell*, not the winning brightness. Brightness is
-    # `[nfields, h, w]`, so keeping it in the loop meant `torch.where` rewriting
-    # nfields full-frame planes on all 25 iterations -- 75 plane writes to end up
-    # using one. The flat cell index is a single plane whatever `nfields` is, and
-    # one gather afterwards reads out the winner. Measured 1.26x on this function
-    # at nfields=3 and bit-identical, which it has to be: same candidates, same
-    # order, same comparison, so the same point wins and the same brightness is
-    # read from it. The saving is mostly peak memory, which is what lets a
-    # weaker machine afford a larger tile.
-    best_shape = torch.zeros(h, w, device=device)
-    best_cell = torch.zeros(h, w, device=device, dtype=torch.long)
-    for dy in range(-_VARCELL_RINGS, _VARCELL_RINGS + 1):
-        for dx in range(-_VARCELL_RINGS, _VARCELL_RINGS + 1):
-            ny = (piy + dy).clamp(0, hl - 1)
-            nx = (pix + dx).clamp(0, wl - 1)
-            dxp = Xw - px[ny, nx]
-            dyp = Yw - py[ny, nx]
-            dist = torch.sqrt(dxp * dxp + dyp * dyp)
-            d_norm = dist / rad[ny, nx].clamp_min(1e-3)
-            shape = 1.0 - _smoothstep(0.0, 1.0, d_norm)  # [h, w]
-            # A margin, not a bare `>`: two candidates can be genuinely almost
-            # tied (a pixel near the border between two blobs), and there the
-            # coordinate arithmetic feeding `dist` differs in its last bit or
-            # two depending on how a tile happens to be padded and cropped --
-            # around 2e-5 measured. Without a margin comfortably above that
-            # noise floor, a near-tie can resolve to a *different* winning
-            # point depending on tile layout, which is not a gradual drift but
-            # a discrete jump to that other point's own brightness -- the one
-            # thing a tile-independent field must never do. The margin is
-            # fixed and the candidate order is fixed (same dy, dx sweep every
-            # time), so whichever candidate is reached first while within it
-            # keeps the win consistently, regardless of how the image was
-            # tiled to get here.
-            win = shape > best_shape + _VARCELL_TIE_MARGIN
-            best_cell = torch.where(win, (ny * wl + nx).expand(h, w), best_cell)
-            best_shape = torch.where(win, shape, best_shape)
+    # Per slot: jitter y, jitter x, the combined presence/radius draw, then one
+    # brightness per output field. One CPU hash call covers every slot.
+    per = 3 + nfields
+    lat = torch.from_numpy(
+        _lattice_np(iy0, ix0, hl, wl, seed, _GRAIN_SLOTS * per)
+    ).to(device)
 
-    # One gather instead of 25 masked writes. `bri` is [nfields, hl, wl] and
-    # `best_cell` indexes its flattened lattice, so this reads each pixel's
-    # winning point's own per-field brightness.
-    best_bri = bri.reshape(nfields, -1).gather(
-        1, best_cell.reshape(1, -1).expand(nfields, -1)
-    ).reshape(nfields, h, w)
-    return (0.5 + 0.5 * best_shape.unsqueeze(0) * best_bri).unsqueeze(0)
+    cell_iy = torch.arange(iy0, iy0 + hl, device=device, dtype=torch.float32)[:, None]
+    cell_ix = torch.arange(ix0, ix0 + wl, device=device, dtype=torch.float32)[None, :]
+    camp = _grain_cluster(iy0, ix0, hl, wl, seed + 991, device)
+
+    piy = (torch.floor(Yr).long() - iy0).clamp(0, hl - 1)
+    pix = (torch.floor(Xr).long() - ix0).clamp(0, wl - 1)
+
+    peak = torch.zeros(h, w, device=device)
+    num = torch.zeros(nfields, h, w, device=device)
+    den = torch.zeros(h, w, device=device)
+    rad_lo, rad_span = lo / cell, (hi - lo) / cell
+    for s in range(_GRAIN_SLOTS):
+        b = s * per
+        # One draw, two jobs: below `_GRAIN_FILL` the slot holds a grain and the
+        # draw is stretched back over the full [lo, hi] range for its radius;
+        # above it the slot is empty, which a zero radius says exactly (the
+        # falloff is zero everywhere, so it can never win and never contributes).
+        u = lat[b + 2]
+        rad = torch.where(
+            u < _GRAIN_FILL, rad_lo + rad_span * (u / _GRAIN_FILL),
+            torch.zeros_like(u),
+        )
+        bri = (lat[b + 3: b + 3 + nfields] * 2.0 - 1.0) * camp
+        py = cell_iy + lat[b]
+        px = cell_ix + lat[b + 1]
+        for dy in range(-_GRAIN_RINGS, _GRAIN_RINGS + 1):
+            for dx in range(-_GRAIN_RINGS, _GRAIN_RINGS + 1):
+                ny = (piy + dy).clamp(0, hl - 1)
+                nx = (pix + dx).clamp(0, wl - 1)
+                dyp = Yr - py[ny, nx]
+                dxp = Xr - px[ny, nx]
+                # The epsilon on the *distance* is what makes an empty slot
+                # unreachable rather than merely improbable. An empty slot has
+                # radius exactly 0, and a bare `radius.clamp_min(tiny)` would
+                # give a pixel landing exactly on that slot's phantom position
+                # a ratio of 0/tiny = 0 -- a full-strength grain out of a slot
+                # that holds none. Biasing the numerator instead forces the
+                # ratio to `1e-7 / 1e-12` there, comfortably past 1, whatever
+                # the distance happens to be. It costs a real grain 1e-7 of a
+                # cell, which is under 1e-7 of a pixel.
+                shape = 1.0 - _smoothstep(
+                    0.0, 1.0,
+                    (torch.sqrt(dyp * dyp + dxp * dxp) + 1e-7)
+                    / rad[ny, nx].clamp_min(1e-12),
+                )
+                wgt = shape
+                for _ in range(_GRAIN_SHARE - 1):
+                    wgt = wgt * shape
+                num = num + wgt * bri[:, ny, nx]
+                den = den + wgt
+                peak = torch.maximum(peak, shape)
+
+    # In a true gap every `shape` is exactly zero -- `_smoothstep` clamps, so
+    # the falloff is 0 at and beyond the radius rather than merely small -- so
+    # `num` and `den` are both exactly zero and this is 0, not an amplified
+    # ratio of two small numbers. `peak` is zero there too, so it would not
+    # matter either way.
+    val = num / den.clamp_min(1e-12)
+    return (
+        0.5 + (0.5 * _grain_gain(lo, hi)) * peak.unsqueeze(0) * val
+    ).unsqueeze(0)
 
 
 # Scatter stencils, indexed by the ``scatter_pattern`` parameter. A stencil is
@@ -1708,15 +1925,19 @@ def _fbm(
     return 0.5 + (field - 0.5) * gain if gain != 1.0 else field
 
 
-def _smooth_noise(n: torch.Tensor, cell: float, amount: float) -> torch.Tensor:
+def _smooth_noise(
+    n: torch.Tensor, cell: float, amount: float, ratio: float = 1.0,
+) -> torch.Tensor:
     """Blur a 0..1 noise field and put back the amplitude the blur costs.
 
-    The defect this exists for is structural rather than a bad setting: value
-    noise is a quilt of axis-aligned cells, invisible at a 1.6px clump and
-    plainly rectangular at 20px. No amount of re-seeding or extra octaves moves
-    it, because every octave is built on the same kind of lattice -- measured,
-    the two-octave global field scores the same gridiness as one octave alone.
-    A filter on the field is the cure.
+    ``ratio`` is the field's Min/Max grain-size ratio, which the gain depends
+    on -- see `_SMOOTH_GAIN_K_FIT`. It defaults to 1.0, a single grain size.
+
+    It was written to remove a defect: the layer was value noise, a quilt of
+    axis-aligned cells, and a filter on the field was the only cure. There is no
+    quilt left to remove -- `_grain_points` has no lattice-aligned structure to
+    begin with -- so this is now a shape control, rounding grains off and
+    softening where they meet.
 
     **Variance is restored, and that is the point.** `_fbm` preserves variance
     so Octaves changes structure at constant strength; this follows the same
@@ -1724,17 +1945,19 @@ def _smooth_noise(n: torch.Tensor, cell: float, amount: float) -> torch.Tensor:
     down would leave Global Intensity fighting it, and "smoother" would be
     indistinguishable from "less".
 
-    The gain is a closed form in ``sigma/cell`` rather than a measurement of
-    the field in hand. Normalising against ``n.std()`` would be a statistic of
-    the region -- invariant 1 -- and would restore a different amount in every
-    tile of an export while every preview looked fine.
+    The gain is a closed form in ``sigma/cell`` and the size ratio rather than a
+    measurement of the field in hand. Normalising against ``n.std()`` would be a
+    statistic of the region -- invariant 1 -- and would restore a different
+    amount in every tile of an export while every preview looked fine.
     """
     if amount <= 0.001:
         return n
     sigma = amount * _SMOOTH_MAX * cell
     if sigma < 0.05:
         return n
-    gain = math.sqrt(1.0 + _SMOOTH_GAIN_K * (sigma / cell) ** 2)
+    a, b, c = _SMOOTH_GAIN_K_FIT
+    r = min(max(ratio, 0.0), 1.0)
+    gain = math.sqrt(1.0 + ((a * r + b) * r + c) * (sigma / cell) ** 2)
     return 0.5 + _blur(n - 0.5, sigma) * gain
 
 
@@ -1806,7 +2029,7 @@ class GrainEngine:
     # ------------------------------------------------------------------ #
     def _global_grain_field(
         self, h: int, w: int, y0: float, x0: float, p: dict,
-        gcell: float, gcell_max: float, variable: bool,
+        gcell: float, gcell_max: float,
     ) -> torch.Tensor:
         """The Global Grain texture layer, normalised and clamped. Cached.
 
@@ -1831,8 +2054,8 @@ class GrainEngine:
           index.** The field is addressed globally (invariant 1), so keying on
           anything relative would hand one tile another tile's texture and seam
           every export while every preview looked fine.
-        * ``gcell, gcell_max, variable`` -- the *derived* working cells, not the
-          raw sliders. Two different (size, scale) pairs that floor to the same
+        * ``gcell, gcell_max`` -- the *derived* working cells, not the raw
+          sliders. Two different (size, scale) pairs that floor to the same
           working cell genuinely produce the same field and should share an
           entry, and this folds in both `scale` and the supersample level for
           free, since the caller has already multiplied them in.
@@ -1854,7 +2077,7 @@ class GrainEngine:
         channel at working resolution.
         """
         key = (
-            h, w, float(y0), float(x0), gcell, gcell_max, variable,
+            h, w, float(y0), float(x0), gcell, gcell_max,
             int(p["seed"]), p["global_smooth"], p["global_chroma"],
             str(self.device),
         )
@@ -1866,14 +2089,9 @@ class GrainEngine:
         self.gg_misses += 1
 
         def field(seed_off: int, nfields: int) -> torch.Tensor:
-            if variable:
-                return _variable_cell_noise(
-                    h, w, y0, x0, gcell, gcell_max,
-                    int(p["seed"]) + seed_off, self.device, nfields,
-                )
-            return _fbm(
-                h, w, y0, x0, gcell,
-                int(p["seed"]) + seed_off, nfields, 2, 0.5, self.device,
+            return _grain_points(
+                h, w, y0, x0, gcell, gcell_max,
+                int(p["seed"]) + seed_off, self.device, nfields,
             )
 
         gg = field(7717, 1)
@@ -1883,14 +2101,11 @@ class GrainEngine:
         # corners. Smoothed first, the clamp bites on a field that has
         # already lost its extremes, so the rails are reached less often.
         #
-        # Referenced against Max in the variable case: that is the field's
-        # own characteristic scale now (the base lattice pitch
-        # `_variable_cell_noise` places one point per cell of), where Min
-        # was the reference for the old single-size field. Smoothness on
-        # the variable field mostly softens the base-lattice boundary
-        # rather than a value-noise quilt -- there is no axis-aligned quilt
-        # here to begin with, since the points are jittered off-grid.
-        gg = _smooth_noise(gg, gcell_max if variable else gcell, p["global_smooth"])
+        # Referenced against Max, which is the field's own characteristic
+        # scale -- the pitch of the lattice `_grain_points` scatters its
+        # grains over, and therefore the largest a grain can be.
+        gg = _smooth_noise(gg, gcell_max, p["global_smooth"],
+                           gcell / gcell_max)
         gg = gg * 2.0 - 1.0
 
         # Chroma: decorrelate the three channels without touching the
@@ -1929,16 +2144,16 @@ class GrainEngine:
         # third of the wobble the other construction has.
         gc = p["global_chroma"]
         if gc > 0.001:
-            # Same construction as `gg` above (fBm or variable-cell,
-            # whichever `variable` selected), through the same closure --
+            # Same construction as `gg` above, through the same closure --
             # the decorrelation below only needs `gs` to be a second field
             # of comparable amplitude, but sharing the geometry generator
-            # means a variable-size chroma field reuses each grain's own
-            # position and radius across channels and only randomises its
-            # per-channel brightness, which is what gives a coloured grain
-            # its speckle without moving its shape from channel to channel.
+            # means the chroma field reuses each grain's own position and
+            # radius across channels and only randomises its per-channel
+            # brightness, which is what gives a coloured grain its speckle
+            # without moving its edge from channel to channel.
             gs = field(3391, 3)
-            gs = _smooth_noise(gs, gcell_max if variable else gcell, p["global_smooth"])
+            gs = _smooth_noise(gs, gcell_max, p["global_smooth"],
+                               gcell / gcell_max)
             gs = gs * 2.0 - 1.0
             gd = gs - gs.mean(dim=1, keepdim=True)
             gg = gg * math.sqrt(1.0 - (2.0 / 3.0) * gc) + gd * math.sqrt(gc)
@@ -3070,32 +3285,27 @@ class GrainEngine:
         #     as a separate mean-zero field rather than by the main grain's
         #     recipe.
         #
-        #     `global_size_max` (2026-08-04, on request) is the one thing here
-        #     that is not just another knob on this same field -- it swaps the
-        #     construction entirely. Reported as "too digital a job": `_fbm`
-        #     stacks octaves of a *single* clump size, so no matter how rough or
-        #     how many octaves, every grain is the same diameter. Above Min,
-        #     `_variable_cell_noise` replaces it with discrete points that each
-        #     draw their own radius uniformly between Min and Max, which is
-        #     what makes clumps genuinely differ from their neighbours rather
-        #     than all sharing one stacked structure. See that function for the
-        #     construction and `pad_for` for why its reach is Max, not Min.
+        #     Min and Max are the two ends of one grain-size distribution, and
+        #     since 2026-08-05 they select nothing else: `_grain_points` draws
+        #     every setting, Min == Max included. It used to be two
+        #     constructions, value-noise fBm below Max and a cellular field
+        #     above it, and the switch between them was a change in *kind* --
+        #     the layer's whole character, and 43% of its loudness, turned on
+        #     whether Max happened to exceed Min. Both were also reported as
+        #     showing a visible grid, from different causes. See `_GRAIN_ROT`.
         gi = p["global_intensity"]
         go = p["global_opacity"]
         if gi > 0.01 and go > 0.001:
             gcell = max(_MIN_CELL, p["global_size"] * scale)
             # Max can never pull the effective ceiling *below* Min: clamped up
-            # to it rather than swapped with it, so a preset that raises Min
-            # alone (global_size_max still at its own untouched default) can
-            # never accidentally cross into the variable-size construction --
-            # the two are not a symmetric pair the way the light-leak sizes
-            # are, because Min already has an established meaning on its own
-            # and Max is purely "how much further can it stretch".
+            # to it rather than swapped with it -- the two are not a symmetric
+            # pair the way the light-leak sizes are, because Min already has an
+            # established meaning on its own and Max is purely "how much
+            # further can it stretch".
             gcell_max = max(gcell, p["global_size_max"] * scale)
-            variable = (gcell_max - gcell) > 1e-3
 
             gg = self._global_grain_field(
-                h, w, y0, x0, p, gcell, gcell_max, variable,
+                h, w, y0, x0, p, gcell, gcell_max,
             )
             out = out + gg * ((gi / 100.0) * _AMP_SCALE * go)
 
@@ -3662,26 +3872,25 @@ class GrainEngine:
         # exactly where Max exceeds Min.
         gsm = 0.0
         # Same floored min and up-clamped max render() computes, not the raw
-        # slider values -- matched exactly, including the floor, so this gate
-        # and render()'s own `variable` decision can never disagree about
-        # whether the field switched construction.
+        # slider values -- matched exactly, including the floor, so the two can
+        # never disagree about the field's reference scale.
         gcell_lo = max(_MIN_CELL, p["global_size"] * scale)
         g_eff = max(gcell_lo, p["global_size_max"] * scale)
-        variable_gate = (g_eff - gcell_lo) > 1e-3
         if (p["global_intensity"] > 0.01 and p["global_opacity"] > 0.001
                 and p["global_smooth"] > 0.001):
             gsm = p["global_smooth"] * _SMOOTH_MAX * g_eff
-        # `_variable_cell_noise` reads lattice cells up to `_VARCELL_RINGS` away
-        # from a pixel's own -- a real read reach, not merely an addressing
-        # convenience, because the render pipeline only ever hands it a padded
-        # window rather than the whole image. Under-reserve this and a pixel
-        # near a tile edge silently substitutes a clamped boundary cell for the
-        # true neighbour, which two different tile splits do differently --
-        # invisible in a single preview, a seam in a tiled export.
-        varcell_r = 0.0
-        if (p["global_intensity"] > 0.01 and p["global_opacity"] > 0.001
-                and variable_gate):
-            varcell_r = _VARCELL_RINGS * g_eff
+        # The grain field itself reserves **nothing**, and that is a real
+        # change: the old cellular path carried a `_VARCELL_RINGS * cell` term
+        # here. `_grain_points` derives its own lattice window from whatever
+        # window it is handed, with a ring of slack on every side, so a pixel
+        # always sees its true neighbouring cells however the frame was split
+        # -- there is no boundary cell for it to substitute. Measured at
+        # 1.2e-06 between a whole-frame render and arbitrary sub-windows with
+        # zero padding, against the 2e-03 every other tile-independence check
+        # here is held to. `verify.py` pins that directly rather than trusting
+        # this comment, which is what has to stay true if the field ever grows
+        # a kernel of its own. `global_smooth` above is that kernel today and
+        # is reserved for separately.
         mask_r = max(1.0, 3.0 * scale)
         # Scatter reads a pixel up to its full reach away. It displaces rather
         # than blurring, so it belongs with the warps below and not in the
@@ -3721,7 +3930,7 @@ class GrainEngine:
         return int(
             math.ceil(
                 3.0 * (hp_r * 3.3 + mb + clar + halo + soft + shr + tex_r
-                       + mask_r + gsm + aa_r + varcell_r)
+                       + mask_r + gsm + aa_r)
                 + jit + aa_tap
             )
         ) + 4
