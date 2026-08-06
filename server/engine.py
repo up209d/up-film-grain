@@ -317,6 +317,49 @@ _BLUE_RANGE = 70.0
 # none, which is the failure `vibrance` is written to avoid as well.
 _BLUE_SAT_FLOOR = 0.12
 
+# -- split toning ---------------------------------------------------------- #
+# The warm/cool axis Highlight Warmth and Shadow Warmth push along, and the
+# amplitude of a full-strength push.
+#
+# **The axis is projected onto the luma-null plane, and that is the whole
+# construction.** The raw direction below is a warm shift -- red up, a little
+# green, blue down -- and pushing a pixel along it as written *also brightens
+# it*, because its luma is 0.248 rather than 0. So warming the highlights would
+# lift them as well, fighting Shoulder and Brightness for the same range and
+# making the two controls impossible to set independently. Subtracting the axis'
+# own luma from every channel lands it exactly on the plane where the luma
+# weights sum to zero, so the shift is a pure change of colour at every setting
+# and in both directions. `_WARM_AXIS` below is that projection, normalised so
+# its largest component is 1.
+#
+# **Amplitude, and why it is nearly three times what it replaced.** This was
+# `warm_highlights` and `cool_shadows`, two 0..1 sliders adding a fixed
+# [0.055, 0.012, -0.040] and [-0.030, 0.002, 0.050]. The user reported both as
+# doing nothing visible, and the arithmetic agrees: the peak shift was 0.055 in
+# one channel, and the weighting only reached 1.0 at pure white, so an ordinary
+# highlight at luma 0.7 got 0.019 -- under two 8-bit levels, which is a
+# rounding error and not a look. At 0.14 a full-strength push moves the blue
+# channel by 36 levels at the top of the range, which is a visible cast without
+# being a colour filter; the pair at opposite signs is a split tone you can see
+# at a glance and still dial back to nothing.
+_WARM_RAW = (1.0, 0.15, -1.0)
+_WARM_NULL = tuple(
+    c - sum(k * v for k, v in zip(_LUMA, _WARM_RAW)) for c in _WARM_RAW
+)
+# Normalised on the largest component rather than on the vector's length, so
+# `_WARM_GAIN` reads directly as "how far the worst-shifted channel moves".
+_WARM_AXIS = tuple(c / max(abs(v) for v in _WARM_NULL) for c in _WARM_NULL)
+_WARM_GAIN = 0.14
+
+# Where the two weightings reach full strength. They overlap through the
+# mid-tones deliberately -- disjoint bands leave an untinted stripe across the
+# middle of the range, so setting both sliders the same way would tint the top
+# and the bottom of a gradient and miss its centre. Widened from the old
+# (0.45, 1.0) / (0.0, 0.5): those only reached full weight at pure white and
+# pure black, so most of a real photograph took a fraction of the setting.
+_WARM_HI_BAND = (0.30, 0.85)
+_WARM_LO_BAND = (0.15, 0.70)
+
 # Peak edge displacement in full-resolution pixels at edge_jitter = 1.
 #
 # Was an inline 0.6, which made the control useless: the noise field averages
@@ -378,37 +421,116 @@ _AA_PASSES = 3
 _AA_DIR_K = 0.5
 _AA_DIR_MIN = 0.7
 
-# Thresholds that turn a value-noise field into sparse marks for the film
-# texture, one band per mark type. These have to be read off the field's actual
-# distribution rather than guessed: value noise is heavily centre-weighted, and
-# a threshold of 0.88 -- which sounds extreme -- selects 10% of the frame. The
-# measured quantiles are 1% above 0.943, 0.1% above 0.988, 0.01% above 0.998.
-#
-# Target coverage at full strength, chosen to look like film rather than like
-# weather: dust ~0.3% of the frame, scratches ~0.15%, hair ~0.03%. Anything
-# near a percent stops reading as damage and starts reading as texture.
-_DUST_THRESH = (0.9800, 0.9955)
-_SCRATCH_THRESH = (0.9836, 0.9970)
-# A hair is drawn as the level set |n - 0.5| < eps, so its width in pixels is
-# roughly 2 * eps * cell -- eps is scale-invariant on its own, but it has to be
-# solved for a real width, not picked. At 0.0016 with a 55px cell the filament
-# came out 0.35px wide, i.e. sub-pixel before supersampling even halved it, and
-# rendered as literally nothing. 0.014 gives about 1.5px.
-_HAIR_EPS = 0.006
-
 # Floor on a mark's per-mark brightness multiplier. Marks vary in density from
 # this to full; taking it to zero would just delete marks rather than vary them,
 # which thins the population instead of making it look weathered.
 _TEX_LUM_FLOOR = 0.25
 
-# Dust softening radius as a multiple of the speck's own cell. Was 1.6, which
-# at a 2px speck is a 3px blur -- not enough to read as out of focus at all.
-_DUST_SOFT_REACH = 1.1
+# -- dust ------------------------------------------------------------------ #
+# Every constant below describes one speck's *shape*. See `_dust_sites` for why
+# dust is drawn one speck at a time rather than thresholded out of a field.
+#
+# Eccentricity: a speck's two semi-axes are `r * (1 +- e)` with `e` drawn up to
+# this. **Not zero, and not much larger.** A population of exact circles is the
+# single clearest tell that a texture was generated -- real debris is a chip or
+# a fibre-end seen at some angle, so it is a little oval and pointing somewhere.
+# Past about 0.4 the specks start reading as short scratches instead.
+_DUST_ECCENT = 0.35
 
-# How far Dust Softness widens the speck's threshold band, which is what makes
-# the speck itself gradual rather than a disc. This does the real work; the
-# blur only takes the last of the edge off.
-_DUST_SOFT_BAND = 12.0
+# Amplitudes of the 3rd, 4th and 5th angular harmonics perturbing the ellipse's
+# radius, each with its own random phase. This is what "imperfect" means here
+# and it is deliberately built on top of the ellipse rather than instead of it:
+# the 2nd harmonic *is* an elongation, so it would only fight the eccentricity
+# draw above, where 3-5 dent the outline without changing its overall shape.
+#
+# They sum to 0.22, which is the number that matters -- the radius is
+# `1 + sum(a_k cos(k phi + p_k))`, so a sum at or above 1 can fold the outline
+# through its own centre and draw a shape with a bite out of it. At 0.22 the
+# worst case is a 22% dent and the speck stays convex and recognisably round,
+# which is what was asked for: an imperfect circle, not a blob.
+_DUST_HARMONICS = (0.10, 0.07, 0.05)
+
+# Spread of speck diameter about `dust_size`, as a multiplier range. Real debris
+# does not come in one size, and drawing every speck at the slider's exact value
+# reads as a stamped population. Geometric-ish rather than symmetric, so the
+# mean stays near 1.
+_DUST_SIZE_SPREAD = (0.55, 1.55)
+
+# Edge width of a speck at Dust Softness 0, as a fraction of its own radius, and
+# the width a full-softness speck reaches. The floor is not decoration: a hard
+# analytic edge aliases at any speck size, and it is what supersampling is left
+# to clean up when it is too tight to resolve.
+_DUST_EDGE_MIN = 0.10
+_DUST_EDGE_MAX = 0.85
+
+# Absolute floor on that edge, in working pixels. A 1px speck's 10% edge is a
+# hundredth of a pixel, which is a hard step in the output whatever the analytic
+# profile says. Half a pixel is the smallest edge the grid can carry.
+_DUST_EDGE_PX = 0.5
+
+# The narrowest half-width the pixel grid can carry, in working pixels. Below
+# it a mark is drawn at this width and *faded* by how much of it is really
+# there, instead of being drawn thinner.
+#
+# **This is not a nicety, it is the difference between a hair and a dashed
+# line.** A filament narrower than a pixel only registers where its centre
+# happens to pass near a pixel centre, so it renders as a row of dots with gaps
+# between them -- which is exactly what a hair's tapered tip did before this
+# existed: measured, one hair came out as a 394-pixel filament plus a detached
+# one-pixel speck at its end. Fading by the area (or, for a filament, the width)
+# that fell below the floor is what area-averaging would have done anyway, so
+# the mark thins the honest way: it gets fainter, not dotted.
+_MARK_MIN_PX = 0.5
+
+# How much of a speck's opacity softness takes away. Out-of-focus debris really
+# is both softer and fainter -- the same light is spread over a wider footprint
+# -- and leaving this at 0 makes Dust Softness read as "the specks got bigger".
+_DUST_SOFT_FADE = 0.45
+
+# Luminosity ranges the two populations spread across: opaque motes from black
+# to mid-grey, pinholes and lint from off-white to white. `dust_lum_var` spreads
+# each about its own midpoint, so a population varies within itself without the
+# two ever swapping places.
+_DUST_DARK_LUM = (0.0, 0.42)
+_DUST_LITE_LUM = (0.72, 1.0)
+
+# -- hair ------------------------------------------------------------------ #
+# Filament width at full resolution, in pixels, before the per-hair draw. A hair
+# is about this on a 24MP scan; the value is inherited from the level-set
+# construction this replaced, where it had to be *solved* for rather than picked
+# (a level set is `2 * eps * cell` wide, and the first attempt at 0.35px drew
+# literally nothing). Drawn directly now, so the width is simply the width.
+_HAIR_WIDTH = 1.6
+_HAIR_WIDTH_SPREAD = (0.7, 1.5)
+
+# Spread of hair length about `hair_length`, as a multiplier range.
+_HAIR_LEN_SPREAD = (0.65, 1.4)
+
+# How far a hair bends over its own length: the quadratic sag and the two
+# sinusoidal wobbles, all as fractions of the half-length. A hair lies in a
+# curve, and a straight one reads as a scratch -- which is the other mark type,
+# and the two must not converge.
+_HAIR_CURVE = 0.45
+_HAIR_WOBBLE = (0.18, 0.07)
+
+# Ceiling on each wobble's steepest lateral slope. See `_hair_sites`: a wobble
+# steep enough to double back within a pixel breaks the perpendicular-distance
+# approximation the renderer draws the filament with, and the hair comes out in
+# pieces. Capping the slope rather than the amplitude lets a slow wobble be
+# wide and forces a fast one to be shallow, which is what a fibre does anyway.
+# With the quadratic sag's own 2 * `_HAIR_CURVE` this holds the total under 1.8.
+_HAIR_SLOPE = (0.55, 0.30)
+
+# Where the taper starts, as a fraction of the half-length, and how thin the tip
+# gets. A real fibre comes to a point; a filament of constant width with two
+# blunt ends reads as a line segment somebody drew.
+_HAIR_TAPER = 0.55
+_HAIR_TIP = 0.15
+
+# Luminosity range a hair composites toward. A hair on the glass is opaque, so
+# it prints near black -- but not *at* black, or every hair is the same hair.
+_HAIR_LUM = (0.02, 0.30)
+_HAIR_ALPHA = (0.45, 1.0)
 
 # Inverse CDF of the value-noise field: (fraction of pixels above, threshold).
 # Measured over 3.2M samples. Needed because the film-texture marks are counted
@@ -429,15 +551,16 @@ _NOISE_ICDF = (
 # field's peaks are broad and clustered, so one excursion above the threshold
 # becomes several detectable blobs. Purely a calibration constant -- the
 # geometric argument predicts about 1.3 and measurement says otherwise, so
-# measurement wins. Tuned against delivered counts on a 1.5MP frame.
-# One per mark type, because the calibration is not shared: a compact speck, a
-# 70:1 scratch and a level-set filament each turn a given coverage fraction
-# into a different number of countable marks. Measured against delivered counts
-# on a 1.5MP frame and accurate to roughly a factor of 1.5 across the range --
-# these are counts you steer by, not guarantees.
-_BLOB_CELLS_DUST = 14.0
+# measurement wins. Tuned against delivered counts on a 1.5MP frame, and
+# accurate to roughly a factor of 1.5 across the range -- this is a count you
+# steer by, not a guarantee.
+#
+# **Scratches are the only mark type left that needs one.** Dust and hair used
+# to have their own (14.0 and 0.5) and the calibration was never shared, because
+# a compact speck and a level-set filament turn a given coverage fraction into
+# quite different numbers of countable marks. Both are drawn from lists now and
+# their counts are exact, so the constants went with the construction.
 _BLOB_CELLS_SCRATCH = 26.0
-_BLOB_CELLS_HAIR = 0.5
 
 # -- light leaks ---------------------------------------------------------- #
 # A leak is a *shaft* of light past an obstruction, so it is drawn as a small
@@ -449,6 +572,20 @@ _BLOB_CELLS_HAIR = 0.5
 # ratio, i.e. a low-discrepancy sequence rather than a stratification, so leak
 # k lands in the same place whatever the count is -- raising the count must add
 # a leak, not reshuffle the ones already on the frame.
+# Reciprocal powers of the plastic number: the 2-D low-discrepancy step
+# `_mark_spread` places dust and hair on, and the direct analogue of the
+# golden-ratio step `_leak_sites` places leaks on one dimension with.
+_R2_A1 = 1.0 / 1.32471795724474602596
+_R2_A2 = _R2_A1 * _R2_A1
+
+# How far a mark jitters off its low-discrepancy slot, as a fraction of the
+# frame. Small on purpose, for `_leak_sites`' reason: the sequence already
+# spreads the marks, and a large jitter only lets two of them land on top of
+# each other. At the top of the dust count the R2 spacing is 0.05, so this is
+# larger than the spacing and the placement goes locally random; at a count of
+# three it is far smaller and the sequence wins.
+_MARK_JITTER = 0.06
+
 _LEAK_PHI = 0.6180339887498949
 
 # How hard leaks are pulled toward the ends of their border. The film gate's
@@ -576,6 +713,226 @@ def _leak_sites(count: float, seed: int, var: float) -> list[dict]:
             "hue": mix(u[9], -0.20, 0.20),
         })
     return sites
+
+
+def _mark_rng(seed: int, salt: int, k: int) -> np.random.Generator:
+    """Per-mark generator, seeded on the mark's own index.
+
+    Seeded per mark rather than once per frame, for the reason `_leak_sites`
+    documents: mark 3 must not change when mark 9 is added. That is what makes
+    a count slider *add* marks instead of rerolling the frame every time it
+    moves, and it is why raising Dust Count from 20 to 21 leaves twenty specks
+    exactly where they were.
+    """
+    return np.random.default_rng(
+        np.uint64((int(seed) & 0xFFFF) * 1000003 + salt + k * 7919 + 17)
+    )
+
+
+def _mark_spread(
+    salt: int, seed: int, u0: float, u1: float, k: int,
+) -> tuple[float, float]:
+    """Where mark ``k`` sits, as a fraction of the frame.
+
+    A low-discrepancy step plus a small jitter, which is `_leak_sites`' trick in
+    two dimensions and it is here for the same reason. **Independent uniform
+    draws clump, and at small counts they clump visibly**: measured on the hair
+    generator, four of the first five marks landed in the top fifth of the
+    frame. That is not a bug in the hash -- over 400 marks the draws are uniform
+    to 1% and uncorrelated to 0.02 -- it is just what five uniform points look
+    like, and "I asked for five hairs and they are all in one corner" is a
+    complaint whether or not the statistics are innocent.
+
+    The R2 sequence steps by the reciprocal powers of the plastic number, which
+    fills the unit square about as evenly as a sequence can without knowing how
+    long it will be. That last part is what makes it usable here: **any prefix
+    is well spread**, so mark 6 can be added without moving marks 1 to 5, and
+    the count slider keeps the add-don't-reroll behaviour `_mark_rng` exists
+    for.
+
+    The jitter is fixed in frame units rather than scaled to the count, and that
+    is deliberate in both directions. At high counts the R2 spacing is smaller
+    than the jitter, so the placement is locally random and dust clumps the way
+    dust does; at low counts the spacing is much larger than the jitter, so the
+    sequence dominates and the marks spread out. Scaling the jitter to the count
+    would move every existing mark whenever the count changed.
+    """
+    off = _mark_rng(seed, salt + 977, 0).random(2)
+    y = (off[0] + (k + 1) * _R2_A2 + _MARK_JITTER * (u0 - 0.5)) % 1.0
+    x = (off[1] + (k + 1) * _R2_A1 + _MARK_JITTER * (u1 - 0.5)) % 1.0
+    return float(y), float(x)
+
+
+def _dust_sites(count: int, seed: int, balance: float) -> list[dict]:
+    """One record per speck, in units that do not depend on the frame's size.
+
+    **Dust is a list of objects now** (rewritten 2026-08-06). It was a threshold
+    on a value-noise field, which is the construction `docs/film-texture.md`
+    still insists on for scratches, and two things it could not do were asked
+    for outright:
+
+    * **A count that is a count.** A threshold selects *area*, and the number of
+      countable blobs that area breaks into was a fitted constant (14.0, good to
+      about a factor of 1.5). Ask for 20 specks and you got somewhere between 13
+      and 30. Here 20 is twenty.
+    * **A shape.** The outline of a thresholded noise field is whatever the
+      field happened to do -- lumpy, frequently merged with its neighbour, and
+      occasionally a long tear that reads as a scratch. A speck is a small round
+      thing; you cannot get one out of a level set of noise except by accident,
+      which is exactly what the user reported seeing.
+
+    **This does not break tile independence, and the reason is `_leak_sites`'.**
+    The list is a function of the count, the seed and the *frame* -- never of
+    the region being rendered. Every tile builds the identical list, positions
+    resolve against `full_hw` rather than against the tile, and a speck
+    straddling a tile boundary is drawn by both tiles from the same absolute
+    geometry. What breaks the invariant is N specks *per tile* or positions
+    drawn against the tile's own area, and neither happens here.
+
+    ``balance`` is `dust_balance`: -1 all dark, +1 all bright, 0 an even split.
+    The split is a prefix of the list rather than a per-speck coin flip, which
+    is what makes it exact *and* makes moving the slider convert specks in place
+    instead of reshuffling them -- position is drawn per index and never touched
+    by the balance.
+    """
+    n = int(min(max(count, 0), 4000))
+    n_light = int(round(n * (min(max(balance, -1.0), 1.0) + 1.0) * 0.5))
+
+    sites = []
+    for k in range(n):
+        u = _mark_rng(seed, 5501, k).random(12)
+        s_lo, s_hi = _DUST_SIZE_SPREAD
+        # Position as a fraction of the frame, so it lands in the same place at
+        # any working scale and in any tiling.
+        py, px = _mark_spread(5501, seed, u[0], u[1], k)
+        sites.append({
+            "y": py,
+            "x": px,
+            "size": s_lo + (s_hi - s_lo) * u[2] * u[2],
+            # Squared draw above: small debris outnumbers large debris, and a
+            # flat draw puts as many 1.5x specks on the frame as 0.6x ones,
+            # which reads as gravel rather than dust.
+            "eccent": _DUST_ECCENT * u[3],
+            "angle": u[4] * 2.0 * math.pi,
+            "phase": tuple(v * 2.0 * math.pi for v in u[5:8]),
+            "soft": u[8],
+            "opacity": u[9],
+            "lum": u[10],
+            # Which population. See the docstring: a prefix, not a coin.
+            "light": k < n_light,
+        })
+    return sites
+
+
+def _hair_sites(count: int, seed: int) -> list[dict]:
+    """One record per hair. Same construction as `_dust_sites`, same reasons.
+
+    The reported bug was "I can see more than one hair when I set the count to
+    1", and it was not a tuning error -- it was structural. A hair used to be
+    the level set ``|n - 0.5| < eps`` of a smooth field, gated by a second field
+    thresholded to select roughly one blob's worth of area per hair asked for.
+    A level set is not one curve: inside any given gate blob the field crosses
+    0.5 along however many separate arcs it happens to, so one unit of "hair"
+    drew one filament, or three, or none. The gate constant (`_BLOB_CELLS_HAIR`
+    = 0.5) was a fitted apology for exactly that.
+
+    Drawn from a list there is nothing to fit: one record is one filament, and
+    the count is the length of the list.
+
+    A hair still has to *wander* -- the level set's one real virtue was that it
+    curved the way a hair lies rather than along a curve somebody chose. So the
+    filament carries a quadratic sag plus two sinusoidal wobbles at incommensurate
+    frequencies, all scaled by its own length, which gives a curve with no
+    repeating period and no preferred direction. See `_HAIR_CURVE`.
+
+    **The wobbles are bounded by their slope, not by their amplitude**, and that
+    is the one non-obvious thing in here. The renderer measures how far a pixel
+    is from the filament as the vertical gap divided by ``sqrt(1 + slope^2)``,
+    which is the perpendicular distance only while the curve is locally close to
+    a straight line. A large amplitude at a high frequency is not: the curve
+    doubles back within a pixel or two, a point genuinely sitting on it is
+    scored against the wrong part of it, and the filament comes out with gaps
+    where it bends hardest. Measured, a fifth of the hairs broke into two or
+    three pieces that way. So each wobble's amplitude is capped at
+    ``_HAIR_SLOPE / (2 pi f)``, which holds its steepest slope to a constant
+    however fast it ripples -- and it is the physical answer too, since a fibre
+    does not zigzag tightly *and* widely at the same time.
+    """
+    n = int(min(max(count, 0), 400))
+
+    sites = []
+    for k in range(n):
+        u = _mark_rng(seed, 6607, k).random(15)
+        l_lo, l_hi = _HAIR_LEN_SPREAD
+        w_lo, w_hi = _HAIR_WIDTH_SPREAD
+        a_lo, a_hi = _HAIR_ALPHA
+        py, px = _mark_spread(6607, seed, u[0], u[1], k)
+        # Incommensurate frequencies: a whole number of cycles over the filament
+        # would make both ends leave at the same angle, which reads as a drawn
+        # arc. These do not divide each other either, so the pair never repeats
+        # over one hair's length.
+        freq = (0.6 + 0.9 * u[7], 1.7 + 1.6 * u[8])
+        sites.append({
+            "y": py,
+            "x": px,
+            "len": l_lo + (l_hi - l_lo) * u[2],
+            "angle": u[3] * 2.0 * math.pi,
+            # Signed, so hairs curl both ways.
+            "curve": _HAIR_CURVE * (2.0 * u[4] - 1.0),
+            "wob": tuple(
+                min(a, cap / (2.0 * math.pi * f)) * (2.0 * v - 1.0)
+                for a, cap, f, v in zip(_HAIR_WOBBLE, _HAIR_SLOPE, freq, u[5:7])
+            ),
+            "freq": freq,
+            "phase": (u[9] * 2.0 * math.pi, u[10] * 2.0 * math.pi),
+            "width": w_lo + (w_hi - w_lo) * u[11],
+            "alpha": a_lo + (a_hi - a_lo) * u[12],
+            "lum": u[13],
+            "soft": u[14],
+        })
+    return sites
+
+
+def _mark_window(
+    cy: float, cx: float, reach: float, h: int, w: int, y0: float, x0: float,
+    device: torch.device,
+) -> tuple[slice, slice, torch.Tensor, torch.Tensor] | None:
+    """Tile-local slice and centre-relative coordinate ramps for one mark.
+
+    Returns ``None`` when the mark does not touch this tile at all, which is the
+    usual answer and is what keeps a list of four hundred specks cheap: the cost
+    is the marks' own total area, not the count times the frame.
+
+    **The arithmetic here is what makes a drawn mark tile-independent**, so it is
+    worth being explicit about. A pixel's offset from the mark is
+    ``(i + y0) - cy``: ``i`` is its index within the tile and ``y0`` the tile's
+    absolute origin, both whole numbers and both exact in float32 below 2^24, so
+    their sum is the pixel's absolute coordinate *exactly* -- the same value
+    whichever tile asks, whatever offset that tile happens to start at. ``cy``
+    comes from the frame's size and the site record, neither of which knows a
+    tile exists. So two tilings agree bit for bit rather than approximately, and
+    a speck split down the middle by a tile boundary is drawn as one speck.
+    """
+    ys0 = max(0, int(math.floor(cy - reach - y0)))
+    ys1 = min(h, int(math.ceil(cy + reach - y0)) + 1)
+    xs0 = max(0, int(math.floor(cx - reach - x0)))
+    xs1 = min(w, int(math.ceil(cx + reach - x0)) + 1)
+    if ys1 <= ys0 or xs1 <= xs0:
+        return None
+    # Absolute coordinate first, *then* the centre subtracted -- not
+    # `arange + (y0 - cy)`. Folding the origin and the centre together first
+    # gives two tilings two different float roundings of the same offset, which
+    # is a sub-pixel disagreement across a tile seam. This way the absolute
+    # coordinate is an exact integer in both and only one rounding happens.
+    dy = (
+        (torch.arange(ys0, ys1, device=device, dtype=torch.float32) + float(y0))
+        - cy
+    ).view(1, 1, -1, 1)
+    dx = (
+        (torch.arange(xs0, xs1, device=device, dtype=torch.float32) + float(x0))
+        - cx
+    ).view(1, 1, 1, -1)
+    return slice(ys0, ys1), slice(xs0, xs1), dy, dx
 
 
 def _leak_anchor(pos: float, fh: float, fw: float) -> tuple[int, float]:
@@ -3274,17 +3631,34 @@ class GrainEngine:
             gain = (1.0 + vib * (1.0 - sat)).clamp_min(0.0)
             base = lum_v + (base - lum_v) * gain
 
-        # 5. Cross-channel bias: warm highlights, cool shadows. Most of what
-        #    reads as "a film palette" lives here, not in the grain.
-        wh, cs = p["warm_highlights"], p["cool_shadows"]
-        if wh > 0.01 or cs > 0.01:
+        # 5. Split tone: a cross-channel bias on each end of the range. Most of
+        #    what reads as "a film palette" lives here, not in the grain.
+        #
+        #    **Both controls are signed** (rewritten 2026-08-06, on request).
+        #    They were `warm_highlights` and `cool_shadows`, each 0..1 and each
+        #    locked to one direction, so the panel could describe warm-over-cool
+        #    and nothing else -- not tungsten stock's cool highlights, not a
+        #    cross-process, not warm shadows under a cold sky. Now each end of
+        #    the range runs cool at -1 through neutral at 0 to warm at +1, which
+        #    is the same two stages with the sign let out.
+        #
+        #    They were also reported as invisible, and they were: see
+        #    `_WARM_GAIN` for the arithmetic. Both the amplitude and the two
+        #    weighting bands were widened along with the sign.
+        #
+        #    One axis for both, in opposite directions, rather than a separate
+        #    "warm" and "cool" vector. Two hand-written vectors are two things
+        #    that can drift apart; a signed push along one axis is warm and cool
+        #    by construction, and it is what makes 0 exactly neutral rather than
+        #    approximately so.
+        hw_, sw_ = p["highlight_warmth"], p["shadow_warmth"]
+        if abs(hw_) > 0.001 or abs(sw_) > 0.001:
             lum_s = _luma(base)
-            warm = torch.tensor([0.055, 0.012, -0.040], device=base.device,
-                                dtype=base.dtype).view(1, 3, 1, 1)
-            cool = torch.tensor([-0.030, 0.002, 0.050], device=base.device,
-                                dtype=base.dtype).view(1, 3, 1, 1)
-            base = base + _smoothstep(0.45, 1.0, lum_s) * warm * wh
-            base = base + (1.0 - _smoothstep(0.0, 0.5, lum_s)) * cool * cs
+            axis = torch.tensor(_WARM_AXIS, device=base.device,
+                                dtype=base.dtype).view(1, 3, 1, 1) * _WARM_GAIN
+            w_hi = _smoothstep(*_WARM_HI_BAND, lum_s) * hw_
+            w_lo = (1.0 - _smoothstep(*_WARM_LO_BAND, lum_s)) * sw_
+            base = base + (w_hi + w_lo) * axis
 
         # 6. Base fog: the film base has a minimum density, so there is no true
         #    black. Lifts the floor without touching the white point.
@@ -3293,6 +3667,71 @@ class GrainEngine:
             base = fog + (1.0 - fog) * base
 
         base = base.clamp(0.0, 1.0)
+
+        # 6b. Luminance response: how much grain each density carries. Grain is
+        #     at full strength across the band [lum_low, lum_high] and eases out
+        #     over a falloff width on each side. Band edges and transition
+        #     widths are independent -- welding them together forces the ramp to
+        #     start at pure black or run all the way to white, which is what
+        #     makes the boundary visible.
+        #
+        #     **Measured here, off the developed density, rather than down at
+        #     step 10 where it is used** (moved 2026-08-06, on request). What
+        #     this mask asks is "how dense is the negative at this point", and
+        #     the answer is settled the moment the characteristic curve and base
+        #     fog have run: it is a property of development, so it belongs with
+        #     the development stages and not among the destruction ones.
+        #
+        #     Read at its old position it was measured off a `base` that edge
+        #     softening, edge jitter and sanding had already been through, which
+        #     is wrong in the specific way step 7 and the smooth-area guard are
+        #     both written to avoid: a blurred frame's luma is not the density
+        #     the emulsion recorded, so softening the picture silently moved the
+        #     grain around.
+        #
+        #     Measurable, and `verify.py` measures it. Put a hard black-to-white
+        #     step on a frame and set the band to mid-tones only, so the mask
+        #     reads zero on both sides. Softening the border invents a mid-tone
+        #     ramp across it that was never in the photograph -- and read at the
+        #     old position the mask believed it, laying a **0.095 sigma ribbon of
+        #     grain** along a border whose two sides are both meant to be clean.
+        #     Here it reads 0.00000: the density either side of a border is what
+        #     it was, whatever was done to the border itself.
+        #
+        #     It also means the mask is no longer warped along with the image by
+        #     edge jitter. That is the right way round: jitter displaces where
+        #     the *picture* is, not how dense the silver is, and the mask is
+        #     blurred over several pixels anyway -- an order more than jitter's
+        #     peak travel.
+        #
+        #     The mask is driven by a spatially blurred luma so the transition
+        #     is smooth across the *frame* as well as across the tone curve.
+        #     Reading per-pixel luma lets image detail modulate the mask itself,
+        #     which speckles the boundary region.
+        #
+        #     `lum_d` is the **density luma**, and it is kept as its own name
+        #     rather than folded into `lum` because the two now mean different
+        #     things. `lum` below is the luma of the picture *as it currently
+        #     stands*, recomputed after every stage that moves a pixel, and the
+        #     sanding filter needs exactly that -- it is steering along the
+        #     contour it can see. `lum_d` is how much silver is here, and every
+        #     control keyed on that reads this one: the band below, and Shadow
+        #     Clumping over in `_grain_field`. Two density-keyed controls
+        #     sampling at two different points in the pipeline would be a
+        #     disagreement about what "the shadows" are, and it would show up as
+        #     the clump size and the grain amount responding to a softened
+        #     border differently.
+        lum_d = _luma(base)
+        lum_m = _blur(lum_d, max(1.0, 3.0 * scale))
+        lo = p["lum_low"]
+        hi = max(p["lum_high"], lo + 0.05)
+        sf = max(p["shadow_falloff"], 1e-3)
+        hf = max(p["highlight_falloff"], 1e-3)
+
+        up_ramp = _smootherstep(max(0.0, lo - sf), lo, lum_m)
+        dn_ramp = 1.0 - _smootherstep(hi, min(1.0, hi + hf), lum_m)
+        m = (1.0 - p["shadow_drop"]) + p["shadow_drop"] * up_ramp
+        m = m * ((1.0 - p["highlight_drop"]) + p["highlight_drop"] * dn_ramp)
 
         # 7. Edge isolation (needed before jitter so we only warp real edges).
         #
@@ -3452,29 +3891,19 @@ class GrainEngine:
                 base = base + (sanded - base) * (edge_clean * coherent * snd)
                 lum = _luma(base)
 
-        # 9. Luminance response: grain is at full strength across the band
-        #    [lum_low, lum_high] and eases out over a falloff width on each
-        #    side. Band edges and transition widths are independent -- welding
-        #    them together forces the ramp to start at pure black or run all
-        #    the way to white, which is what makes the boundary visible.
-        #
-        #    The mask is driven by a spatially blurred luma so the transition is
-        #    smooth across the *frame* as well as across the tone curve. Reading
-        #    per-pixel luma lets image detail modulate the mask itself, which
-        #    speckles the boundary region.
-        lum_m = _blur(lum, max(1.0, 3.0 * scale))
-        lo = p["lum_low"]
-        hi = max(p["lum_high"], lo + 0.05)
-        sf = max(p["shadow_falloff"], 1e-3)
-        hf = max(p["highlight_falloff"], 1e-3)
-
-        up_ramp = _smootherstep(max(0.0, lo - sf), lo, lum_m)
-        dn_ramp = 1.0 - _smootherstep(hi, min(1.0, hi + hf), lum_m)
-        m = (1.0 - p["shadow_drop"]) + p["shadow_drop"] * up_ramp
-        m = m * ((1.0 - p["highlight_drop"]) + p["highlight_drop"] * dn_ramp)
-
         # 10. Grain field, weighted toward micro-edges and away from flat areas.
-        g = self._grain_field(h, w, y0, x0, lum, p, scale)
+        #     `m` is the luminance-response mask, measured back at step 6b off
+        #     the developed density rather than off this stage's input.
+        #
+        #     `lum_d` rather than `lum`, and for the same reason `m` is measured
+        #     up there: the only thing `_grain_field` reads a luma for is Shadow
+        #     Clumping, which asks how *dense* this area is -- shadows carry
+        #     larger, less densely packed crystals -- and that is settled by
+        #     development, not by what edge softening later did to the border.
+        #     Passing the late `lum` here while `m` came from step 6b would have
+        #     the two halves of the same physical question answered from two
+        #     different frames.
+        g = self._grain_field(h, w, y0, x0, lum_d, p, scale)
         eb = p["edge_bias"]
         weight = m * ((1.0 - eb) + eb * edge)
 
@@ -3852,110 +4281,175 @@ class GrainEngine:
             ) * 0.85
 
         # -- hair ---------------------------------------------------------
-        # A hair on the scanner bed is opaque, so it prints as a dark
-        # filament. Drawn as the level set of a smooth field: |n - 0.5| below
-        # a small epsilon is a thin curve that wanders the way a hair does,
-        # which is far more convincing than any curve I would parameterise.
-        hr = p["hair"]
-        if hr >= 1.0 and area is not None:
-            # Length and count are separate controls, and keeping them separate
-            # is the whole point here. Deriving the contour cell from the count
-            # -- which is what I did first -- means raising the count shortens
-            # every hair, so the slider reads as a *length* control instead of
-            # a count. The contour field's cell now comes from Hair Length
-            # alone, and the count is a threshold on a gate at that same scale.
-            length = max(8.0, p["hair_length"] * scale)
-            c_cell = length * 1.2
-            n = _value_noise(h, w, y0, x0, c_cell, seed + 6607, 1, dev)
-            # Width held at ~1.6 full-res px as the cell changes: a level set is
-            # about 2 * eps * cell wide, so eps has to track the cell or hairs
-            # fatten as they lengthen.
-            eps = (1.6 * max(scale, 0.25)) / (2.0 * c_cell)
-            fil = 1.0 - _smoothstep(0.0, eps, (n - 0.5).abs())
+        # A hair on the scanner bed is opaque, so it prints as a dark filament,
+        # and it is drawn one filament at a time from `_hair_sites` -- see there
+        # for why "count 1 drew several hairs" was structural rather than a
+        # tuning error, and why a list of objects is still tile-independent.
+        # Truncated rather than rounded, so the mark-count dead zone means
+        # what `docs/presets.md` says it means: anything under 1 renders nothing,
+        # here as for scratches and leaks. Rounding would quietly make 0.6 draw
+        # a hair and leave a hand-edited preset behaving differently from the
+        # one control the check in `verify.py` was written for.
+        hr = int(p["hair"])
+        if hr >= 1 and full_hw is not None:
+            fh = max(float(full_hw[0]), 1.0)
+            fw = max(float(full_hw[1]), 1.0)
+            l_nom = max(p["hair_length"], 1.0) * scale
+            w_nom = max(_HAIR_WIDTH * scale, 0.35)
+            h_soft = p["hair_soften"]
 
-            # Gate blobs are one hair each, and they are sized by length, so
-            # the threshold is free to control only how many there are.
-            g_a = _count_threshold(hr * 2.5, length * length, area, _BLOB_CELLS_HAIR)
-            g_b = _count_threshold(hr * 0.4, length * length, area, _BLOB_CELLS_HAIR)
-            sparse = _value_noise(h, w, y0, x0, length, seed + 6608, 1, dev)
-            fil = fil * _smoothstep(g_a, max(g_b, g_a + 1e-4), sparse)
+            for st in _hair_sites(hr, seed):
+                half = max(0.5 * l_nom * st["len"], 1.0)
+                halfw = max(0.5 * w_nom * st["width"], 0.02)
+                w1, w2 = st["wob"]
+                f1, f2 = st["freq"]
+                ph1, ph2 = st["phase"]
+                # Per-hair softness, spread about the slider so a frame carries
+                # both a hair on the glass and one a layer away at any setting.
+                soft = min(h_soft * (0.25 + 1.5 * st["soft"]), 1.0)
+                # Edge width across the filament, relative to its own half-width.
+                # Floored on the pixel grid: a sub-pixel hair with a hard edge
+                # aliases into a dotted line.
+                er = min(0.35 + 2.2 * soft, 0.9)
+                er = max(er, _DUST_EDGE_PX / halfw)
+                # Everything the filament can reach from its own centre. The
+                # bend is a fraction of the half-length, so it scales with it.
+                reach = (
+                    half * (1.0 + abs(st["curve"]) + abs(w1) + abs(w2))
+                    + halfw * (1.0 + er) + 2.0
+                )
+                cy, cx = st["y"] * fh, st["x"] * fw
+                win = _mark_window(cy, cx, reach, h, w, y0, x0, dev)
+                if win is None:
+                    continue
+                sl_y, sl_x, dy, dx = win
 
-            vary = _value_noise(
-                h, w, y0, x0, max(30.0, 200.0 * scale), seed + 6609, 2, dev
-            )
-            out = out - self._weather(
-                fil, vary, p["hair_soften"], p["hair_soften"] * 3.0 * max(scale, 0.25),
-            ) * 0.9
+                ca, sa = math.cos(st["angle"]), math.sin(st["angle"])
+                # Along the filament (s, normalised to +-1 at the tips) and
+                # across it.
+                s = (dx * ca + dy * sa) / half
+                across = dy * ca - dx * sa
+
+                # The curve itself, and its slope, both in working pixels. The
+                # slope is what turns "vertical distance to the curve" into
+                # "perpendicular distance to it" -- without it a bent hair reads
+                # as fatter wherever it is steep, which is precisely where the
+                # eye looks.
+                tau1 = 2.0 * math.pi * f1
+                tau2 = 2.0 * math.pi * f2
+                sin1, cos1 = torch.sin(tau1 * s + ph1), torch.cos(tau1 * s + ph1)
+                sin2, cos2 = torch.sin(tau2 * s + ph2), torch.cos(tau2 * s + ph2)
+                curve = half * (st["curve"] * s * s + w1 * sin1 + w2 * sin2)
+                slope = 2.0 * st["curve"] * s + w1 * tau1 * cos1 + w2 * tau2 * cos2
+                d = (across - curve).abs() / torch.sqrt(1.0 + slope * slope)
+
+                # Taper: a real fibre comes to a point, and a filament of
+                # constant width with two blunt ends reads as a line segment.
+                sabs = s.abs()
+                taper = 1.0 - _smoothstep(_HAIR_TAPER, 1.0, sabs)
+                hw_raw = halfw * (_HAIR_TIP + (1.0 - _HAIR_TIP) * taper)
+                # Below the grid's floor the tip is drawn *at* the floor and
+                # faded by what is missing, rather than drawn thinner -- see
+                # `_MARK_MIN_PX`, and note this is the whole reason a tapered
+                # hair does not come out dotted.
+                #
+                # **Twice `_MARK_MIN_PX` for a filament**, i.e. a full pixel of
+                # width where a speck needs half a pixel of radius. The two are
+                # not the same condition: a disc always has a pixel centre
+                # within reach of its own soft edge, but a line can thread
+                # between pixel centres for its whole length and hit none of
+                # them -- which is exactly what the tip did, measured as a 488px
+                # filament with a 4px and a 2px fragment strung out past its end.
+                hw_min = 2.0 * _MARK_MIN_PX
+                hw_t = hw_raw.clamp_min(hw_min)
+                thin = (hw_raw / hw_min).clamp(0.0, 1.0)
+                shape = 1.0 - _smoothstep(1.0 - er, 1.0 + er, d / hw_t)
+                # And a hard stop at the ends, since the taper alone leaves a
+                # thin thread running on past them.
+                shape = shape * thin * (1.0 - _smoothstep(0.92, 1.0, sabs))
+
+                lo_, hi_ = _HAIR_LUM
+                col = lo_ + (hi_ - lo_) * st["lum"]
+                alpha = shape * (
+                    st["alpha"] * (1.0 - _DUST_SOFT_FADE * soft)
+                )
+                sub = out[:, :, sl_y, sl_x]
+                out[:, :, sl_y, sl_x] = sub * (1.0 - alpha) + col * alpha
 
         # -- dust ---------------------------------------------------------
         # Two populations: opaque specks that block light and print dark, and
-        # the pinholes and lint that print bright. Both are wanted -- dust
-        # that is only ever dark reads as sensor dirt, not film.
-        du = p["dust"]
-        if du >= 1.0 and area is not None:
-            cell = max(_MIN_CELL, p["dust_size"] * scale)
-            n = _value_noise(h, w, y0, x0, cell, seed + 5501, 2, dev)
-            # Two thirds dark motes, one third bright pinholes -- both wanted,
-            # dust that is only ever dark reads as sensor dirt.
-            # Both ends of the ramp come from the count, a band rather than a
-            # threshold plus a fudge. At low counts the threshold sits so deep
-            # in the field's tail that `t + (1-t)*0.55` collapses below
-            # _smoothstep's degeneracy guard and becomes a hard step -- and a
-            # hard step there is knife-edge: a pixel within float epsilon of it
-            # landed on opposite sides in a tiled versus a single-pass render.
-            # Deriving both ends from counts guarantees a real ramp, and makes
-            # specks fade in rather than switch on.
-            # Softness widens the band *symmetrically about its midpoint*,
-            # which gives each speck a gradual profile instead of a disc edge.
-            # Blur alone cannot do this job: blurring a 2px speck by several
-            # times its own size does not soften it, it erases it -- energy is
-            # conserved so the peak collapses, and what you are left with is
-            # fewer specks rather than softer ones. Symmetric expansion keeps
-            # roughly the same count.
-            spread_k = 1.0 + _DUST_SOFT_BAND * p["dust_soften"]
-
-            def band(n_marks: float) -> tuple[float, float]:
-                a_ = _count_threshold(n_marks * 3.0, cell * cell, area, _BLOB_CELLS_DUST)
-                b_ = _count_threshold(n_marks * 0.4, cell * cell, area, _BLOB_CELLS_DUST)
-                b_ = max(b_, a_ + 1e-4)
-                mid, half = 0.5 * (a_ + b_), 0.5 * (b_ - a_) * spread_k
-                return max(0.0, mid - half), min(1.0, mid + half)
-
-            dark = _smoothstep(*band(du * 0.66), n[:, 0:1])
-            lite = _smoothstep(*band(du * 0.34), n[:, 1:2])
-            # Coarser than the dust itself so neighbouring specks differ,
-            # rather than every speck being mottled within itself. Four
-            # channels: softness and opacity for each population.
-            vary = _value_noise(h, w, y0, x0, cell * 3.0, seed + 5502, 4, dev)
-            # Capped relative to the speck: past about its own size the blur
-            # is removing specks, not softening them.
-            r = p["dust_soften"] * _DUST_SOFT_REACH * cell
-
-            # Composited rather than added, which is what separates opacity
-            # from luminosity. Additively they are the same number: a fainter
-            # speck and a lighter speck are indistinguishable. As a composite,
-            # opacity is how much of the photograph the speck hides and
-            # luminosity is what colour the speck itself is, so a solid grey
-            # mote and a faint black veil are different things.
+        # the pinholes and lint that print bright. `dust_balance` sets the
+        # split, and both ends are wanted -- dust that is only ever dark reads
+        # as sensor dirt rather than as film, which is what it was reported as.
+        #
+        # Each speck is drawn as its own shape rather than thresholded out of a
+        # noise field; `_dust_sites` has the reasoning, and the constants above
+        # it have the geometry.
+        du = int(p["dust"])
+        if du >= 1 and full_hw is not None:
+            fh = max(float(full_hw[0]), 1.0)
+            fw = max(float(full_hw[1]), 1.0)
+            r_nom = 0.5 * max(p["dust_size"], 0.1) * scale
             o_var, l_var = p["dust_opacity_var"], p["dust_lum_var"]
             base_op = p["dust_opacity"]
+            d_soft = p["dust_soften"]
+            a3, a4, a5 = _DUST_HARMONICS
+            bump_max = 1.0 + a3 + a4 + a5
 
-            def lay(mask, chans, lum_lo, lum_hi):
-                nonlocal out
-                v_op = _spread(chans[:, 0:1])
-                v_lum = _spread(chans[:, 1:2])
-                soft = self._weather(
-                    mask, chans, p["dust_soften"], r, lum_floor=1.0
+            for st in _dust_sites(du, seed, p["dust_balance"]):
+                r = max(r_nom * st["size"], 0.2)
+                e = st["eccent"]
+                ra, rb = r * (1.0 + e), r * (1.0 - e)
+                soft = min(d_soft * (0.25 + 1.5 * st["soft"]), 1.0)
+                # Edge width as a fraction of the speck's own radius, floored on
+                # the pixel grid for the reason `_DUST_EDGE_PX` gives.
+                edge = _DUST_EDGE_MIN + (_DUST_EDGE_MAX - _DUST_EDGE_MIN) * soft
+                edge = min(max(edge, _DUST_EDGE_PX / rb), 0.9)
+                reach = ra * bump_max * (1.0 + edge) + 1.0
+                cy, cx = st["y"] * fh, st["x"] * fw
+                win = _mark_window(cy, cx, reach, h, w, y0, x0, dev)
+                if win is None:
+                    continue
+                sl_y, sl_x, dy, dx = win
+
+                ca, sa = math.cos(st["angle"]), math.sin(st["angle"])
+                # In the speck's own frame, scaled by its two semi-axes, so the
+                # unit circle *is* its outline before the harmonics dent it.
+                u = (dx * ca + dy * sa) / ra
+                v = (dy * ca - dx * sa) / rb
+                q = torch.sqrt(u * u + v * v)
+                phi = torch.atan2(v, u)
+                p3, p4, p5 = st["phase"]
+                bump = (
+                    1.0
+                    + a3 * torch.cos(3.0 * phi + p3)
+                    + a4 * torch.cos(4.0 * phi + p4)
+                    + a5 * torch.cos(5.0 * phi + p5)
                 )
-                alpha = (soft * base_op * (1.0 - o_var * (1.0 - v_op))).clamp(0.0, 1.0)
-                # Luminosity spreads about the population's own end of the
-                # scale, so dark motes stay dark and pinholes stay bright.
-                mid = 0.5 * (lum_lo + lum_hi)
-                col = mid + (v_lum - 0.5) * (lum_hi - lum_lo) * l_var
-                out = out * (1.0 - alpha) + col.clamp(0.0, 1.0) * alpha
+                shape = 1.0 - _smoothstep(1.0 - edge, 1.0 + edge, q / bump)
 
-            lay(dark, vary[:, 0:2], 0.0, 0.42)
-            lay(lite, vary[:, 2:4], 0.72, 1.0)
+                # Composited rather than added, which is what separates opacity
+                # from luminosity. Additively they are the same number: a
+                # fainter speck and a lighter speck are indistinguishable. As a
+                # composite, opacity is how much of the photograph the speck
+                # hides and luminosity is what colour the speck itself is, so a
+                # solid grey mote and a faint black veil are different things.
+                lum_lo, lum_hi = _DUST_LITE_LUM if st["light"] else _DUST_DARK_LUM
+                mid = 0.5 * (lum_lo + lum_hi)
+                col = min(max(
+                    mid + (st["lum"] - 0.5) * (lum_hi - lum_lo) * l_var, 0.0,
+                ), 1.0)
+                # A speck smaller than a pixel fades rather than thinning, for
+                # `_MARK_MIN_PX`'s reason -- otherwise it registers only where
+                # it happens to land on a pixel centre, so the *count* would
+                # quietly depend on the render scale.
+                thin = min(1.0, (ra * rb) / (_MARK_MIN_PX * _MARK_MIN_PX))
+                alpha = shape * min(max(
+                    base_op * (1.0 - o_var * (1.0 - st["opacity"]))
+                    * (1.0 - _DUST_SOFT_FADE * soft) * thin, 0.0,
+                ), 1.0)
+                sub = out[:, :, sl_y, sl_x]
+                out[:, :, sl_y, sl_x] = sub * (1.0 - alpha) + col * alpha
 
         return out
 
@@ -3971,6 +4465,14 @@ class GrainEngine:
         same opacity, which is the tell that they were generated: real debris
         is at different depths, so some of it is in focus and some is not, and
         none of it is equally dark.
+
+        **Scratches only, as of 2026-08-06.** Dust and hair are drawn from lists
+        now and carry their own per-mark softness, opacity and tone straight off
+        the site record -- which is strictly better than this, because a drawn
+        mark can vary its *edge width* where a thresholded one can only be
+        blurred, and blurring a 2px speck by several times its own size erases
+        it rather than softening it. This stays because a scratch is still a
+        field, and a field has no per-mark anything to attach a draw to.
 
         ``vary`` carries two decorrelated fields addressed at mark scale, so a
         whole scratch shares its blur and its density rather than varying
@@ -4126,18 +4628,22 @@ class GrainEngine:
         shr = p["sharpen_radius"] * scale if p["sharpen"] > 0.01 else 0.0
         if p["pre_sharpen"] > 0.01:
             shr = max(shr, p["pre_sharpen_radius"] * scale)
-        # Film-texture softening blurs the mark fields, so it reaches like any
-        # other kernel. Widest of the three wins -- they are separate stages,
-        # not compounded.
+        # Scratch softening blurs the mark field, so it reaches like any other
+        # kernel.
+        #
+        # **Dust and hair reserve nothing at all**, and that is not an oversight
+        # (changed 2026-08-06). They used to blur their mark fields and had to be
+        # counted here; both are drawn one mark at a time now, from absolute
+        # frame coordinates with an analytic soft edge and no kernel anywhere, so
+        # a tile that can see its own pixels can draw every speck that touches
+        # them -- including the ones whose centres sit in the next tile, because
+        # `_mark_window` clips the mark's own footprint rather than the tile's.
+        # Exactly the position light leaks have always been in, and `verify.py`
+        # pins it by tiling a frame at maximum dust and hair with no overlap.
         tex_r = 0.0
-        if p["dust"] >= 1.0:
-            tex_r = max(tex_r, p["dust_soften"] * 1.6
-                        * max(_MIN_CELL, p["dust_size"] * scale))
         if p["scratches"] >= 1.0:
             tex_r = max(tex_r, p["scratch_soften"] * 3.0
                         * max(0.4 * p["scratch_width"] * scale, 0.6))
-        if p["hair"] >= 1.0:
-            tex_r = max(tex_r, p["hair_soften"] * 3.0 * max(scale, 0.25))
         # Anti-aliasing reads two ways at once and both have to be counted:
         # its taps travel a radius along the tangent (a displacement, like the
         # warps below), and it derives that tangent -- and its step gate --

@@ -1,50 +1,171 @@
 # Film texture
 
-## Film texture is drawn, never scattered (added 2026-07-31)
+## Film texture sits last, and is masked by nothing (added 2026-07-31)
 
 Step 15, dead last, after sharpening: dust, scratches, hair, light leaks.
 Everything above it models what the *emulsion* does; this models what happened
 to the strip of film afterwards. It is weighted by none of the image masks — a
 scratch does not care what is underneath it — and every parameter ships at 0.
 
-**Do not reimplement dust, scratches or hair by scattering objects.** A list of
-speck positions is a statistic of the region: an export would split a scratch
-across two tiles, or draw a different list per tile. Those three marks are each
-a *threshold on a noise field addressed in global coordinates*, so every pixel
-gets the same answer whichever tile asks. It also happens to look better — the
-outlines are organic because the field is, where stamped sprites repeat.
+**What must never happen is a mark list derived from the region being
+rendered.** N specks per tile, or positions drawn against the tile's own area,
+and an export grows seams or draws different debris in every tile. That is the
+invariant. It is *not* the same as "never build a list", which is what this file
+used to say, and the distinction cost a rewrite to get right — see below.
 
-**Light leaks are the exception, and the distinction is worth being precise
-about.** `_leak_sites` does build a list of objects, and it is tile-independent
-anyway, because the list is a function of the *count, the seed and nothing
-else* — every tile builds the identical list, and so does the proxy, and so
-does the export. What breaks tile independence is deriving a list from the
-region being rendered: N specks per tile, or positions drawn against the tile's
-own area. Neither happens here. Leaks earn the exception because a leak is not
-a mark, it is a beam with a source, a direction and a length, and a field that
-only knows "how far am I from the nearest border" can express none of those —
-see the section below for what that cost.
+How each shape is made, and the measured result:
 
-How each shape is made, and the measured result at full strength:
-
-| mark | how | coverage | geometry |
+| mark | how | count | geometry |
 |---|---|---|---|
-| dust | isotropic fine noise, two populations (dark motes, bright pinholes) | 0.62% | 1.0:1, compact |
-| scratches | noise with cells ~2px wide and ~900px tall — the anisotropy *is* the scratch | 0.18% | 74:1, 1.1px wide |
-| hair | level set of a smooth field: `|n − 0.5| < eps` is a curve that wanders | 0.37% | 2.0px wide |
-| light leak | oriented beams anchored on the perimeter, added in **linear** light | 34% at 6 | 1.3:1 along/deep |
+| dust | drawn per speck: an ellipse with three angular harmonics, from a frame-anchored list | **exact** | round, mean axis ratio 1.47 |
+| scratches | noise with cells ~2px wide and ~900px tall — the anisotropy *is* the scratch | ±50% | 76:1, 1.2px wide |
+| hair | drawn per filament: a tapered curve with a quadratic sag and two wobbles | **exact** | 2.9px wide |
+| light leak | oriented beams anchored on the perimeter, added in **linear** light | exact | 1.3:1 along/deep |
 
-Every mark type is passed through `_weather()`, which is what stops the section
+Scratches still go through `_weather()`, which is what stops a *field* of marks
 looking generated. A thresholded field gives every mark an identical crisp edge
 and identical opacity; real debris sits at different depths, so some is in focus
 and some is not, and none of it is equally dark. `_weather` blends each mark
 toward a blurred copy and scales its density, both driven by fields addressed at
 *mark* scale — a whole scratch shares its blur and its density rather than
 fading in and out down its own length. Measured at full softening: mean edge
-slope down 26-33%, while the crisp-to-soft ratio *widens* (scratches 13.8x to
-18.2x) and per-mark brightness spread runs 66-87% of the mean. Both halves are
-asserted: a uniform blur would pass a mean test and be exactly the artificial
-result this exists to avoid.
+slope down 26%, while the crisp-to-soft ratio *widens* (13.8x to 18.2x) and
+per-mark brightness spread runs 69% of the mean. Both halves are asserted: a
+uniform blur would pass a mean test and be exactly the artificial result this
+exists to avoid. Dust and hair carry their own per-mark draws now and no longer
+need it.
+
+## Dust and hair are drawn one mark at a time (rewritten 2026-08-06)
+
+Three complaints, one cause. *"Too many dark dots, I want more light dots."*
+*"Dots need to be in round form, some dot I found is not round."* *"I can see
+hair count when I set to 1, I see more than 1 hairs."* All three were reported
+against a construction that could not have satisfied any of them, because a
+threshold on a noise field has neither a count nor a shape:
+
+* **A threshold selects area, not marks.** How many countable blobs that area
+  breaks into was a *fitted constant* — `_BLOB_CELLS_DUST = 14.0`,
+  `_BLOB_CELLS_HAIR = 0.5` — good to about a factor of 1.5. Ask for 20 specks
+  and you got somewhere between 13 and 30.
+* **A level set is not one curve.** A hair was `|n − 0.5| < eps` of a smooth
+  field, gated by a second field. Inside any one gate blob the field crosses 0.5
+  along however many separate arcs it happens to, so one unit of "hair" drew
+  one filament, or three, or none. `_BLOB_CELLS_HAIR = 0.5` was a fitted apology
+  for exactly that, and it is why count 1 drew more than one hair.
+* **The outline is whatever the field did.** Lumpy, frequently merged with a
+  neighbour, occasionally a long tear that reads as a scratch. You cannot get a
+  small round thing out of a level set of noise except by accident.
+
+So dust and hair are now **frame-anchored lists of drawn marks**, and the
+counts are exact. Measured on a 900x1400 plate, components counted:
+
+| asked | 1 | 2 | 3 | 5 | 20 | 120 | 400 |
+|---|---|---|---|---|---|---|---|
+| dust drawn | 1 | 2 | 3 | 5 | 20 | 120 | 391 |
+| hair drawn | 1 | 2 | 3 | 5 | — | — | — |
+
+1–5 is exact across six seeds and `verify.py` asserts it. The 2% shortfall at
+400 is marks genuinely overlapping — two specks on top of each other are one
+blob and there is nothing to fix about that.
+
+### This does not break tile independence, and here is exactly why
+
+`_leak_sites` already set the precedent and this file already stated the rule:
+what breaks the invariant is a list derived from *the region being rendered*.
+A list derived from the count, the seed and the **frame** is a different thing —
+every tile builds the identical list, and so does the proxy, and so does the
+export.
+
+Two mechanisms carry it:
+
+* **Positions are fractions of `full_hw`**, which `render()` already receives
+  for the light leaks and which `render_view` fills from the whole source rather
+  than the read window. So a speck lands in the same place at any working scale
+  and under any tiling.
+* **`_mark_window` clips the mark's own footprint, not the tile's.** A speck
+  straddling a tile boundary is drawn by both tiles from the same absolute
+  geometry. The arithmetic is deliberate: the pixel offset is `(i + y0) − cy`
+  and *not* `i + (y0 − cy)`, because folding the origin into the centre first
+  hands two tilings two different float roundings of the same offset — a
+  sub-pixel disagreement along a seam. Formed this way the absolute coordinate
+  is an exact integer in both and only one rounding ever happens.
+
+The consequence is that **`pad_for` reserves nothing at all for dust or hair**.
+Both used to blur their mark fields and had to be counted there; neither has a
+kernel any more. `verify.py` renders 300 specks and 20 hairs tiled at 128px
+against a single pass and gets **0.00e+00**.
+
+### The shape of a speck: round, and not a circle
+
+Both halves were asked for — "a shape form of imperfect circle or imperfect
+ellipse, which is correct". So a speck is an ellipse with a random eccentricity
+(`_DUST_ECCENT`, up to 0.35) at a random angle, its radius perturbed by the
+**3rd, 4th and 5th angular harmonics** with random phases.
+
+Third and up, deliberately: the 2nd harmonic *is* an elongation, so it would
+only fight the eccentricity draw. Their amplitudes sum to 0.22, and that sum is
+the number that matters — the radius is `1 + Σ aₖ·cos(kφ + pₖ)`, so a sum at or
+above 1 folds the outline through its own centre and draws a shape with a bite
+out of it.
+
+Measured with the isoperimetric quotient `4πA/P²`, against **a disc rendered
+through the same rasteriser** rather than against 1.0 (a rasterised outline
+over-counts its own perimeter by a factor that depends on the radius): specks
+score 86% of a disc's, i.e. round. And the other half, from the second moments:
+mean axis ratio **1.47** where the same disc renders 1.04 — so they are round
+shapes and not circles.
+
+### The dark/light balance
+
+`dust_balance` runs −1 (every speck an opaque dark mote) through 0 (an even mix)
+to +1 (every speck a bright pinhole). It replaces a hard-coded two-thirds dark,
+which is what was reported as too dark.
+
+The split is **a prefix of the list, not a per-speck coin flip**, and that buys
+two things: it is exact (100 specks at balance 0 render 50 dark and 50 light,
+asserted), and moving the slider converts specks *in place* — position is drawn
+per index and the balance never touches it, so the frame does not reshuffle
+under you while you hunt for the ratio you want.
+
+### Two sampling traps, both of which drew visible artifacts
+
+* **A filament narrower than a pixel renders as a dashed line.** It only
+  registers where its centre passes near a pixel centre. A hair tapers to a
+  point, so its tip did exactly this: measured, one hair came out as a 394-pixel
+  filament plus a detached one-pixel speck strung out past its end — which is
+  the "I see more than one hair" complaint reappearing in a new form. The fix is
+  `_MARK_MIN_PX`: below the floor a mark is drawn *at* the floor and faded by
+  what is missing, which is what area-averaging would have done anyway. A
+  filament needs a full pixel of width where a speck needs half a pixel of
+  radius — a disc always has a pixel centre within reach of its own soft edge, a
+  line can thread between them for its whole length.
+* **A wobble steep enough to double back breaks the distance formula.** The
+  renderer measures a pixel's distance from the filament as the vertical gap
+  over `sqrt(1 + slope²)`, which is the perpendicular distance only while the
+  curve is locally straight. At high amplitude *and* high frequency it is not,
+  a point genuinely on the curve gets scored against the wrong part of it, and
+  the hair comes out in pieces — a fifth of them did. So each wobble's amplitude
+  is capped by its **slope** rather than by its size: `_HAIR_SLOPE / 2πf`, which
+  holds the steepest slope constant however fast it ripples. It is the physical
+  answer too, since a fibre does not zigzag tightly and widely at once.
+
+### Marks are placed on a low-discrepancy sequence
+
+Independent uniform draws clump, and at small counts they clump *visibly*:
+measured on the hair generator, four of the first five marks landed in the top
+fifth of the frame. That is not a bug in the hash — over 400 marks the draws are
+uniform to 1% and uncorrelated to 0.02 — it is just what five uniform points
+look like. "I asked for five hairs and they are all in one corner" is a
+complaint whether or not the statistics are innocent.
+
+`_mark_spread` steps along the **R2 sequence** (the reciprocal powers of the
+plastic number), which is `_leak_sites`' golden-ratio trick in two dimensions,
+plus a small jitter. Any prefix of R2 is well spread, which is what keeps mark 6
+from moving marks 1–5 — the same add-don't-reroll property `_mark_rng` exists
+for. The jitter is fixed in frame units rather than scaled to the count: at 400
+specks the R2 spacing (0.05) is under the jitter (0.06) so placement goes
+locally random and dust clumps the way dust does, and at a count of three the
+spacing dwarfs it and the sequence wins.
 
 ### A leak is a beam, not a border wash (rewritten 2026-08-02)
 
@@ -221,16 +342,20 @@ fainter speck and a lighter speck are indistinguishable. As a composite,
 `dust_opacity` is how much of the photograph the speck hides and the luminosity
 variation is what colour the speck itself is.
 
-**Dust Softness widens the speck's threshold band; the blur is secondary.**
-Blurring a 2px speck by several times its own size does not soften it, it
-erases it -- energy is conserved so the peak collapses below anything visible,
-and you end up with fewer specks rather than softer ones. My first attempt read
-as "softness does nothing" for exactly that reason, and the measurement was
-survivorship-biased on top: only the specks that survived were left to measure.
-Expanding the band symmetrically about its midpoint keeps the count and makes
-each speck gradual. Measured 52% softer at 2px specks with coverage *rising*.
+**Dust Softness is the speck's own edge width, and there is no blur any more.**
+It used to widen a threshold band, because blurring a 2px speck by several times
+its own size does not soften it — it erases it, since energy is conserved so the
+peak collapses below anything visible and you end up with fewer specks rather
+than softer ones. My first attempt read as "softness does nothing" for exactly
+that reason, and the measurement was survivorship-biased on top: only the specks
+that survived were left to measure. A *drawn* speck sidesteps all of it: the
+edge width is a parameter of the shape, so softness costs nothing and removes
+nothing. Measured 42% softer with the count untouched, and softness now varies
+per speck straight off the site record instead of via a second noise field.
 
-Three traps, all of which cost me a rebuild:
+Traps from the thresholded era. The first three no longer apply to dust or hair
+— they are here because scratches are still a field, and because the shape of
+the mistake generalises:
 
 * **Read thresholds off the field's real distribution.** Value noise is heavily
   centre-weighted, so a threshold of 0.88 — which sounds extreme — selects
@@ -241,10 +366,16 @@ Three traps, all of which cost me a rebuild:
   sparsity field had a 900px cell, so across a frame it spanned only 0.38–0.73
   and never crossed its 0.72 gate — hair rendered as *literally nothing*, and
   which nothing depended on where in the noise plane the frame happened to sit.
-  Keep gating cells well under a frame (280px now).
+  Keep gating cells well under a frame.
 * **Solve level-set widths, do not pick them.** A hair's width is ~`2·eps·cell`
   pixels. At `eps = 0.0016` with a 110px working cell that is 0.35px — sub-pixel
   before supersampling halved it again, so it drew nothing.
+* **A fitted constant standing in for a count is a smell, not a calibration.**
+  `_BLOB_CELLS_DUST` and `_BLOB_CELLS_HAIR` were honest about being accurate to
+  a factor of 1.5, and that was treated as the price of the construction rather
+  than as evidence the construction could not express what the slider claimed.
+  When a control needs a fudge factor to mean what its label says, the label is
+  describing a different implementation.
 
 Light leaks need the *frame* size, which is why `render()` now takes `full_hw`
 and `render_supersampled` scales it by `ss` alongside `y0`/`x0`. `render_view`

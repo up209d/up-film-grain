@@ -225,3 +225,76 @@
   clamp does not fail a test loudly, it quietly eats one tail so every sigma
   measured afterwards is measuring the clamp. Add up every layer's peak swing
   when choosing a level, not just the one under test.
+* **A fitted constant standing in for a count is not a calibration, it is
+  evidence.** `_BLOB_CELLS_DUST = 14.0` and `_BLOB_CELLS_HAIR = 0.5` converted
+  "area above a threshold" into "number of countable marks", and both were
+  honestly documented as good to a factor of 1.5. I read that as the price of
+  the construction. It was not — it was the construction telling me it could not
+  express what the slider's label claimed, and the user eventually reported the
+  consequence ("I see more than 1 hairs when I set to 1"). **When a control needs
+  a fudge factor to mean what its label says, the label is describing a
+  different implementation.** Both constants are gone and the counts are exact.
+* **"Never build a list of objects" was the wrong rule.** The real invariant is
+  narrower: never derive a list from *the region being rendered*. A list built
+  from the count, the seed and the frame is as tile-independent as any noise
+  field — `_leak_sites` had been proving that for a week while `film-texture.md`
+  told the next reader not to do it. An over-broad rule is worse than none,
+  because it forbids the correct solution in the same breath as the wrong one.
+* **A line thinner than a pixel renders as a dashed line.** It only registers
+  where its centre passes near a pixel centre. A tapering hair does this at its
+  tip and the detached fragments read as extra marks — which is the exact bug
+  the rewrite was meant to fix, reappearing in a new form one layer down. Draw
+  at a floor of one pixel and fade by what is missing, which is what
+  area-averaging would have done. A *disc* is safe at half that, because it
+  always has a pixel centre within reach of its own soft edge.
+* **The vertical-gap-over-`sqrt(1+slope²)` distance to a curve is a
+  small-slope approximation and it fails loudly.** Where a wobble is steep
+  enough to double back within a pixel or two, a point genuinely on the curve is
+  scored against the wrong part of it and the mark comes out in pieces — a fifth
+  of the hairs did. Cap the *slope* rather than the amplitude: it keeps the
+  approximation valid however fast the curve ripples, and it happens to be the
+  physical answer too.
+* **Five uniform random points look clumped, and the statistics being innocent
+  is no defence.** Four of the first five hairs landed in the top fifth of the
+  frame; over 400 marks the same draws are uniform to 1% and uncorrelated to
+  0.02. Small counts need a low-discrepancy sequence, and it must be one whose
+  *prefixes* are well spread (R2, or the golden step leaks already use) so that
+  raising the count adds a mark instead of rerolling the frame.
+* **"Does it change the picture?" is the wrong question for a subtle control.**
+  `warm_highlights` and `cool_shadows` shipped for weeks doing something real
+  and invisible: a peak shift of 0.055 in one channel, at full weight only at
+  pure white, so an ordinary highlight moved by under two 8-bit levels. Every
+  check passed. If a control's plausible failure mode is *being too faint to
+  see*, assert a floor in units a human perceives — `verify.py` now measures the
+  split tone in 8-bit levels.
+* **A colour shift that is not luma-neutral is two controls fighting.** Pushing
+  along a warm axis as written also brightens, because the axis has a luma of
+  its own. Project it onto the plane where the luma weights sum to zero and the
+  shift is pure colour by construction, in both directions and at every setting
+  — which is what lets Highlight Warmth and Shoulder be set independently
+  instead of chasing each other.
+* **A mask must be measured where its meaning is settled, not where it is
+  used.** The Luminance Response mask asks how dense the negative is, which the
+  characteristic curve decides — but it was computed three stages later, after
+  edge softening, jitter and sanding. Softening a border invents a mid-tone ramp
+  that was never in the photograph, and the mask believed it: a **0.095 sigma
+  ribbon of grain** along a border whose two sides were both meant to be clean.
+  The same reasoning already had the edge mask and the smooth-area guard reading
+  the untouched input; this one was simply missed.
+* **"Where does this run" is two questions, and a panel answers the wrong one if
+  you are not careful.** I moved `Luminance Response` above `Grain Structure` in
+  the panel because the engine *measures* its mask before it builds the field.
+  The user pushed back — "its main purpose is suppressing grain from grain
+  structure" — and they were right: where the mask is **applied** never moved,
+  and application is what a user reasons about. Ordering a panel by the internal
+  read order put the suppression above the thing it suppresses. It ended as a
+  merge rather than a reorder, which was the better answer to the original
+  question anyway: Luminance Response was never a stage, so a heading of its own
+  had always claimed too much.
+* **Moving one half of a physical question is worse than moving neither.** When
+  the luminance band moved to read the developed density at step 6b, Shadow
+  Clumping was left reading the late luma at step 10 — and both ask exactly the
+  same thing, *how dense is this area*. Two controls keyed on one quantity,
+  sampling it at two points in the pipeline, is a bug that no single-control
+  test can see. Find the other readers of a value before you move where it is
+  read.

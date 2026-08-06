@@ -26,6 +26,11 @@ breaks their whole purpose:
 * `aa_strength` (step 1c) is in the optical block and, crucially, *before the
   masks are measured* — otherwise the grain keeps keying on the jaggies the
   stage just removed. See `docs/edge-destruction.md`.
+* The **density luma** `lum_d` (step 6b) is taken directly after the
+  characteristic curve and base fog and *above* edge softening, jitter and
+  sanding. Both controls keyed on "how much silver is here" read it — the
+  Luminance Response band and Shadow Clumping. See the section below in this
+  file; it moved there on 2026-08-06 and the move is measurable.
 * `global_*` (step 13) is after every mask, so it reaches the regions the masks
   protect. Fold it in earlier and it becomes just more masked grain.
 * `sharpen` (step 14) is dead last, **after** the grain stages, because the
@@ -94,6 +99,71 @@ Cost on a 6MP render at 2×: **0.69s off, 0.75s at 2px, 0.80s at 8px**, with
 `pad_for` 108 → 114 → 132px. A separable gaussian plus one transfer round trip
 is cheap; the padding is what you actually pay for at 8px.
 
+
+## Luminance Response is measured on density, not on the picture (moved 2026-08-06)
+
+Audited on request. The mask that decides how much grain each tone carries used
+to be computed at step 9, immediately before the grain field it multiplies. It
+is now computed at **step 6b**, immediately after base fog — before edge
+softening, edge jitter and sanding touch the frame.
+
+**Only the measurement moved.** `m` is still applied at step 10, still
+multiplying the grain field after `_grain_field` builds it, exactly as it always
+was — worth stating outright because the distinction is easy to lose and the
+user reasonably read the change as moving the suppression itself:
+
+```python
+g = self._grain_field(h, w, y0, x0, lum_d, p, scale)   # field built
+weight = m * ((1.0 - eb) + eb * edge)                  # mask applied, step 10
+out = base + g * weight * amp
+```
+
+**The argument.** What this mask asks is *how dense is the negative here*, and
+the answer is settled the moment the characteristic curve and base fog have run.
+It is a property of development. Everything between the old and the new position
+is a property of *geometry* — softening a border, wandering an edge, sanding the
+burrs off it — and none of those change how much silver was deposited.
+
+Read at the old position the mask was measured off a `base` those three stages
+had already been through, which is wrong in the specific way step 7 and the
+smooth-area guard are both written to avoid: a blurred frame's luma is not the
+density the emulsion recorded, so softening the picture silently moved the grain
+around. It also meant edge jitter warped the mask along with the image, which is
+the wrong way round — jitter displaces where the *picture* is, not how dense the
+silver is.
+
+**The measurement, and it is not subtle.** Put a hard black-to-white step on a
+frame and set the band to mid-tones only, so both sides of the border are
+suppressed and the frame should carry no grain at all. Now soften the border
+hard. Softening invents a mid-tone ramp across it that was never in the
+photograph — and the old order believed it, laying a **0.095 sigma ribbon of
+grain** along a border whose two sides are both meant to be clean. At the new
+position it reads **0.00000**. `verify.py` pins both numbers, and it pins the
+control too (feeding the engine that same softened frame as its *input* really
+does produce the 0.095, so the check cannot pass by measuring nothing).
+
+At default parameters the difference is small, which is why this survived: the
+mask is blurred over 3px anyway and the shipped tone curves are neutral. It
+shows up exactly where a user would reach for it — a soft border, a narrow
+grain band, or both. Measured across all eleven shipped presets on a test scene,
+the move is worth a **mean of 0.00 8-bit levels** and a max of 1 to 33 levels,
+and every one of those maxima sits on a softened border. The look does not move;
+the artifact does.
+
+### Shadow Clumping had to come with it
+
+`_grain_field` reads a luma too, for one thing only: Shadow Clumping, which
+enlarges the clumps where the negative is thin. That is the *same* physical
+question the band asks — how dense is this area — so it now reads the same
+`lum_d`. Moving one and not the other left two halves of one question answered
+from two different frames, which is worse than either consistent choice, and it
+was a defect in the first pass at this rather than a deliberate split.
+
+`lum` still exists alongside `lum_d` and is still recomputed after every stage
+that moves a pixel. It is the luma of the picture **as it currently stands**,
+and the sanding filter genuinely needs that one — it steers along the contour it
+can see, not along the one development recorded. Two names because they are two
+different quantities.
 
 ## `master_opacity` lives outside `render()`, and it has to (added 2026-08-03)
 

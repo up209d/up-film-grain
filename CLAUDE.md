@@ -40,6 +40,13 @@ they **ship neutral (0)** so the pipeline is a colour pass-through. Do not tune
 them or fold them into presets without asking. The `Tone Response` group is
 still the deferred one; `Colour Grading` is not.
 
+Deferred does not mean frozen: the split tone in `Tone Response` was rewritten
+2026-08-06 on request. `warm_highlights` / `cool_shadows` (0…1, one direction
+each) are now `highlight_warmth` / `shadow_warmth` (**−1 cool … +1 warm**), the
+amplitude is nearly 3× what it was, and the axis is projected onto the luma-null
+plane so a warmth push cannot also change brightness. Both still ship at 0. See
+`docs/colour-grading.md`.
+
 **Quality beats speed.** The user has explicitly accepted lag and latency. Do
 not clamp octaves, lattice density, blur radii, supersampling or preview
 resolution for performance alone. If a quality/speed trade-off appears, take
@@ -104,6 +111,15 @@ exports are wrong.
    strength normalises against the fixed `EDGE_REF`; the noise lattice is
    addressed by absolute global coordinates. Break it and exports grow seams
    that no preview will ever show.
+
+   Note what this does *not* forbid, because the distinction has now been got
+   wrong twice in the same file: a list of objects is fine as long as it is a
+   function of the count, the seed and the **frame**. Light leaks have always
+   worked that way, and dust and hair joined them on 2026-08-06 — every tile
+   builds the identical list and clips each mark to *its own* footprint in
+   absolute coordinates. What breaks the invariant is a list derived from the
+   region being rendered: N specks per tile, or positions drawn against the
+   tile's own area. See `docs/film-texture.md`.
 2. **Scale invariance.** Every spatial quantity is specified in full-resolution
    pixels and multiplied by the working `scale`. The preview no longer relies
    on this (it renders at `scale = 1.0` like the export), but supersampling
@@ -111,16 +127,27 @@ exports are wrong.
    Break it and 2× and 1× stop agreeing.
 
 `pipenv run python tests/verify.py` checks both, plus zoom fidelity, colour
-pass-through, luminance response, edge bias, the smooth-area guard, 16-bit PNG
+pass-through, the luminance-response band and that it is keyed on developed
+density rather than on the softened frame, edge bias, the smooth-area guard, 16-bit PNG
 validity, the global-grain point field — its freedom from the pixel grid, its
 structure above the clump, its flat amplitude, its smoothing and its chroma —
 anti-aliasing, the pre-blur, edge
 softening, edge jitter and its direction bias, edge sanding, scatter, output
 sharpening, the master opacity cross-fade, the colour-grading section with its
 3D LUT lookup, `.cube` parsing, monotone tone recovery and highlight
-reconstruction, the four source-masked global layers with their hue masks and
+reconstruction, the bidirectional split tone, the four source-masked global
+layers with their hue masks and
 mid-tone bell, the six Global Grain blend modes, `global_seed` as an offset, and
-the film-texture section — 318 checks. It exits non-zero on failure.
+the film-texture section including its exact mark counts — 345 checks. It exits
+non-zero on failure.
+
+Three of those are a *third* kind of assertion and the newest: they measure a
+control in **8-bit levels** rather than in float deltas. The split tone shipped
+for weeks doing something real and invisible — a peak shift of 0.055 reached
+only at pure white, so an ordinary highlight moved by under two levels. Any
+"did it change the picture" test passes on that. If a control's failure mode is
+*being too subtle to see*, the check has to name the threshold at which a human
+sees it.
 
 One of those is a different *kind* of assertion again and is worth copying when
 adding a tonal control: the tone-curve check measures the **slope of the
@@ -154,6 +181,14 @@ All three displacement stages — both warps and scatter — are in `pad_for` to
 they displace rather than blur, so they read pixels up to their peak travel
 away and contribute to the additive term rather than the ×3 kernel sum.
 
+**Dust and hair reserve nothing there any more** (2026-08-06) and that is the
+one direction this argument runs the other way, so it has its own check. They
+used to blur their mark fields; drawn one mark at a time from absolute
+coordinates with an analytic soft edge, neither has a kernel at all. A stage
+*removed* from `pad_for` is exactly as dangerous as one missing from it, so
+`verify.py` tiles 300 specks and 20 hairs at 128px against a single pass and
+requires 0.00e+00.
+
 One trap when adding a check here: `sanitize(None)` fills in *defaults*, not
 zeros, so an override dict has to zero every other stage that could contribute
 to the same measurement. The sanding check failed first time round because
@@ -169,13 +204,13 @@ optional reading before touching the area it covers.
 |---|---|
 | [docs/pipeline-order.md](docs/pipeline-order.md) | Which stages are placed by *position* and what breaks if they move; `pre_blur` vs `micro_blur`; why `master_opacity` lives outside `render()` |
 | [docs/preview-and-export.md](docs/preview-and-export.md) | The client-scaled two-tier preview, and the three export tiers (`full`, `preview`, `preview_full`) |
-| [docs/colour-grading.md](docs/colour-grading.md) | Step −1: LUTs as *resources*, the twelve adjustments, the Shadows/Highlights rewrite, highlight reconstruction |
+| [docs/colour-grading.md](docs/colour-grading.md) | Step −1: LUTs as *resources*, the twelve adjustments, the Shadows/Highlights rewrite, highlight reconstruction — and, filed with them, Tone Response's bidirectional split tone |
 | [docs/halation.md](docs/halation.md) | Blue compensation and why it runs before the wash; highlight recovery metered against real headroom |
 | [docs/edge-destruction.md](docs/edge-destruction.md) | Scatter (diffusion without the average) and anti-aliasing (filter along the contour) |
 | [docs/global-grain.md](docs/global-grain.md) | Why value noise quilts, the two superseded constructions, the tilted point field, the chroma slider, the five layers (hue mask vs channel value, mask vs seed) and the blend modes |
-| [docs/film-texture.md](docs/film-texture.md) | Dust, scratches, hair — drawn, never scattered — and light leaks as beams |
+| [docs/film-texture.md](docs/film-texture.md) | Dust and hair as drawn marks with exact counts, scratches as a field, light leaks as beams |
 | [docs/presets.md](docs/presets.md) | The mark-count dead zone, and `reference_mp` rescaling across image sizes |
-| [docs/panel-layout.md](docs/panel-layout.md) | `GROUPS` reorgs and where each parameter's section went |
+| [docs/panel-layout.md](docs/panel-layout.md) | `GROUPS` reorgs and where each parameter's section went, including why Luminance Response stopped being a section |
 | [docs/client-ui.md](docs/client-ui.md) | Wheel zoom, the mount, muted-on-boot, and two React traps |
 | [docs/tuning-constants.md](docs/tuning-constants.md) | Every calibrated constant in `engine.py`, with the measurement behind it |
 | [docs/lessons.md](docs/lessons.md) | Things I got wrong, so you don't repeat them |

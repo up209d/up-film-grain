@@ -28,9 +28,10 @@ from server import imageio as iio  # noqa: E402
 from server import params as P  # noqa: E402
 from server.engine import (  # noqa: E402
     _GRAIN_CLUSTER, _GRAIN_COS, _GRAIN_FILL, _GRAIN_SHARE, _GRAIN_SIN,
-    _GRAIN_SLOTS, GrainEngine, RenderCancelled, _grain_cluster, _grain_gain,
-    _grain_delta, _grain_points, _lat_span, _lattice_np, _leak_anchor,
-    _leak_sites, _smoothstep, _source_masks, device_name, pick_device,
+    _GRAIN_SLOTS, _LUMA, GrainEngine, RenderCancelled, _blur, _grain_cluster,
+    _grain_gain, _grain_delta, _grain_points, _lat_span, _lattice_np,
+    _leak_anchor, _leak_sites, _smoothstep, _source_masks, device_name,
+    pick_device,
 )
 from tests.scene import patch as scene_patch  # noqa: E402
 from tests.scene import scene  # noqa: E402
@@ -184,6 +185,64 @@ def main() -> int:
         dn[0] < b0[0] * 0.6 and dn[-1] > b0[-1] * 0.85,
         f"sat {b0[0]:.2f}->{dn[0]:.2f} muted, {b0[-1]:.2f}->{dn[-1]:.2f} vivid",
     )
+
+    # -- 3b2. split tone: both directions, visible, and luma-neutral -----------
+    # `highlight_warmth` and `shadow_warmth` replaced `warm_highlights` and
+    # `cool_shadows` on 2026-08-06, and both halves of that change need pinning.
+    #
+    # The direction half is obvious. The *visibility* half is the one worth
+    # having: the old pair peaked at a 0.055 shift in one channel, reached only
+    # at pure white, so an ordinary highlight moved by under two 8-bit levels --
+    # which is why they were reported as doing nothing. "It moved" would have
+    # passed on the old code too, so the assertion is a floor in 8-bit levels.
+    #
+    # And luma-neutrality, because that is what lets these be set independently
+    # of Shoulder and Brightness rather than fighting them for the same range.
+    print("\nsplit tone (highlight and shadow warmth, both directions)")
+    ramp = np.zeros((64, 512, 3), np.float32)
+    ramp[:] = np.linspace(0.02, 0.98, 512, dtype=np.float32)[None, :, None]
+    lw_ = np.array(_LUMA, np.float32)
+
+    def tone_at(over: dict, at: float) -> np.ndarray:
+        o = eng.render_image(ramp, P.sanitize({**quiet, **over}), 1.0, supersample=1)
+        return o[32, int(at * 511)].astype(np.float64)
+
+    # Probes sit at 0.74 and 0.21 rather than at the extremes: a full-strength
+    # push at 0.95 drives blue through 1.0 and clips, which would make the two
+    # directions look asymmetric for a reason that has nothing to do with them.
+    for key, probe, other in (
+        ("highlight_warmth", 0.75, 0.20),
+        ("shadow_warmth", 0.20, 0.75),
+    ):
+        mid = tone_at({}, probe)
+        dw = tone_at({key: 1.0}, probe) - mid
+        dc = tone_at({key: -1.0}, probe) - mid
+        check(
+            f"{key} +1 warms and -1 cools",
+            dw[0] > 0 and dw[2] < 0 and dc[0] < 0 and dc[2] > 0,
+            f"+1 gives r{dw[0]:+.3f} b{dw[2]:+.3f}, -1 gives r{dc[0]:+.3f} b{dc[2]:+.3f}",
+        )
+        check(
+            f"{key} is symmetric about 0",
+            float(np.abs(dw + dc).max()) < 5e-3,
+            f"worst |(+1) + (-1)| {float(np.abs(dw + dc).max()):.2e}",
+        )
+        levels = float(np.abs(dw).max()) * 255.0
+        check(
+            f"{key} is actually visible", levels > 12.0,
+            f"{levels:.0f} 8-bit levels at full strength (the old pair managed 2)",
+        )
+        check(
+            f"{key} holds luma",
+            abs(float((dw * lw_).sum())) < 2e-3 and abs(float((dc * lw_).sum())) < 2e-3,
+            f"luma moves {float((dw * lw_).sum()):+.2e} warm, {float((dc * lw_).sum()):+.2e} cool",
+        )
+        far = float(np.abs(tone_at({key: 1.0}, other) - tone_at({}, other)).max())
+        check(
+            f"{key} stays at its own end of the range",
+            far < float(np.abs(dw).max()) * 0.35,
+            f"{far * 255:.1f} levels at the other end against {levels:.0f} at its own",
+        )
 
     # -- 3c. preset rescaling across image sizes -------------------------------
     # A preset dialled in on one size has to hold its look on another. The
@@ -908,6 +967,62 @@ def main() -> int:
     check("highlight suppression", hi / peak < 0.30, f"95-100% is {hi / peak * 100:.0f}% of peak")
     for i, s in band:
         print(f"      {i:3d}-{i + 5:3d}%  {'#' * int(s / peak * 34)}")
+
+    # -- 4b. the luminance mask is measured off density, not off the picture --
+    # The mask moved to step 6b on 2026-08-06 -- directly after the
+    # characteristic curve and base fog, and *above* edge softening, jitter and
+    # sanding. What that buys is testable and the test is a strong one.
+    #
+    # Put a hard black-to-white border on a frame and set the grain band to
+    # mid-tones only, so both sides of the border are suppressed and the frame
+    # should carry no grain anywhere. Then soften the border hard. Softening
+    # invents a mid-tone ramp across it that was never in the photograph, and a
+    # mask read *after* that stage believes it -- laying a ribbon of grain along
+    # a border whose two sides are both meant to be clean.
+    #
+    # The reference number is not hypothetical: feeding the engine that same
+    # softened frame as its *input* (which is exactly what the old order's mask
+    # saw) puts 0.095 sigma of grain in the ribbon. Here it must be nothing.
+    print("\nluminance response is keyed on density, not on the softened frame")
+    step_plate = np.zeros((400, 400, 3), np.float32)
+    step_plate[:, :200] = 0.03
+    step_plate[:, 200:] = 0.97
+    mid_only = {
+        "intensity": 60, "global_intensity": 0, "micro_blur": 0, "acutance": 0,
+        "edge_erosion": 0, "halation": 0, "edge_jitter": 0, "sharpen": 0,
+        # Both off, so what is measured is `m` alone rather than the edge mask
+        # or the smooth-area guard also having an opinion about the border.
+        "edge_bias": 0.0, "smooth_guard": 0.0,
+        "lum_low": 0.35, "lum_high": 0.65, "shadow_falloff": 0.02,
+        "highlight_falloff": 0.02, "shadow_drop": 1.0, "highlight_drop": 1.0,
+        "edge_soften_radius": 30.0,
+    }
+
+    def ribbon_sigma(arr: np.ndarray, over: dict) -> float:
+        q = P.sanitize({**mid_only, **over})
+        got = eng.render_image(arr, q, 1.0, supersample=1)
+        ref_ = eng.render_image(
+            arr, P.sanitize({**mid_only, **over, "intensity": 0}), 1.0, supersample=1,
+        )
+        r_ = got - ref_
+        return max(float(r_[:, 175:195].std()), float(r_[:, 205:225].std()))
+
+    # The control: a frame that really does have mid-tones across the border
+    # must be grainy there, or the check below is passing for the wrong reason.
+    t_ = torch.from_numpy(step_plate).permute(2, 0, 1).unsqueeze(0)
+    pre_softened = _blur(t_, 30.0).squeeze(0).permute(1, 2, 0).numpy()
+    ctrl = ribbon_sigma(np.ascontiguousarray(pre_softened), {"edge_soften": 0.0})
+    check(
+        "a real mid-tone ramp is grainy", ctrl > 0.02,
+        f"sigma {ctrl:.5f} where the frame itself carries the mid-tones",
+    )
+    for es in (0.0, 1.0):
+        got = ribbon_sigma(step_plate, {"edge_soften": es})
+        check(
+            f"softening at {es:.0f} invents no grain at the border",
+            got < ctrl * 0.05,
+            f"sigma {got:.5f} against the mid-tone control's {ctrl:.5f}",
+        )
 
     # -- 5. grain concentrates on edges rather than flat areas ---------------
     print("\nedge bias (grain onto micro-edges, not flat areas)")
@@ -3061,6 +3176,208 @@ def main() -> int:
             f"{name} stays non-uniform", spread1 > 0.3,
             f"per-mark brightness spread {spread1 * 100:.0f}% of mean",
         )
+
+    # -- 5g-2. dust and hair are drawn, so their counts are exact ------------
+    # Both were rewritten on 2026-08-06 from a threshold on a noise field to a
+    # list of drawn marks. The reported bug was "I set Hair Count to 1 and I see
+    # more than one hair", and it was structural: a level set of a field is not
+    # one curve, so one unit of "hair" drew however many separate arcs the field
+    # happened to cross 0.5 along. Dust had the same problem in a milder form --
+    # its count went through a fitted blob-per-cell constant good to about a
+    # factor of 1.5.
+    #
+    # So the check is the count itself, and it has to be exact rather than
+    # approximate, because "roughly N" is precisely what was wrong.
+    def components(mask: np.ndarray, min_px: int = 1) -> list[int]:
+        """Sizes of the 8-connected components of ``mask``, largest first."""
+        parent: dict[tuple[int, int], tuple[int, int]] = {}
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        ys, xs = np.nonzero(mask)
+        pts = list(zip(ys.tolist(), xs.tolist()))
+        for q in pts:
+            parent[q] = q
+        for y, x in pts:
+            for dy, dx in ((-1, 0), (0, -1), (-1, -1), (-1, 1)):
+                nb = (y + dy, x + dx)
+                if nb in parent:
+                    ra, rb = find(nb), find((y, x))
+                    if ra != rb:
+                        parent[rb] = ra
+        sizes: dict[tuple[int, int], int] = {}
+        for q in pts:
+            r_ = find(q)
+            sizes[r_] = sizes.get(r_, 0) + 1
+        return sorted((v for v in sizes.values() if v >= min_px), reverse=True)
+
+    def mark_mask(over: dict, thr: float = 0.04) -> np.ndarray:
+        o = eng.render_image(plain, P.sanitize({**tex_off, **over}), 1.0, supersample=2)
+        return np.abs(o - plain).max(2) > thr
+
+    # Small counts across several seeds, because "1 means 1" has to hold for
+    # every frame rather than on average.
+    for key, extra, min_px in (
+        ("dust", {"dust_size": 8.0}, 3),
+        # 20px floor for hair: a filament fades to nothing at its tapered tip,
+        # and the last pixel or two of that fade sits within a hair's breadth of
+        # any threshold you pick. Those are not extra hairs -- measured, the
+        # detached remnant is a single pixel at delta 0.0405 on a flat plate,
+        # which is a 1% shift. The filament itself runs to several hundred.
+        ("hair", {"hair_length": 200.0}, 20),
+    ):
+        worst = None
+        for sd in (1234, 77, 909, 42, 5, 31):
+            for n in (1, 2, 3, 5):
+                got = len(components(
+                    mark_mask({key: float(n), "texture_seed": float(sd), **extra}),
+                    min_px,
+                ))
+                if got != n and worst is None:
+                    worst = f"seed {sd} asked {n} drew {got}"
+        check(
+            f"{key} count 1-5 is exact over six seeds",
+            worst is None, worst or "every frame drew exactly what it was asked for",
+        )
+
+    # At high counts marks genuinely merge, which is the one honest source of
+    # error -- two specks that overlap are one blob and there is nothing to fix
+    # about that. It is a few percent, not the factor of 1.5 the fitted constant
+    # used to cost.
+    for n in (20, 120, 400):
+        got = len(components(mark_mask({"dust": float(n), "dust_size": 8.0}), 3))
+        check(
+            f"dust count {n} lands within 3%", abs(got - n) <= max(1, 0.03 * n),
+            f"drew {got} of {n} ({(got - n) / n * 100:+.1f}%, merges only)",
+        )
+
+    # -- 5g-3. a speck is a round shape, and not a circle --------------------
+    # Both halves were asked for: "dots need to be in round form, some dot I
+    # found is not round -- don't make them circle, a shape form of imperfect
+    # circle or imperfect ellipse".
+    #
+    # Roundness is measured as the isoperimetric quotient 4*pi*A/P^2, which is
+    # 1.0 for a circle and falls away for anything ragged or elongated -- and it
+    # is measured *against a rendered disc of the same size* rather than against
+    # 1.0, because a rasterised outline over-counts its own perimeter by a
+    # factor that depends on the radius. The old thresholded-noise specks score
+    # far below this because their outlines are whatever the field did.
+    #
+    # The other half is asserted from the second moments: a population whose
+    # mean axis ratio is 1.0 is a population of circles, which is the thing that
+    # was explicitly not wanted.
+    def speck_stats(over: dict) -> tuple[float, float, float]:
+        m = mark_mask({"dust": 60.0, "dust_soften": 0.0, **over}, thr=0.05)
+        parent: dict[tuple[int, int], tuple[int, int]] = {}
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        ys, xs = np.nonzero(m)
+        pts = list(zip(ys.tolist(), xs.tolist()))
+        for q in pts:
+            parent[q] = q
+        for y, x in pts:
+            for dy, dx in ((-1, 0), (0, -1), (-1, -1), (-1, 1)):
+                nb = (y + dy, x + dx)
+                if nb in parent:
+                    ra, rb = find(nb), find((y, x))
+                    if ra != rb:
+                        parent[rb] = ra
+        groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        for q in pts:
+            groups.setdefault(find(q), []).append(q)
+        iso, ratio = [], []
+        for px in groups.values():
+            if len(px) < 60:
+                continue
+            s = set(px)
+            area = float(len(px))
+            per = float(sum(
+                1 for (y, x) in px
+                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                if (y + dy, x + dx) not in s
+            ))
+            iso.append(4.0 * math.pi * area / max(per * per, 1e-9))
+            a = np.array(px, np.float64)
+            a -= a.mean(0)
+            ev = np.linalg.eigvalsh(a.T @ a / len(px))
+            ratio.append(float(math.sqrt(max(ev[1], 1e-9) / max(ev[0], 1e-9))))
+        return float(np.mean(iso)), float(np.mean(ratio)), float(np.std(ratio))
+
+    # A rendered disc of the same nominal size, as the yardstick. Zero
+    # eccentricity and no harmonics is exactly a circle, so this is the score a
+    # perfect speck of this radius gets through the same rasteriser and the same
+    # component finder.
+    import server.engine as _eng_mod
+    _keep = (_eng_mod._DUST_ECCENT, _eng_mod._DUST_HARMONICS)
+    try:
+        _eng_mod._DUST_ECCENT = 0.0
+        _eng_mod._DUST_HARMONICS = (0.0, 0.0, 0.0)
+        disc_iso, disc_ratio, _ = speck_stats({"dust_size": 24.0})
+    finally:
+        _eng_mod._DUST_ECCENT, _eng_mod._DUST_HARMONICS = _keep
+    iso, ratio, spread = speck_stats({"dust_size": 24.0})
+    check(
+        "a speck is round", iso > disc_iso * 0.82,
+        f"isoperimetric {iso:.3f} against a rendered disc's {disc_iso:.3f} "
+        f"({iso / disc_iso * 100:.0f}% of a circle)",
+    )
+    check(
+        "a speck is not a circle", ratio > 1.10 and spread > 0.05,
+        f"mean axis ratio {ratio:.2f} (a disc renders {disc_ratio:.2f}), "
+        f"spread {spread:.2f}",
+    )
+
+    # -- 5g-4. the dark/light balance ---------------------------------------
+    # Reported as "too many dark dots, I want more light dots" -- the split was
+    # hard-coded at two thirds dark. It is a slider now, and the split is exact
+    # because it is a prefix of the list rather than a per-speck coin flip.
+    def populations(bal: float) -> tuple[int, int]:
+        o = eng.render_image(
+            plain,
+            P.sanitize({**tex_off, "dust": 100.0, "dust_size": 8.0,
+                        "dust_balance": bal, "dust_lum_var": 0.0}),
+            1.0, supersample=2,
+        )
+        d = o.max(2) - 0.5
+        return int(len(components(d < -0.04, 3))), int(len(components(d > 0.04, 3)))
+
+    for bal, want in ((-1.0, "all dark"), (1.0, "all light")):
+        dk, lt = populations(bal)
+        ok = (lt == 0 and dk > 90) if bal < 0 else (dk == 0 and lt > 90)
+        check(f"balance {bal:+.0f} is {want}", ok, f"{dk} dark, {lt} light")
+    dk, lt = populations(0.0)
+    check(
+        "balance 0 is an even mix", abs(dk - lt) <= max(4, 0.08 * (dk + lt)),
+        f"{dk} dark, {lt} light",
+    )
+
+    # -- 5g-5. drawn marks reserve no tile overlap --------------------------
+    # `pad_for` stopped counting dust and hair when they stopped blurring. That
+    # is the claim to be paranoid about: a stage missing from `pad_for` seams a
+    # tiled export along exactly its own radius while every preview looks fine.
+    # It is safe here only because a drawn mark is clipped to *its own*
+    # footprint in absolute frame coordinates rather than to the tile's, so a
+    # speck straddling a boundary is drawn identically by both tiles.
+    heavy = P.sanitize({
+        **tex_off, "dust": 300.0, "dust_size": 40.0, "dust_soften": 1.0,
+        "hair": 20.0, "hair_length": 400.0, "hair_soften": 1.0,
+    })
+    whole = eng.render_image(plain, heavy, 1.0, tile=4096, supersample=1)
+    split = eng.render_image(plain, heavy, 1.0, tile=128, supersample=1)
+    d_ = float(np.abs(whole - split).max())
+    check(
+        "no seam from drawn marks at zero overlap", d_ < 1e-6,
+        f"max delta {d_:.2e} over 300 specks and 20 hairs, tiled at 128px",
+    )
 
     # Light leaks: the failure this guards is every leak coming out identical,
     # which reads as stamped rather than accidental. Two things had to be

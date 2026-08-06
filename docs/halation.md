@@ -87,7 +87,8 @@ broad gradient that shows up a hard switch-on. Same pattern as
 `_linear_to_srgb(_luma(lin))` is cheaper and wrong — the transfer curve is
 non-linear so it does not commute with a weighted sum, and it reads a deep sky
 **23% brighter than it is**, putting this slider on a different scale from the
-Luminance Response knees it is meant to match. Linear luma is worse still: it
+Shadow/Highlight Knees it is meant to match (under Grain Structure since
+the Luminance Response section was merged into it). Linear luma is worse still: it
 crushes an ordinary sky to 0.05 and wastes the top nine tenths of the slider.
 
 Known limit, measured: a fixed brightness gate is a *proxy* for "where the wash

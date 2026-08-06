@@ -14,6 +14,10 @@ its *mechanism* rather than all five landing in one place:
 | `edge_chroma` | Edge Destruction | it modulates `edge_erosion`, and does nothing without it |
 | `warm_highlights`, `cool_shadows` | Tone Response | colour grading, deferred, ships at 0 — the same as everything already in there |
 
+(Those two were renamed to `highlight_warmth` and `shadow_warmth` on 2026-08-06
+when they became bidirectional; the section they landed in is unchanged. See
+`docs/colour-grading.md`.)
+
 That is a judgement call on top of what was asked: "Colour" was a grab-bag of
 three unrelated jobs, and putting the fringing slider directly under the erosion
 slider it modifies is more discoverable than the merge alone would be. One
@@ -82,3 +86,93 @@ parameter after `scatter_pattern`, so the client renders it as a menu with no
 change to `App.tsx` — the value is still a number everywhere else, and the
 names live in `params.GLOBAL_BLENDS` where the engine imports them rather than
 in two literal tuples that would have to agree on an index.
+
+## The Luminance Response section is gone, merged into Grain Structure (2026-08-06)
+
+Asked for in two steps, and the second step corrected the first — worth
+recording because the correction is the useful part.
+
+**What I did first, and why it was half-right.** The ask was to audit Luminance
+Response's position and move it to where the pipeline actually runs it. I read
+that as a `GROUPS` reorder and lifted the section *above* Grain Structure, on
+the reasoning that the engine measures the mask before it builds the field. The
+user pushed back:
+
+> I don't see why you move it here, it is at least after grain structure
+> section, in the sense it main purpose is supressing grain from grain
+> structure, am I wrong?
+
+They were not wrong, and the objection exposed a genuine ambiguity in "where
+does this run". **Where the mask is *applied* never moved** — it has always
+multiplied the grain field at step 10, after `_grain_field` builds it. What
+moved in the engine is only which luma the mask *reads*. Ordering the panel by
+the read rather than by the application put the suppression before the thing it
+suppresses, which is backwards from every user's point of view: you set a grain
+amount, then you say where it lands.
+
+**What it is now.** The section does not exist. Its six parameters —
+Shadow/Highlight Knee, the two Falloffs, Highlight and Black Suppression — took
+`group = "Grain Structure"` and sit under the controls that build the field they
+mask:
+
+```
+Intensity            Octaves               Shadow Knee
+Clump Size           Roughness             Highlight Knee
+Shadow Clumping      Chroma Grain          Shadow Falloff
+Clump Hardness                             Highlight Falloff
+                                           Highlight Suppression
+                                           Black Suppression
+                                           Seed
+```
+
+`GROUPS` loses an entry rather than reordering one:
+
+```
+before                          after
+------                          -----
+Colour Grading                  Colour Grading
+Pre Blur                        Pre Blur
+Pre Sharpen                     Pre Sharpen
+Grain Structure                 Grain Structure   (+ the six, at the end)
+Edge Destruction                Edge Destruction
+Anti Aliasing                   Anti Aliasing
+Global Grain                    Global Grain
+Sharpening                      Sharpening
+Luminance Response              Halation
+Halation                        Tone Response
+Tone Response                   Film Texture
+Film Texture                    Output
+Output
+```
+
+Merging beats reordering here for a reason that only shows up once you try the
+reorder: **Luminance Response was never a stage, so a heading of its own was
+always claiming too much.** It says which densities carry the grain the controls
+above it make. As a section it read as a second thing to set up; as the tail of
+Grain Structure it reads as what it is.
+
+Two things fall out of the merge, both improvements:
+
+* **The section's mute button stops being a lie.** `toggleGroup` sets a group's
+  parameters to their neutral values, and none of these six are in
+  `NEUTRAL_ZERO` — they are knees and widths, not amounts — so muting
+  Luminance Response set them to their *defaults* and switched nothing off.
+  Muting Grain Structure takes `intensity` to 0, which really does switch the
+  whole thing off, these six included.
+* **Per-section Reset now covers the pair together**, which is what you want:
+  the band is meaningless apart from the field it applies to.
+
+**`seed` stays last in the group**, under everything it rerolls, matching where
+`Texture Seed` and `Global Seed` sit in theirs — so the six went in front of it
+rather than literally at the bottom of the list. It is the control reached for
+least often and burying it under six knees would cost more than the literal
+reading is worth. One line to flip if that reads wrong.
+
+**The list as a whole is not pipeline-ordered and cannot be**, which is worth
+stating plainly since this is now the third reorg asked for in those terms.
+Edge Destruction alone spans steps 1, 1b, 7b, 8b and 11; Tone Response spans 3
+to 6. A section is a group of *controls that share a mechanism*, and several
+mechanisms are threaded through the pipeline at more than one point. What the
+order can do — and what all three reorgs have done — is put each section next to
+the one it actually interacts with, and this time the answer was that two of
+them were one section.

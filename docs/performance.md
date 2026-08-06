@@ -215,3 +215,32 @@ Both were measured and then declined, so the numbers are not lost:
   Grain is one tilted point field now". The saving was spent on more points per
   cell rather than banked.
 
+
+## Drawn dust and hair cost effectively nothing (measured 2026-08-06)
+
+The rewrite from thresholded noise fields to per-mark drawing (see
+`docs/film-texture.md`) looked like it might be a regression: the field version
+was a handful of whole-frame tensor ops, and this is a Python loop over up to
+400 marks with a dozen tensor ops each.
+
+It is not, because **the cost is the marks' own total area rather than the count
+times the frame**. `_mark_window` returns `None` for any mark that does not
+touch the tile — the usual answer — and otherwise slices to the mark's own
+footprint, so a 20px speck costs a 20px-square evaluation and not a 12MP one.
+The old version evaluated two full-frame `_value_noise` calls plus a blur
+whatever the count was.
+
+Measured on a 12MP frame at supersample 1, against a 0.19s grain-only render:
+
+| | added |
+|---|---|
+| dust 50 at 9px (a typical preset) | +0.00s |
+| dust 400 at 40px (both sliders at their tops) | +0.02s |
+| hair 10 at 200px | +0.00s |
+| hair 40 at 600px (both at their tops) | +0.03s |
+
+It also **removed work from `pad_for`**, which is a second-order saving that
+outweighs any of the above on a tiled export: dust softening used to reserve
+`dust_soften * 1.6 * dust_size` of overlap on every tile, so a 120px speck at
+full softness widened every tile's read window by 200px in each direction and
+the render then threw that overlap away.

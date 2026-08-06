@@ -54,6 +54,14 @@ GLOBAL_BLENDS: tuple[str, ...] = (
 
 
 # Groups are rendered in this order by the client.
+#
+# `Luminance Response` is **gone as a section** (2026-08-06, on request): its six
+# parameters moved into `Grain Structure`, under the controls that build the
+# field they mask. It was never a stage of its own -- it says which densities
+# carry the grain the section above it makes -- and a heading of its own read as
+# a second thing to set up rather than as the tail of the first. See
+# `docs/panel-layout.md`, which also has why this list is not, and cannot be,
+# pipeline-ordered as a whole.
 GROUPS: list[str] = [
     "Colour Grading",
     "Pre Blur",
@@ -63,7 +71,6 @@ GROUPS: list[str] = [
     "Anti Aliasing",
     "Global Grain",
     "Sharpening",
-    "Luminance Response",
     "Halation",
     "Tone Response",
     "Film Texture",
@@ -426,16 +433,34 @@ PARAMS: list[Param] = [
         "Minimum density of the film base. There is no true black on film.",
     ),
     Param(
-        "warm_highlights", "Warm Highlights", "Tone Response",
-        0.0, 1.0, 0.01, 0.0, "",
-        "Cross-channel bias pushing highlights warm, as the three dye layers "
-        "reach saturation at different rates.",
+        "highlight_warmth", "Highlight Warmth", "Tone Response",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "Cross-channel bias on the top of the range: **positive is warm, "
+        "negative is cool**, and 0 leaves the highlights alone. The three dye "
+        "layers reach saturation at different rates, so a stock's highlights "
+        "carry a cast of their own -- warm on most colour negative, cool on "
+        "tungsten stock and on a lot of reversal film. Both directions are "
+        "reachable because both are real; a warm-only control could only ever "
+        "describe half the stocks.\n"
+        "\n"
+        "The shift is **luma-neutral by construction** -- the colour axis is "
+        "projected onto the plane where the luma weights sum to zero -- so this "
+        "changes the colour of the highlights without brightening or darkening "
+        "them, and it cannot fight Shoulder or Brightness for the same range.",
     ),
     Param(
-        "cool_shadows", "Cool Shadows", "Tone Response",
-        0.0, 1.0, 0.01, 0.0, "",
-        "Complementary cool cast in the shadows. Together with warm "
-        "highlights this is most of what reads as a film colour palette.",
+        "shadow_warmth", "Shadow Warmth", "Tone Response",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "The same control for the bottom of the range: positive warms the "
+        "shadows, negative cools them, 0 leaves them alone. Set against "
+        "Highlight Warmth this is a split tone, and it is most of what reads "
+        "as a film colour palette -- cool shadows under warm highlights is the "
+        "classic daylight negative look, and the opposite pairing is the "
+        "cross-processed one.\n"
+        "\n"
+        "Luma-neutral like its partner. The two weightings overlap through the "
+        "mid-tones on purpose, so setting both to the same sign tints the whole "
+        "frame rather than leaving a band untouched in the middle.",
     ),
     # ---------------------------------------------------------------- grain
     Param(
@@ -487,6 +512,50 @@ PARAMS: list[Param] = [
         "0 = monochrome grain shared across channels. 1 = independent dye "
         "cloud noise per layer.",
     ),
+    # ---------------------------------------------- luminance response
+    # Was a section of its own until 2026-08-06, merged in here on request:
+    # these six do not describe a stage, they describe *where the grain built
+    # above them lands*, so a heading of their own read as a second thing to
+    # set up rather than as the tail of this one. Panel order is the pipeline's:
+    # build the field, then say which densities carry it.
+    Param(
+        "lum_low", "Shadow Knee", "Grain Structure",
+        0.0, 0.5, 0.005, 0.15, "",
+        "Lower edge of the peak-grain band. Below this, density falls off.",
+    ),
+    Param(
+        "lum_high", "Highlight Knee", "Grain Structure",
+        0.3, 1.0, 0.005, 0.65, "",
+        "Upper edge of the peak-grain band. Above this, tightly packed "
+        "silver suppresses visible grain.",
+    ),
+    Param(
+        "shadow_falloff", "Shadow Falloff", "Grain Structure",
+        0.02, 0.5, 0.005, 0.15, "",
+        "How wide the fade-out is below the shadow knee. Independent of the "
+        "knee position, so you can place the band anywhere and still control "
+        "how gradual the transition into it is.",
+    ),
+    Param(
+        "highlight_falloff", "Highlight Falloff", "Grain Structure",
+        0.02, 0.5, 0.005, 0.25, "",
+        "How wide the fade-out is above the highlight knee. Widen it for a "
+        "gentler hand-off into clean highlights.",
+    ),
+    Param(
+        "highlight_drop", "Highlight Suppression", "Grain Structure",
+        0.0, 1.0, 0.01, 0.85, "",
+        "How far grain is cut in dense highlights. 0.85 = 85% reduction.",
+    ),
+    Param(
+        "shadow_drop", "Black Suppression", "Grain Structure",
+        0.0, 1.0, 0.01, 0.6, "",
+        "How far grain is cut in deep blacks.",
+    ),
+    # `seed` stays last in the group, under everything it rerolls -- the same
+    # place `Texture Seed` and `Global Seed` sit in theirs. It is the control
+    # reached for least often, so the six above go in front of it rather than
+    # literally at the bottom of the list.
     Param(
         "seed", "Seed", "Grain Structure",
         0.0, 9999.0, 1.0, 1234.0, "",
@@ -494,41 +563,6 @@ PARAMS: list[Param] = [
         "the pipeline -- the global layer, the edge envelope, the jitter "
         "displacement, the film-texture marks -- is offset from this one, so "
         "moving it rerolls the whole frame without changing any look.",
-    ),
-    # ------------------------------------------------------------ luminance
-    Param(
-        "lum_low", "Shadow Knee", "Luminance Response",
-        0.0, 0.5, 0.005, 0.15, "",
-        "Lower edge of the peak-grain band. Below this, density falls off.",
-    ),
-    Param(
-        "lum_high", "Highlight Knee", "Luminance Response",
-        0.3, 1.0, 0.005, 0.65, "",
-        "Upper edge of the peak-grain band. Above this, tightly packed "
-        "silver suppresses visible grain.",
-    ),
-    Param(
-        "shadow_falloff", "Shadow Falloff", "Luminance Response",
-        0.02, 0.5, 0.005, 0.15, "",
-        "How wide the fade-out is below the shadow knee. Independent of the "
-        "knee position, so you can place the band anywhere and still control "
-        "how gradual the transition into it is.",
-    ),
-    Param(
-        "highlight_falloff", "Highlight Falloff", "Luminance Response",
-        0.02, 0.5, 0.005, 0.25, "",
-        "How wide the fade-out is above the highlight knee. Widen it for a "
-        "gentler hand-off into clean highlights.",
-    ),
-    Param(
-        "highlight_drop", "Highlight Suppression", "Luminance Response",
-        0.0, 1.0, 0.01, 0.85, "",
-        "How far grain is cut in dense highlights. 0.85 = 85% reduction.",
-    ),
-    Param(
-        "shadow_drop", "Black Suppression", "Luminance Response",
-        0.0, 1.0, 0.01, 0.6, "",
-        "How far grain is cut in deep blacks.",
     ),
     # ----------------------------------------------------------------- edge
     Param(
@@ -726,7 +760,7 @@ PARAMS: list[Param] = [
         "never damaged, so every bit of the correction is overshoot. Blue "
         "above this brightness is compensated and blue below it is left as "
         "it was. Read on the picture's own brightness scale, the same one the "
-        "Luminance Response knees use.",
+        "Shadow and Highlight Knees under Grain Structure use.",
     ),
     Param(
         "halation_blue_falloff", "Blue Level Falloff", "Halation",
@@ -1144,17 +1178,34 @@ PARAMS: list[Param] = [
     Param(
         "dust", "Dust Count", "Film Texture",
         0.0, 400.0, 1.0, 0.0, "",
-        "Roughly how many specks land on the frame -- a count, not a "
-        "strength, so it means the same thing whatever the image size. Two "
-        "thirds print dark (opaque motes) and one third bright (pinholes "
-        "and lint). Approximate by nature: specks merge and the frame edge "
-        "clips some. 0 = none.",
+        "How many specks land on the frame -- a count, not a strength, so it "
+        "means the same thing whatever the image size. **Exact**: the specks "
+        "are drawn one at a time from a list anchored to the frame, so 20 here "
+        "is twenty specks, not roughly twenty. Raising it adds specks and "
+        "leaves the ones already there where they were. 0 = none.",
+    ),
+    Param(
+        "dust_balance", "Dust Dark / Light", "Film Texture",
+        -1.0, 1.0, 0.01, 0.0, "",
+        "Which way the population leans. **-1 is every speck dark, +1 is every "
+        "speck bright, 0 is an even mix.** Dark specks are opaque motes sitting "
+        "on the emulsion; bright ones are pinholes in it and lint on the "
+        "scanner glass, and a frame of only dark specks reads as sensor dirt "
+        "rather than as film.\n"
+        "\n"
+        "The split is exact and it converts specks *in place*: moving this "
+        "changes which of the specks are bright without moving any of them, so "
+        "you can find the ratio you want without the frame reshuffling under "
+        "you. Dust Count stays the total either way.",
     ),
     Param(
         "dust_size", "Dust Size", "Film Texture",
         0.5, 120.0, 0.05, 2.0, "px",
-        "Speck diameter at full resolution. Small is scanner dust; large is "
-        "lint and debris on the negative.",
+        "Mean speck diameter at full resolution. Small is scanner dust; large "
+        "is lint and debris on the negative. Individual specks are drawn "
+        "around this rather than all cut to it -- real debris comes in a range "
+        "of sizes, and a frame of identically-sized specks is the clearest "
+        "sign the texture was generated.",
         spatial=True,
     ),
     Param(
@@ -1184,9 +1235,9 @@ PARAMS: list[Param] = [
         0.0, 1.0, 0.01, 0.35, "",
         "How far out of focus the specks are. Debris sits at different "
         "depths, so this is a *spread* rather than a uniform blur -- some "
-        "specks stay crisp and others go soft at any setting. Blurred "
-        "specks also come out fainter, which is what out-of-focus debris "
-        "actually does. 0 = all crisp.",
+        "specks stay crisp and others go soft at any setting. Soft specks "
+        "also come out fainter, which is what out-of-focus debris actually "
+        "does. 0 = all crisp.",
     ),
     Param(
         "scratches", "Scratch Count", "Film Texture",
@@ -1215,17 +1266,19 @@ PARAMS: list[Param] = [
     Param(
         "hair", "Hair Count", "Film Texture",
         0.0, 40.0, 1.0, 0.0, "",
-        "Roughly how many hairs and fibres are lying on the frame, printing "
-        "as dark wandering filaments. Each follows a contour of a noise "
-        "field, so it curves the way a hair actually lies rather than along "
-        "a curve somebody chose. 0 = none.",
+        "How many hairs and fibres are lying on the frame, printing as dark "
+        "wandering filaments. **Exact**: one hair is one hair. Each is drawn "
+        "as its own filament with its own direction, curl and taper, so "
+        "raising the count adds hairs and leaves the ones already there "
+        "untouched. 0 = none.",
     ),
     Param(
         "hair_length", "Hair Length", "Film Texture",
         20.0, 600.0, 5.0, 160.0, "px",
-        "How long each hair is, at full resolution -- independent of how many "
-        "there are. It also sets how much a hair wanders over that length, "
-        "because a longer filament follows a broader contour.",
+        "Mean hair length at full resolution -- independent of how many there "
+        "are, and drawn around rather than cut to, so a frame carries long "
+        "fibres and short ones. It also sets how far a hair curls and wanders "
+        "over its own length, because a longer filament bends more.",
         spatial=True,
     ),
     Param(
@@ -1376,7 +1429,10 @@ NEUTRAL_ZERO: tuple[str, ...] = (
     "edge_erosion", "acutance", "edge_soften", "edge_sand", "edge_jitter",
     "halation", "halation_blue", "halation_recovery",
     "micro_blur", "scatter", "aa_strength",
-    "warm_highlights", "cool_shadows",
+    # Both directions of these are an effect, so it is the *magnitude* that has
+    # to be zero -- `is_neutral` takes an absolute value, which is why a
+    # bidirectional control can live in this list at all.
+    "highlight_warmth", "shadow_warmth",
     "global_intensity",
     "global_src_r", "global_src_g", "global_src_b", "global_src_l",
     "sharpen",
