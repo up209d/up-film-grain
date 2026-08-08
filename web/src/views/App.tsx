@@ -204,8 +204,8 @@ export default function App() {
           corner={
             <ExportPanel
               meta={meta}
-              exportSs={exporter.exportSs}
-              onExportSs={exporter.setExportSs}
+              exportKey={exporter.exportKey}
+              onExportKey={exporter.setExportKey}
               format={exporter.format}
               onFormat={exporter.setFormat}
               onExport={exporter.doExport}

@@ -1,6 +1,71 @@
 # Preview and export
 
+## Every export is the preview's look, at full size (2026-08-09, on request)
+
+The menu below is unchanged -- same five entries, same labels, same output
+dimensions. What each one *renders* changed: instead of the source at scale 1.0
+with the factor as its supersample, every entry renders **the preview tier** at
+that supersample and then enlarges the result to the source's own pixel
+dimensions.
+
+Concretely, `run_export` is now `render_tier(up, p, ss, full=False)` followed by
+`imageio.upscale(out, up.h, up.w)`. That is the same call `/api/preview` makes,
+which is the point rather than a convenience: the export is byte-for-byte the
+live preview before the enlargement, so "export what I am looking at" is
+literally true at every setting. Verified across all five factors on a source
+with a 0.5 proxy -- every one writes the source's dimensions and matches
+`upscale(render_tier(...))` at max abs diff **0**.
+
+Why this and not the 1:1 render: a full-resolution render of the same numbers is
+not a sharper version of the preview, it is a *different picture*. Every spatial
+length scales with the frame, so it resolves finer, denser grain -- the two
+reasons are spelled out under "The export scale now defaults to..." below, and
+they have not changed. Making the file disagree with the screen it was judged on
+is the failure this removes.
+
+What it costs, and it is the same trade the old `preview_full` made: **the
+enlargement adds no detail.** Zoomed to 100% the file carries the proxy's
+texture, just bigger. The supersample still buys real quality *within* that
+render -- partial-pixel coverage on every clump -- it just no longer decides
+which tier is rendered. On a source no bigger than `PROXY_LONG_EDGE` the
+question is moot: `up.proxy is up.arr`, `upscale` is a pass-through, and this is
+exactly what the old behaviour did anyway.
+
+### A sixth entry: the real 1:1 render (2026-08-09, same day, on request)
+
+The paragraph above used to end "there is no longer a way to get the frame's own
+finest grain; if that is wanted back it needs its own control". It got one, the
+same day: `Full size W×H / 1:1 SS 1×`, which renders `up.arr` at scale 1.0 with
+`supersample: 1` and has nothing to enlarge. On the wire it is `full: true` on
+`/api/export`; in the UI it is the sixth entry in the same menu.
+
+**It is not the default and that was explicit.** `ss2` -- the previewed frame at
+2× -- still is. This entry is the one file the preview cannot show you, so
+making it the default would reintroduce exactly the disagreement between screen
+and file that the section above removes. `Render 1:1` is how you look at it
+first, and the two are the same pixels because the export goes through
+`render_tier(up, p, ss, True)`, the identical call the 1:1 preview makes.
+
+Two consequences worth knowing:
+
+* **The menu's value is a key, not a factor.** `ss1` and `full` are both 1× and
+  differ only in tier, so `EXPORT_OPTIONS` carries `{key, ss, full}` and
+  `useExport` holds `exportKey`. A number cannot identify an entry any more.
+* **The filename needs its own word.** `_grain_ss1` and the 1:1 render at 1× are
+  the same dimensions and the same factor and differ in the one thing you would
+  keep both files for, so the full tier tags `_grain_full`
+  (`_grain_full_ss2` if the API is asked for a factor the menu does not offer --
+  a full-tier render at any supersample is a coherent request, it is just not
+  one the UI makes).
+
+Verified alongside the five: it writes the source's dimensions, matches
+`render_tier(..., full=True)` at max abs diff **0**, and differs from the
+previewed 1× entry by **153/65535** at peak -- which is the point of having it.
+
 ## Every export is full size (2026-08-08, on request)
+
+*Superseded in part by the section above -- the menu and the output size are as
+described here, the tier it renders is not.*
 
 The export menu used to offer three *scales* -- `full`, `preview` and
 `preview_full` -- and it was asking the wrong question. Its entries differed in
@@ -26,7 +91,9 @@ export the proxy's own look. `preview_full` existed for "the file I am looking
 at, enlarged", and 0.5x is *not* the same thing: it renders the full frame at
 half resolution, where the proxy renders a smaller frame with every length
 scaled to it. If that look is wanted again it needs its own control, not a
-supersample setting.
+supersample setting. *(This is what 2026-08-09 reversed: the proxy's look came
+back as the behaviour of all five entries, and it is the 1:1 render that has no
+control now.)*
 
 Filenames carry the factor (`photo_grain_ss1_5.jpg`) unless it is the default,
 for the reason the old `_grain_2400px` tag existed: two files from one photo

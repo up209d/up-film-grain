@@ -189,14 +189,51 @@ export interface ExportJob {
  *  together: "As previewed" wrote a smaller file *and* a coarser grain, because
  *  every length scales with the frame. Two questions on one control. Below 1
  *  the frame renders smaller than its output and is resampled back up; above,
- *  finer than the output grid and integrated down. */
+ *  finer than the output grid and integrated down.
+ *
+ *  Since 2026-08-09 these five render the **preview tier** and are enlarged to
+ *  the source's dimensions — see `EXPORT_OPTIONS` for the sixth entry, which is
+ *  the one that does not. */
 export const EXPORT_SUPERSAMPLES = [0.5, 1, 1.5, 2, 3] as const;
+
+export interface ExportOption {
+  /** Menu value. A string, not the factor, because the factor no longer
+   *  identifies an entry on its own — `ss1` and `full` both render at 1×. */
+  key: string;
+  ss: number;
+  /** Which tier gets rendered: the proxy the preview shows (`false`, then
+   *  enlarged), or the source itself at 1.0 (`true`, nothing to enlarge). */
+  full: boolean;
+}
+
+/** The export menu, in order.
+ *
+ *  Five preview-tier entries — the file is the picture you judged, enlarged —
+ *  plus **Full size**, added 2026-08-09 on request: a genuine full-resolution
+ *  render at 1× supersampling. That last one is the only entry whose pixels are
+ *  not the preview's, and it is deliberately *not* the default: it resolves
+ *  finer, denser grain than the screen showed, which is a different picture
+ *  rather than a sharper one. */
+export const EXPORT_OPTIONS: readonly ExportOption[] = [
+  ...EXPORT_SUPERSAMPLES.map((ss) => ({ key: `ss${ss}`, ss, full: false })),
+  { key: "full", ss: 1, full: true },
+];
+
+/** Opens on the previewed frame at 2×, unchanged. */
+export const EXPORT_DEFAULT_KEY = "ss2";
+
+export const exportOption = (key: string): ExportOption =>
+  EXPORT_OPTIONS.find((o) => o.key === key) ??
+  EXPORT_OPTIONS.find((o) => o.key === EXPORT_DEFAULT_KEY)!;
 
 export async function startExport(body: {
   id: string;
   params: Record<string, number>;
   format: string;
   supersample: number;
+  /** Render the source at 1.0 instead of the preview tier. Absent means the
+   *  preview tier, which is what five of the six entries ask for. */
+  full?: boolean;
   quality: number;
   reference_mp?: number | null;
   lut?: string | null;

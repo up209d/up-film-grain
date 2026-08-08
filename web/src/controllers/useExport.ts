@@ -5,8 +5,10 @@ import { useState } from "react";
 import type { Values } from "../models/types";
 import {
   downloadUrl,
+  exportOption,
   exportStatus,
   startExport,
+  EXPORT_DEFAULT_KEY,
   type ExportJob,
   type ImageMeta,
 } from "../services/api";
@@ -21,25 +23,33 @@ export function useExport(opts: {
   onError: (msg: string) => void;
 }) {
   const [format, setFormat] = useState("jpeg");
-  /** How finely the export renders. **Not a size choice** -- every export is
-   *  the source's own dimensions now, so this is quality alone.
+  /** Which export entry is selected. **Not a size choice** -- every export is
+   *  the source's own dimensions, so this is quality and tier alone.
+   *
+   *  A key rather than the factor since 2026-08-09, when a sixth entry arrived:
+   *  five render the *preview tier* at their factor and enlarge it, so the file
+   *  matches the frame the settings were judged on, and `full` renders the
+   *  source itself at 1.0. `ss1` and `full` are both 1x, so the number can no
+   *  longer say which one was picked.
    *
    *  Its own state rather than the Quality picker's, because the two are
    *  answering different questions: that one trades preview latency for
    *  fidelity while you work, and a file you are going to keep should not
-   *  inherit whatever you left it on. Defaults to 2, which is what every preset
-   *  was dialled in against. */
-  const [exportSs, setExportSs] = useState(2);
+   *  inherit whatever you left it on. Opens on the previewed frame at 2x, which
+   *  is what every preset was dialled in against. */
+  const [exportKey, setExportKey] = useState(EXPORT_DEFAULT_KEY);
   const [job, setJob] = useState<ExportJob | null>(null);
 
   const doExport = async () => {
     if (!opts.meta) return;
     try {
+      const opt = exportOption(exportKey);
       const id = await startExport({
         id: opts.meta.id,
         params: opts.values,
         format,
-        supersample: exportSs,
+        supersample: opt.ss,
+        full: opt.full,
         quality: 95,
         reference_mp: opts.scaleToRef ? opts.referenceMp : null,
         lut: opts.lut,
@@ -62,5 +72,5 @@ export function useExport(opts: {
     }
   };
 
-  return { format, setFormat, exportSs, setExportSs, job, setJob, doExport };
+  return { format, setFormat, exportKey, setExportKey, job, setJob, doExport };
 }

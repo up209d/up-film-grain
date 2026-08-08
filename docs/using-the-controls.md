@@ -404,12 +404,26 @@ past the filtered result and put roughness back on, 235% of it at the top. Fixed
 
 ## Export
 
-**Every export is full size.** The menu picks the supersample —
-`Full size W×H / SS 0.5× … 3×`, default **2×** — and that is a quality choice,
-not a size one. Below 1 the frame renders smaller than its output and is scaled
-back up; above 1 it renders finer than the output grid and is integrated down,
-which is what gives each grain clump genuine partial-pixel coverage instead of
-a hard, aliased footprint. Cost is roughly the square of the factor.
+**Every export is full size, and every export is what the preview showed you.**
+The menu picks the supersample — `Full size W×H / SS 0.5× … 3×`, default **2×**
+— and that is a quality choice, not a size one. Each entry renders the previewed
+frame at that factor and enlarges the result to the photo's own dimensions, so
+the file matches the picture you dialled the settings in on. Below 1 the frame
+renders smaller than that and is scaled back up; above 1 it renders finer and is
+integrated down, which is what gives each grain clump genuine partial-pixel
+coverage instead of a hard, aliased footprint. Cost is roughly the square of the
+factor.
+
+The enlargement adds no detail — at 100% the file carries the preview's texture,
+just bigger. That is the trade: a fresh full-resolution render of the same
+numbers would be sharper but it would be a *different* picture, with finer and
+denser grain, because every length scales with the frame.
+
+**`Full size W×H / 1:1 SS 1×` is the entry that does that instead** — a genuine
+full-resolution render at 1× supersampling, for when the frame's own finest
+grain is what you are after. It is the only entry whose pixels the preview never
+showed you, which is why it is not the default; hit **Render 1:1** to look at it
+before committing. Its files are tagged `_grain_full`.
 
 Files carry the factor in the name (`photo_grain_ss1_5.jpg`) unless it is the
 default, because now that every export is the same dimensions a folder listing

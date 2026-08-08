@@ -22,18 +22,28 @@ router = APIRouter(prefix="/api")
 def export(body: dict = Body(...)) -> dict:
     """Render and encode a download. **Always at the source's full size.**
 
-    ``supersample`` is the only quality choice now -- 0.5, 1, 1.5, 2 (default)
-    or 3 -- and it picks how finely the frame is rendered, not how big the file
-    is. Below 1 the render happens smaller than the output and is resampled back
-    up; above it, above the output grid and integrated down.
+    ``supersample`` is the only quality choice -- 0.5, 1, 1.5, 2 (default) or 3
+    -- and it picks how finely the frame is rendered, not how big the file is.
+
+    **What gets rendered is the preview tier** (2026-08-09, on request): the
+    proxy at the requested supersample, the identical call ``/api/preview``
+    makes, enlarged afterwards to the source's own dimensions. So the file is
+    the picture that was on screen when the settings were dialled in, rather
+    than a fresh 1:1 render of the same numbers -- which is a *different*
+    picture, finer and denser, because every length scales with the frame. See
+    ``models/export_job.py`` for what that trade costs.
+
+    ``full`` (2026-08-09, on request) opts back out of that for the one caller
+    that wants it: true renders the source itself at scale 1.0 and there is
+    nothing to enlarge. It is the menu's sixth entry and always asks for
+    ``supersample: 1``, but nothing here forces that -- a full-tier render at
+    any factor is a coherent request, it is just not one the UI offers, and
+    hard-coding the pair would make the API narrower than the engine.
 
     It replaced a three-way ``scale`` menu (2026-08-08, on request) whose
-    entries differed in resolution *and* look at the same time: "As previewed"
-    wrote the proxy render, which is a smaller file **and** a coarser grain,
-    because every length scales with the frame. Two things on one control, and
-    only one of them was ever the question being asked. A ``scale`` key in the
-    body is now ignored rather than rejected, so a stale client degrades to a
-    full-size export instead of a 400.
+    entries differed in resolution *and* look at the same time. A ``scale`` key
+    in the body is still ignored rather than rejected, so a stale client
+    degrades to a full-size export instead of a 400.
     """
     up = up_model.get(body.get("id", ""))
     p = up_model.params_for(up, body)
@@ -41,6 +51,7 @@ def export(body: dict = Body(...)) -> dict:
     if fmt not in iio.FORMATS:
         raise HTTPException(400, f"Unknown format {fmt!r}.")
     ss = _clamp_ss(body.get("supersample", 2))
+    full = bool(body.get("full", False))
     quality = max(60, min(100, int(body.get("quality", 95))))
     h, w = up.h, up.w
     job_id = uuid.uuid4().hex[:12]
@@ -50,7 +61,17 @@ def export(body: dict = Body(...)) -> dict:
     # when it is not the default. Same reasoning the old `_grain_2400px` tag
     # had: two files from one photo that differ in a way a folder listing
     # cannot show are worth naming apart.
-    tag = "_grain" if abs(ss - 2.0) < 1e-6 else f"_grain_ss{ss:g}".replace(".", "_")
+    #
+    # The 1:1 render needs its own word for exactly that reason and it is the
+    # sharpest case of it: `_grain_ss1` and a full-tier render at 1x are the
+    # same dimensions and the same factor, and differ in the one thing anybody
+    # would keep both files for.
+    if full:
+        tag = ("_grain_full" if abs(ss - 1.0) < 1e-6
+               else f"_grain_full_ss{ss:g}".replace(".", "_"))
+    else:
+        tag = ("_grain" if abs(ss - 2.0) < 1e-6
+               else f"_grain_ss{ss:g}".replace(".", "_"))
     JOBS[job_id] = {
         "id": job_id, "status": "queued", "progress": 0.0,
         "filename": f"{stem}{tag}.{iio.FORMATS[fmt][1]}",
@@ -58,7 +79,7 @@ def export(body: dict = Body(...)) -> dict:
         "width": int(w), "height": int(h),
     }
     threading.Thread(
-        target=run_export, args=(job_id, up, p, fmt, ss, quality),
+        target=run_export, args=(job_id, up, p, fmt, ss, quality, full),
         daemon=True,
     ).start()
     return {"job": job_id}

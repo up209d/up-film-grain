@@ -104,11 +104,18 @@ FILM_GRAIN_PYTHON=../.venv/bin/python ./build/run.sh
 * **The bar warns when a render is over budget** — 5s on a GPU, 10s on CPU — and
   offers the next factor down. It is the safety net for settings that are
   expensive rather than wrong.
-* **Export always writes full size**, and the menu picks the supersample —
-  `Full size W×H / SS 0.5× … 3×`, default 2×. It is a quality choice, not a size
-  one: below 1 the frame renders smaller than its output and is scaled up, above
-  it renders finer and is integrated down. Cost is roughly the square of the
-  factor. Files carry the factor in the name unless it is the default.
+* **Export always writes full size, and always writes what the preview showed
+  you.** The menu picks the supersample — `Full size W×H / SS 0.5× … 3×`,
+  default 2×. It is a quality choice, not a size one: each entry renders the
+  previewed frame at that factor — below 1 smaller and scaled up, above 1 finer
+  and integrated down — and enlarges the result to the photo's own dimensions.
+  The enlargement adds no detail; it is there so the file matches the picture
+  you judged rather than being a different, finer-grained one. Cost is roughly
+  the square of the factor. Files carry the factor in the name unless it is the
+  default. A sixth entry, `Full size W×H / 1:1 SS 1×`, is the exception: a real
+  full-resolution render at 1×, finer-grained than the preview, tagged
+  `_grain_full` — not the default, because it is the one file the preview cannot
+  show you.
 * **JPEG 95 is the default format** — 100.2% of the grain sigma at 0.43MB
   against 9.82MB for 16-bit PNG, encoded 4:4:4 so chroma grain survives. Choose
   **PNG 16-bit** when the file is going on for further grading.

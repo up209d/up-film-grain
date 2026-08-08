@@ -244,7 +244,7 @@ optional reading before touching the area it covers.
 | [docs/using-the-controls.md](docs/using-the-controls.md) | What each control does, for a user rather than a maintainer — moved out of `README.md` 2026-08-08 |
 | [docs/architecture.md](docs/architecture.md) | Where everything lives after the 2026-08-08 package split, the two import rules that keep it acyclic, and why `Stage.tsx` was left whole |
 | [docs/pipeline-order.md](docs/pipeline-order.md) | Which stages are placed by *position* and what breaks if they move; `pre_blur` vs `micro_blur`; why `master_opacity` lives outside `render()` |
-| [docs/preview-and-export.md](docs/preview-and-export.md) | The client-scaled two-tier preview, and why every export is full size with the supersample as the only choice |
+| [docs/preview-and-export.md](docs/preview-and-export.md) | The client-scaled two-tier preview, and why every export is the preview tier enlarged to full size with the supersample as the only choice |
 | [docs/colour-grading.md](docs/colour-grading.md) | Step −1: LUTs as *resources*, the twelve adjustments, the Shadows/Highlights rewrite, highlight reconstruction — and, filed with them, Tone Response's bidirectional split tone |
 | [docs/halation.md](docs/halation.md) | Blue compensation and why it runs before the wash; highlight recovery metered against real headroom |
 | [docs/edge-destruction.md](docs/edge-destruction.md) | Scatter (diffusion without the average) and anti-aliasing (filter along the contour) |
