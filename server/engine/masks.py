@@ -8,7 +8,8 @@ def _source_masks(m: torch.Tensor) -> tuple[torch.Tensor, ...]:
     """The four visibility envelopes of the source-masked global layers.
 
     ``m`` is the frame **already clamped to 0..1** -- the caller's job, and not
-    optional: `render` leaves `out` unclamped until the very end because step 14
+    optional: `render` leaves `out` unclamped until the very end because the
+    sharpening at step 10
     needs the headroom, and halation routinely drives a channel past 1.0. An
     unclamped envelope would run a layer louder than its own slider in
     highlights and *invert* it wherever a channel had gone negative.
@@ -85,9 +86,15 @@ def _grain_delta(base: torch.Tensor, g: torch.Tensor, mode: int) -> torch.Tensor
 
     Every other mode is computed against ``base`` **clamped to 0..1**, because
     Overlay and friends are only defined there and `out` is deliberately
-    unclamped at this point in the pipeline. The delta is still added to the
-    unclamped frame by the caller, so a blown highlight keeps the headroom step
-    14 relies on instead of being flattened to 1.0 on its way past.
+    unclamped through most of the pipeline. The delta is still added to the
+    unclamped frame by the caller, so a blown highlight keeps the headroom
+    sharpening relies on instead of being flattened to 1.0 on its way past.
+
+    Since 2026-08-09 this layer runs below Film Texture, and Tone Response --
+    which ends in a clamp -- is above that, so in practice the frame arriving
+    here is already inside 0..1. The clamp stays: it is what makes the mode
+    definitions correct rather than incidentally correct, and a stage moving
+    back above the tone curve must not silently change what Overlay means.
 
     A note on the two that are not symmetric about mid grey: Multiply and Screen
     have no neutral value in 0..1 at all -- multiplying by a mid-grey layer

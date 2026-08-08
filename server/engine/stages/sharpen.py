@@ -1,9 +1,16 @@
-"""Output sharpening -- deliberately the last thing before Film Texture.
+"""Output sharpening -- deliberately the last thing in the pipeline.
 
 Extracted from `render()` on 2026-08-08. Its own module rather than folded in
 with the edge stages, because it is its own panel section and because
 `docs/pipeline-order.md` lists its position as load-bearing: run before the
 grain stages it would sharpen a clean image and leave the grain flat.
+
+It was the last thing *before Film Texture*; since 2026-08-09 Film Texture is
+above it, so the dust, the hair and the scratches are part of the
+high-frequency content it amplifies. At the levels the shipped presets carry --
+ten of twelve at `sharpen 12`, against the ~1.2 where this stage's own help text
+says halos start -- that means a visible ring around every mark. Asked for
+outright; see `docs/film-texture/placement.md`.
 """
 
 from __future__ import annotations
@@ -30,6 +37,9 @@ class SharpenMixin:
         #     operation. Run before the grain stages it would sharpen a clean
         #     image and leave the grain flat, which is the opposite of the
         #     intent.
+        #
+        #     Since 2026-08-09 that content includes Film Texture's marks, which
+        #     moved above this stage. A speck is a hard border, so it rings.
         #
         #     Distinct from `acutance`, which is an edge-local development
         #     effect extracted from the *pre-grain* base specifically so it

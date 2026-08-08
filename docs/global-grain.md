@@ -1,6 +1,7 @@
 # Global Grain
 
-The flat overlay applied after everything else, weighted by no image mask.
+The flat overlay applied second-to-last, below Film Texture since 2026-08-09 and
+above nothing but Sharpening, weighted by no image mask.
 Three constructions were tried and two are superseded; each file below is
 the change that replaced the one above it.
 

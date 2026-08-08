@@ -235,3 +235,25 @@ mechanisms are threaded through the pipeline at more than one point. What the
 order can do — and what all three reorgs have done — is put each section next to
 the one it actually interacts with, and this time the answer was that two of
 them were one section.
+
+**Superseded on 2026-08-08**, and left standing above because the reasoning is
+still why the *sections* are grouped the way they are. The pipeline was
+reordered to match the panel rather than the other way round: `render()` now
+runs the sections top to bottom, so a slider near the bottom cannot change
+anything above it. Sections that span several steps still span them — Edge
+Destruction is one block of the render function now rather than five scattered
+ones.
+
+## Global Grain and Sharpening moved below Film Texture (2026-08-09)
+
+`GROUPS` again, and the pipeline with it, since the two are welded together
+after 2026-08-08:
+
+```
+… Anti Aliasing, Halation, Tone Response, Film Texture, Global Grain, Sharpening, Output
+```
+
+Requested outright. The damage layer is no longer the bottom of the panel, so
+the print grain and the output sharpening are read — and applied — after the
+film got dusty. The look consequences are real and are filed with the stage that
+gave up its position: `docs/film-texture/placement.md`.

@@ -33,8 +33,16 @@ class FilmTextureMixin:
         Everything above this point models what the *emulsion* does. This
         models what happened to the piece of film afterwards -- it got dusty,
         it got dragged through a gate, someone's hair landed on the scanner
-        bed, the back came loose. That is why it sits last and is weighted by
-        none of the image masks: a scratch does not care what is underneath it.
+        bed, the back came loose. That is why it is weighted by none of the
+        image masks: a scratch does not care what is underneath it.
+
+        It is **not last** as of 2026-08-09: Global Grain and Sharpening run
+        below it, on request. The half of the old argument that survives is the
+        half that mattered -- the grading stages are still above, so a LUT and a
+        characteristic curve still read a photograph rather than a dusty one.
+        What is below now is the print and the scan, which genuinely do come
+        after the film got dusty. See `docs/film-texture/placement.md` for what
+        it costs.
 
         All four are drawn by thresholding noise addressed in global
         coordinates rather than by scattering objects. Scattering would need a

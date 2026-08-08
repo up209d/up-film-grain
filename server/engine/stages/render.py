@@ -514,29 +514,26 @@ class RenderMixin:
                 self._antialias(_srgb_to_linear(out), p, scale)
             ).clamp(0.0, 1.0)
 
-        # ---- 6. GLOBAL GRAIN ----------------------------------------------
-        #
         # Checkpoint B restores the frame as it stood here -- everything above
         # is skipped on a hit. Safe because nothing but the image crosses this
-        # boundary: `_source_masks` derives from `out`, `_grain_delta` takes
-        # `out`, sharpening is `out + (out - blur(out))*sh`, halation and the
-        # tone curve take `out`, and `_film_texture` takes `out` plus
-        # parameters. See `checkpoint.py`.
-        ck_b = self._ckpt_key("Global Grain", p, scale, y0, x0, h, w)
+        # boundary: halation and the tone curve take `out`, `_film_texture`
+        # takes `out` plus parameters, `_source_masks` derives from `out`,
+        # `_grain_delta` takes `out`, and sharpening is
+        # `out + (out - blur(out))*sh`. See `checkpoint.py`.
+        #
+        # **Named for the section below it, which is Halation as of
+        # 2026-08-09**: the boundary has not moved a statement, but Global Grain
+        # and Sharpening moved out from under it to the bottom of the pipeline,
+        # so the first section it protects is this one. Getting that name off by
+        # one is a stale hit.
+        ck_b = self._ckpt_key("Halation", p, scale, y0, x0, h, w)
         hit_b = None if ck_b is None else self.ckpt.get(ck_b)
         if hit_b is not None:
             out = hit_b
         elif ck_b is not None:
             self.ckpt.put(ck_b, out)
 
-        self._poll_cancel()
-        out = self._global_grain(out, h, w, y0, x0, p, scale)
-
-        # ---- 7. SHARPENING -------------------------------------------------
-        self._poll_cancel()
-        out = self._sharpen(out, p, scale)
-
-        # ---- 8. HALATION ---------------------------------------------------
+        # ---- 6. HALATION ---------------------------------------------------
         #
         # **It blooms the grain now**, which is the scan/print model rather than
         # the film-base one it used to be: the halo is a blur of an already
@@ -559,21 +556,48 @@ class RenderMixin:
                 self._halation(_srgb_to_linear(out), p, scale)
             ).clamp(0.0, 1.0)
 
-        # ---- 9. TONE RESPONSE ----------------------------------------------
+        # ---- 7. TONE RESPONSE ----------------------------------------------
         #
         # Applied to the finished frame. Section 3 already evaluated this same
         # function once as a mask input, to get the density luma the grain band
         # and Shadow Clumping key on -- same function, same photograph, so the
         # two cannot disagree about what "the shadows" are.
+        #
+        # It no longer develops the Global Grain layer, which goes on two
+        # sections below as of 2026-08-09: that layer is not compressed by the
+        # toe or the shoulder and not lifted by base fog. Consistent with this
+        # section already sitting above Film Texture -- the characteristic curve
+        # is what the *negative* does, and neither a speck of dust nor the grain
+        # of the print stock was ever in the negative.
         self._poll_cancel()
         out = self._tone(out, p)
 
-        # ---- 10. FILM TEXTURE ----------------------------------------------
+        # ---- 8. FILM TEXTURE ----------------------------------------------
         #
-        # After everything, masked by nothing -- a speck of dust sits on the
-        # film, it was never in the picture, so it must not be sharpened,
-        # grained or graded along with it.
+        # Masked by none of the image masks -- a scratch does not care what is
+        # underneath it. **No longer last**: Global Grain and Sharpening run
+        # below it as of 2026-08-09, on request, so the print grain lies over
+        # the debris and the unsharp mask bites on it.
         self._poll_cancel()
         out = self._film_texture(out, h, w, y0, x0, p, scale, full_hw)
+
+        # ---- 9. GLOBAL GRAIN ----------------------------------------------
+        #
+        # Below Film Texture, so the four source-masked layers read a frame with
+        # the dust, the hair and the leaks in it and their envelopes follow the
+        # debris -- a black hair pulls the lightness bell down along its length,
+        # a leak drags the hue masks toward its own colour.
+        self._poll_cancel()
+        out = self._global_grain(out, h, w, y0, x0, p, scale)
+
+        # ---- 10. SHARPENING ------------------------------------------------
+        #
+        # Still last, still for its own reason: the high-frequency content an
+        # unsharp mask amplifies is the grain as much as the image. What changed
+        # is that Film Texture is above it now, so the marks are part of that
+        # content -- at the levels the shipped presets carry, this rings every
+        # speck and every hair.
+        self._poll_cancel()
+        out = self._sharpen(out, p, scale)
 
         return out.clamp(0.0, 1.0)

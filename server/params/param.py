@@ -60,10 +60,10 @@ GROUPS: list[str] = [
     "Grain Structure",
     "Edge Destruction",
     "Anti Aliasing",
-    "Global Grain",
-    "Sharpening",
     "Halation",
     "Tone Response",
     "Film Texture",
+    "Global Grain",
+    "Sharpening",
     "Output",
 ]

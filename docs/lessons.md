@@ -1,5 +1,23 @@
 # Things I got wrong, so you don't repeat them
 
+* **"Runs below the checkpoint" does not mean "can be left out of its key"**
+  (caught by `verify.py` on 2026-08-09). Moving Global Grain and Sharpening
+  below Film Texture made the panel and the pipeline agree so exactly that
+  `checkpoint._BELOW` looked like it could finally be a plain `GROUPS` suffix —
+  every section under the boundary, sliced straight off the list. It cannot.
+  `render()` evaluates the characteristic curve **twice**: at section 3 as a
+  mask input, to get the density luma the grain band and Shadow Clumping key on,
+  and at section 7 for real. So `Tone Response` sits below the boundary and is
+  read above it, and dropping its keys made a `brightness` edit come back
+  **2.3e-01** wrong against a cold render — a plausible, wrong photograph, which
+  is the exact failure that cache is built against.
+
+  The condition is "no stage above the boundary reads this section's keys", and
+  it is strictly stronger than a position in the panel. It survived review
+  because the slice *looked* like a tidy-up of a comment that had gone stale for
+  an unrelated reason. The check that caught it re-renders one parameter from
+  every section against a warm cache; keep it exhaustive over sections.
+
 * **`_grain_points` is arithmetic-bound, so restructuring its loop buys
   nothing** (measured and reverted 2026-08-08). It is the single most expensive
   thing in the pipeline — 4.75s of a 7.95s `SuperPortra` proxy on the GPU, 60% —

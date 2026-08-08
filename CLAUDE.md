@@ -131,6 +131,30 @@ slider in a view. Give it `choices=(...)` and it renders as a menu instead;
 the value is still a number everywhere else, so nothing but the one branch in
 `views/controls/ParamControl.tsx` knows the difference.
 
+## Pipeline order (changed 2026-08-09)
+
+`Global Grain` and `Sharpening` moved **below** `Film Texture`, on request, and
+the panel moved with them so `pipeline order == panel order` still holds. The
+order under the checkpoint is now Halation, Tone Response, Film Texture, Global
+Grain, Sharpening.
+
+It is a change of *look*, not a refactor, and a large one: sharpening now bites
+on the marks, and ten of the twelve shipped presets carry `sharpen 12` against
+the ~1.2 where that stage's own help says halos start, so every speck and hair
+comes out ringed. Global Grain's four source-masked layers key on a frame that
+has the debris in it, and that layer is no longer bloomed by halation or
+developed by the characteristic curve. `docs/film-texture/placement.md` has the
+argument and the measurements; nothing in `pad_for` or the caches needed to
+change.
+
+One thing the move surfaced and `checkpoint.py` now states outright: a section
+running below a checkpoint is **not** enough to keep it out of the key. `render()`
+evaluates the characteristic curve at section 3 as a mask input and applies it
+for real at section 7, so `Tone Response` is read above the boundary it sits
+below — taking a plain `GROUPS` suffix there made a `brightness` edit come back
+2.3e-01 wrong. `verify.py` catches it by re-rendering one parameter per section
+against a warm cache.
+
 ## Two invariants that must not break
 
 Both are silent killers: break either and previews still look fine while

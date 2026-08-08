@@ -40,18 +40,23 @@ from ..params.param import GROUPS
 
 #: Sections that run entirely *below* each checkpoint, by name.
 #:
-#: **Derived from execution order, not from `GROUPS`, and that distinction is
-#: currently load-bearing.** The panel order and the pipeline order do not agree
-#: yet -- `Halation` is panel section 8 and runs 5th; `Tone Response` is 9 and
-#: runs 6th (see `docs/pipeline-order.md`). Taking `GROUPS[i:]` would therefore
-#: call Halation and Tone Response "below Global Grain", and a Halation edit
-#: would hit a checkpoint taken before it ran. That renders a plausible, wrong
-#: photograph -- the exact failure this cache has to be built against.
+#: **Derived from execution order, not from `GROUPS`.** The reason used to be
+#: that the panel and the pipeline disagreed about where Halation ran; they have
+#: agreed since the 2026-08-08 reorder, and the distinction is *still*
+#: load-bearing for a second reason that the first one was hiding. A section's
+#: parameters can be read above the boundary by a stage that is not that
+#: section: `render()` evaluates the characteristic curve at section 3 as a mask
+#: input, to get the density luma the grain band and Shadow Clumping key on, and
+#: only applies it for real at section 7. So `Tone Response` is *below* the
+#: boundary and its parameters are consumed *above* it, and taking a plain
+#: `GROUPS` suffix drops them from the key -- measured, a `brightness` edit then
+#: came back 2.3e-01 wrong against a cold render, which is a plausible and wrong
+#: photograph.
 #:
-#: So these are stated rather than sliced, and `verify.py` derives the real
-#: spans from `render()`'s own AST and asserts that nothing listed here is
-#: consumed above its boundary. When the pipeline is reordered to match the
-#: panel, these become plain `GROUPS` suffixes and the check keeps saying so.
+#: `verify.py` catches exactly that by re-rendering one parameter from every
+#: section against a warm cache. Anything added here has to be a section whose
+#: keys nothing above the boundary reads, which is a stronger condition than
+#: "runs below the boundary" and cannot be read off the panel.
 _BELOW: dict[str, frozenset[str]] = {
     # Saved after Pre Sharpen, so what is below it is everything from Grain
     # Structure down. Protects little on the GPU (~17%) and ~24% on the CPU,
@@ -67,13 +72,21 @@ _BELOW: dict[str, frozenset[str]] = {
     "Grain Structure": frozenset(GROUPS[3:]),
     # The valuable one: 89% of the GPU render and 68% of the CPU one sits above
     # it, and 35 sliders sit below.
-    "Global Grain": frozenset(
-        {"Global Grain", "Sharpening", "Film Texture", "Output"}
-    ),
+    #
+    # **Named `Halation` as of 2026-08-09, when Global Grain and Sharpening
+    # moved below Film Texture** and Halation became the first section under the
+    # boundary. The boundary itself did not move a statement.
+    #
+    # `Halation` came with the rename for free -- it always ran below the
+    # checkpoint and was never listed, so its edits were re-rendering everything
+    # above for nothing. `Tone Response` is the one section between the boundary
+    # and the bottom of the pipeline that is deliberately **not** here, for the
+    # double-evaluation reason above: it is applied below, and read above.
+    "Halation": frozenset(GROUPS[6:]) - {"Tone Response"},
 }
 
 #: Boundaries in the order they execute, shallowest first.
-CHECKPOINTS: tuple[str, ...] = ("Grain Structure", "Global Grain")
+CHECKPOINTS: tuple[str, ...] = ("Grain Structure", "Halation")
 
 
 def _downstream(boundary: str) -> frozenset[str]:

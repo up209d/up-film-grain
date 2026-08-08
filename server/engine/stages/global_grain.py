@@ -290,8 +290,12 @@ class GlobalGrainMixin:
         Extracted from `render()` on 2026-08-08 so the pipeline body reads as
         a sequence of sections. Bit-identical to the inline version.
         """
-        # 13. Global grain -- five overlay layers, applied last. The first is
-        #     masked by nothing; the other four by the picture itself.
+        # 9. Global grain -- five overlay layers, applied second to last, below
+        #     Film Texture since 2026-08-09. The first is masked by nothing; the
+        #     other four by the picture itself -- and "the picture" now includes
+        #     the dust, the hair and the leaks, so the envelopes follow the
+        #     debris. Right for a layer that models the print stock and the
+        #     scan: that pass sees the marks.
         #
         #     Everything above is masked: by the luminance band, by the edge
         #     envelope, by the smooth-area guard. That is emulsion behaviour,
