@@ -3,7 +3,7 @@
   "version": 1,
   "name": "VintageLight",
   "reference_mp": 24,
-  "lut": "UPVintage",
+  "lut": "UP-Vintage",
   "values": {
     "grade_recover": 0,
     "grade_recover_radius": 32,
@@ -86,7 +86,8 @@
     "sharpen": 12,
     "sharpen_radius": 0.8,
     "dust": 222,
-    "dust_size": 23.05,
+    "dust_balance": 0.8,
+    "dust_size": 12,
     "dust_opacity": 1,
     "dust_opacity_var": 0.89,
     "dust_lum_var": 1,

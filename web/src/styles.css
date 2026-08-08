@@ -194,7 +194,7 @@ body {
 
 /* ---------------------------------------------------------------- panel -- */
 .panel {
-  flex: 0 0 330px;
+  flex: 0 0 350px;
   background: var(--panel);
   border-left: 1px solid var(--line);
   padding: 12px;

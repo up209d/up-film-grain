@@ -552,10 +552,10 @@ PARAMS: list[Param] = [
         0.0, 1.0, 0.01, 0.6, "",
         "How far grain is cut in deep blacks.",
     ),
-    # `seed` stays last in the group, under everything it rerolls -- the same
-    # place `Texture Seed` and `Global Seed` sit in theirs. It is the control
-    # reached for least often, so the six above go in front of it rather than
-    # literally at the bottom of the list.
+    # `seed` sits under everything it rerolls -- the same place `Texture Seed`
+    # and `Global Seed` sit in theirs -- so the six above go in front of it.
+    # It is no longer *last* in the group: the three placement controls below
+    # it were moved here on request 2026-08-06 and the ask named this position.
     Param(
         "seed", "Seed", "Grain Structure",
         0.0, 9999.0, 1.0, 1234.0, "",
@@ -564,26 +564,35 @@ PARAMS: list[Param] = [
         "displacement, the film-texture marks -- is offset from this one, so "
         "moving it rerolls the whole frame without changing any look.",
     ),
-    # ----------------------------------------------------------------- edge
+    # Where the grain lands, as opposed to what it is made of. All three
+    # multiply the grain field at step 10 and none of them destroy an edge, so
+    # they read as the tail of Grain Structure the way the luminance band does.
+    # `highpass_radius` is the one with a foot in both camps -- the edge mask it
+    # sizes also feeds Edge Erosion and Acutance -- and it follows the two
+    # sliders that are its main consumers rather than staying behind. See
+    # `docs/panel-layout.md`.
     Param(
-        "edge_bias", "Edge Bias", "Edge Destruction",
+        "edge_bias", "Edge Bias", "Grain Structure",
         0.0, 1.0, 0.01, 0.75, "",
         "Pushes grain onto high-contrast micro-edges and away from flat, "
         "smooth areas such as skies.",
     ),
     Param(
-        "smooth_guard", "Smooth-Area Guard", "Edge Destruction",
+        "smooth_guard", "Smooth-Area Guard", "Grain Structure",
         0.0, 1.0, 0.01, 0.85, "",
         "Keeps grain out of genuinely featureless regions -- skin, clear sky, "
         "studio backdrops -- by measuring local contrast over a medium radius "
         "rather than brightness. 0 = off, 1 = smooth areas left clean.",
     ),
     Param(
-        "highpass_radius", "High-Pass Radius", "Edge Destruction",
+        "highpass_radius", "High-Pass Radius", "Grain Structure",
         0.5, 5.0, 0.05, 2.0, "px",
-        "Radius used to isolate micro-edges, at full resolution.",
+        "Radius used to isolate micro-edges, at full resolution. It also sizes "
+        "the mask Edge Erosion and Acutance work through, so widening it "
+        "coarsens those two as well as the grain's edge bias.",
         spatial=True,
     ),
+    # ----------------------------------------------------------------- edge
     Param(
         "edge_erosion", "Edge Erosion", "Edge Destruction",
         0.0, 1.0, 0.01, 0.5, "",

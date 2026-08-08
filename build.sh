@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 
 OUT="build"
 WITH_VENV=0
-CLEAN=0
+CLEAN=1
 for arg in "$@"; do
   case "$arg" in
     --venv)  WITH_VENV=1 ;;

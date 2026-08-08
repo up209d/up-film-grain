@@ -64,6 +64,7 @@
     "sharpen": 12,
     "sharpen_radius": 0.8,
     "dust": 15,
+    "dust_balance": 0.8,
     "dust_size": 9.2,
     "dust_opacity": 0.85,
     "dust_opacity_var": 0.6,

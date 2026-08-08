@@ -3,7 +3,7 @@
   "version": 1,
   "name": "VintageDarkGrainy",
   "reference_mp": 24,
-  "lut": "UPVintage",
+  "lut": "UP-Vintage",
   "values": {
     "grade_recover": 0.85,
     "grade_recover_radius": 20,
@@ -86,7 +86,8 @@
     "sharpen": 12,
     "sharpen_radius": 0.8,
     "dust": 125,
-    "dust_size": 32,
+    "dust_balance": 0.8,
+    "dust_size": 16,
     "dust_opacity": 1,
     "dust_opacity_var": 1,
     "dust_lum_var": 1,

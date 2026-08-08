@@ -49,6 +49,7 @@
     "sharpen": 3.6,
     "sharpen_radius": 1,
     "dust": 0.0,
+    "dust_balance": 0.8,
     "dust_size": 12,
     "scratches": 0.0,
     "scratch_width": 8,

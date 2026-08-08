@@ -3,7 +3,7 @@
   "version": 1,
   "name": "Vintage",
   "reference_mp": 24,
-  "lut": "UPVintage",
+  "lut": "UP-Vintage",
   "values": {
     "grade_temp": -0.35,
     "grade_tint": 0,
@@ -84,6 +84,7 @@
     "sharpen": 12,
     "sharpen_radius": 0.8,
     "dust": 15,
+    "dust_balance": 0.8,
     "dust_size": 9.2,
     "dust_opacity": 0.85,
     "dust_opacity_var": 0.6,

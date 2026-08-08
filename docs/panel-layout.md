@@ -168,6 +168,38 @@ rather than literally at the bottom of the list. It is the control reached for
 least often and burying it under six knees would cost more than the literal
 reading is worth. One line to flip if that reads wrong.
 
+## Three more moved into Grain Structure (2026-08-06)
+
+Same day, same direction, asked for outright: **Edge Bias**, **Smooth-Area
+Guard** and **High-Pass Radius** took `group = "Grain Structure"` and sit
+directly under `seed`. UI only — three `group` strings, no `GROUPS` change, no
+engine change, and `verify.py` keys on parameter values rather than on group
+names so nothing there moved either.
+
+It is the same argument as the Luminance Response merge above and lands the same
+way. Edge Bias and Smooth-Area Guard are not edge destruction: neither of them
+touches an edge. Both build a *weight* that multiplies the grain field at step
+10 — `weight = m * ((1 - eb) + eb * edge)`, then the guard's textured mask —
+sitting in the same expression as the luminance band that moved here for
+precisely this reason. Under Edge Destruction they were filed by the mask they
+read rather than by what they do with it.
+
+`highpass_radius` is the genuinely arguable one and is worth naming as such,
+because it has a foot in both camps: the high-pass mask it sizes also feeds Edge
+Erosion and Acutance, which really are edge destruction. It follows its two main
+consumers here — the ask named it, and a radius belongs beside the sliders whose
+effect you are watching while you drag it — but the help text now says out loud
+that widening it coarsens the other two as well, since the section heading no
+longer hints at that. The alternative reading, leaving it behind under Edge
+Destruction, splits Edge Bias from the radius that determines what "edge" means
+to it, which is worse. One `group` string to flip if that trade reads wrong.
+
+`seed` therefore stops being last in its group, which is a deliberate departure
+from the rule stated just above and from where `Texture Seed` and `Global Seed`
+sit. The ask was specific about the position ("after the Seed slider"), and the
+three are a coherent block of *where the grain goes* that reads worse split
+around a seed.
+
 **The list as a whole is not pipeline-ordered and cannot be**, which is worth
 stating plainly since this is now the third reorg asked for in those terms.
 Edge Destruction alone spans steps 1, 1b, 7b, 8b and 11; Tone Response spans 3
