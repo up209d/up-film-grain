@@ -1,0 +1,33 @@
+/* Custom properties, the reset, and the page itself. */
+
+:root {
+  --bg: #0d0e10;
+  --panel: #16181c;
+  --panel2: #1d2026;
+  --line: #2a2e36;
+  --text: #e6e8ec;
+  --dim: #8b929e;
+  --accent: #d8a05a;
+  --accent2: #c46a4a;
+  /* Mount board behind the previewed photo. Off-white rather than #fff on
+     purpose: a pure-white surround is brighter than any highlight in the
+     picture and drags the eye's white point with it, so highlights read as
+     duller than they are -- which is the one thing you cannot afford to
+     misjudge while dialling in halation. Gallery board is never pure white
+     either, for the same reason. */
+  --mount: #e8e6e0;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 ui-sans-serif, -apple-system, "SF Pro Text", Inter, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app { display: flex; flex-direction: column; height: 100%; }

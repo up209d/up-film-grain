@@ -1,6 +1,6 @@
 ---
 description: Hard invariants, pipeline order, and calibrated constants for the grain engine
-globs: server/engine.py,tests/verify.py,tests/scene.py
+globs: server/engine/**,tests/checks/**,tests/scene.py
 alwaysApply: false
 ---
 

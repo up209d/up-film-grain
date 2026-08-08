@@ -1,0 +1,58 @@
+/* Sections, sliders, menus and the LUT picker. */
+
+/* --------------------------------------------------------------- groups -- */
+.groups { display: flex; flex-direction: column; gap: 2px; }
+.group { border-top: 1px solid var(--line); padding-top: 6px; }
+.group h3 {
+  margin: 0 0 6px; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .7px; color: var(--dim);
+  cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 6px;
+}
+.chev { display: inline-block; transition: transform .12s ease; }
+.chev.open { transform: rotate(90deg); }
+
+.slider { margin-bottom: 9px; }
+/* Discrete parameters render as a menu instead of a track (see the params
+   map in App.tsx). Full width so the row still reads as one control. */
+.slider select { width: 100%; padding: 4px 8px; }
+/* The LUT picker: a menu plus a load button, sat above its own Mix slider. Its
+   own rule only so the pair reads as one control and the hint under a missing
+   LUT does not butt against the slider below it. */
+.lutpick .slabel > .seg { padding: 2px 8px; font-size: 11px; }
+.lutpick .hint { margin-top: 5px; }
+.lutpick { margin-bottom: 11px; }
+.slabel {
+  display: flex; align-items: center; gap: 6px;
+  margin-bottom: 3px; font-size: 12px;
+}
+/* The title and its help badge are one hover target -- see Help() in App.tsx.
+   `flex: 1` keeps the numeric field pinned to the right of the row. */
+.slabel > .title {
+  flex: 1;
+  display: inline-flex; align-items: center; gap: 6px;
+  min-width: 0;
+  cursor: help;
+}
+.slabel em { color: var(--dim); font-style: normal; font-size: 11px; }
+.num {
+  width: 62px; text-align: right;
+  background: var(--panel2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 2px 5px; font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+input[type="range"] {
+  width: 100%; height: 18px; margin: 0;
+  -webkit-appearance: none; appearance: none; background: transparent;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 3px; border-radius: 2px; background: #33383f;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 13px; height: 13px; border-radius: 50%;
+  background: var(--text); border: none; margin-top: -5px;
+}
+input[type="range"]:active::-webkit-slider-thumb { background: var(--accent); }

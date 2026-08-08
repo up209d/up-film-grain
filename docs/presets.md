@@ -67,3 +67,30 @@ Two ways to populate it instead:
 * All at once: `FILM_GRAIN_DEFAULT_REFERENCE_MP=24` makes every preset with no
   recorded size be treated as authored at 24MP.
 
+
+## The scaling factor can be set by hand (added 2026-08-08)
+
+The Size Scaling section offered the computed factor or nothing at all, and
+requested: a manual override. `Auto` / `Manual` sits under the on/off switch,
+and Manual starts at whatever automatic had -- switching to it moves nothing, so
+you adjust from the computed answer rather than being dropped at 1.00x and
+having to find your way back.
+
+Two things about how it is plumbed:
+
+* **The API never learns about it.** The server scales lengths by
+  `sqrt(photo_mp / reference_mp)`, so a hand-set linear factor `f` is exactly the
+  reference size that solves that equation: `reference_mp = photo_mp / f²`. App
+  computes that and hands it to the render and export hooks, while
+  `useValues.referenceMp` goes on holding what the *preset* says. So saving a
+  file still stamps the truth rather than a fudged size derived from a
+  preference.
+* **It is a view choice, not part of the look.** It lives in `App` beside
+  `supersample` and the mount, is not written into a preset file, and does not
+  travel with one. A preset records what size its numbers were authored at,
+  which is a fact about the file; the override is a preference about this
+  session.
+
+It also makes the on/off switch live for a preset that records no size at all --
+a hand-set factor needs no reference to scale against, so the "n/a" state now
+only applies when both are absent.

@@ -36,7 +36,7 @@ server/imageio.py  decode/encode, incl. a hand-written 16-bit RGB PNG encoder
 server/main.py     FastAPI service
 web/src/App.tsx    UI; slider panel generated from GET /api/params
 web/src/api.ts     typed client
-tests/verify.py    engine invariant checks -- run after touching engine.py
+tests/verify.py    the CLI; checks live in tests/checks/, one module per area
 presets/           preset library -- .json files, not code
 run.sh / dev.sh    production-from-source / hot-reload dev
 build.sh           compiles a distribution into build/

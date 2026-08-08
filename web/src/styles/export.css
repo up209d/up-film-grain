@@ -1,0 +1,126 @@
+/* The export row, and the notice/error banners. */
+
+/* ------------------------------------------------------------ cornerbar -- */
+/* The export controls, overlaid on the preview bottom right rather than parked
+   at the foot of the panel -- exporting is the last thing you do to a picture
+   you are looking at, and the panel had it below a scroll. Same furniture as
+   the viewbar in the opposite corner so the two read as a pair.
+
+   One row as of 2026-08-08, on request: it was a four-row column and stood
+   well over 100px tall, which is not a pair with a 34px bar however alike the
+   background and the border are. It wraps for the same reason the viewbar
+   does, so a narrow stage folds it rather than pushing controls off the edge,
+   and `justify-content: flex-end` keeps it hugging the corner it is anchored
+   to when it folds. */
+.cornerbar {
+  position: absolute; z-index: 3; right: 10px; bottom: 10px;
+  display: flex; align-items: center; flex-wrap: wrap;
+  justify-content: flex-end; gap: 4px;
+  max-width: calc(100% - 20px);
+  padding: 4px; border-radius: 8px;
+  background: rgba(10,11,14,.78);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(6px);
+}
+/* "Export" and its help badge, the bar's own name. `.title` carries `flex: 1`
+   for the panel's slider rows, which in a row this short would shove the rest
+   of the controls away from it. */
+.cornerbar .title { flex: 0 0 auto; font-size: 11.5px; cursor: help; margin: 0 0 1px 6px; }
+.cornerbar .seg { padding: 4px 9px; font-size: 11.5px; }
+.cornerbar select { padding: 4px 7px; font-size: 11.5px; }
+/* Sized rather than shrink-wrapped: the labels carry the pixel dimensions, so
+   a content-width menu would change width both with the photo that is open and
+   with the option that is picked, dragging the bar's left edge about while it
+   is being read.
+
+   250px is measured, not guessed, and the first attempt at 214 clipped the
+   longest label to "As previewed, full size — 1344×7". "As previewed, full
+   size — 12000×8000" is 209px of text in this face at this size; the rest is
+   14px of padding, the ~20px native menu arrow and the border. A select does
+   not ellipsise, it simply cuts, so anything short here loses the dimensions
+   the label exists to carry. */
+.cornerbar .xscale { width: 250px; }
+.cornerbar .export-go { padding: 5px 12px; font-size: 11.5px; }
+/* The same rule the viewbar uses between its groups, so the two corners are
+   punctuated identically. */
+.cornerbar .vsep {
+  width: 1px; align-self: stretch; margin: 1px 3px;
+  background: var(--line);
+}
+/* In-flight export, inline. The bar is fixed-width elsewhere, so this is too:
+   a progress readout that grows as the percentage gains a digit would nudge
+   everything to its left. */
+.cornerbar .job { flex: 0 0 auto; font-size: 11px; gap: 6px; }
+.cornerbar .pbar { flex: 0 0 64px; }
+.cornerbar .job > span { min-width: 78px; font-variant-numeric: tabular-nums; }
+/* An error is the one thing here allowed to break the single line -- it is a
+   sentence, and truncating it to hold the shape would be trading the message
+   for the furniture. It takes a row of its own instead.
+
+   `order` rather than DOM position: it is rendered where it belongs, next to
+   the button that caused it, and a failure that appeared mid-bar would push
+   everything after it -- the collapse switch -- onto a *third* row. Ordered
+   last, the controls keep their single line and the message sits under them. */
+.cornerbar .err {
+  order: 99; flex: 1 1 100%;
+  font-size: 11px; padding: 5px 8px;
+}
+
+/* --------------------------------------------------------------- export -- */
+/* The `.export` row and the full-width `.export-go` that used to live here went
+   with the column layout above: two stacked selects and a button on their own
+   line are exactly the shape a one-row bar does not have. Everything the export
+   controls need is now in the `.cornerbar` rules. */
+
+.job { display: flex; align-items: center; gap: 8px; color: var(--dim); font-size: 11.5px; }
+.pbar { flex: 1; height: 4px; background: #2a2e36; border-radius: 2px; overflow: hidden; }
+.pbar > div { height: 100%; background: var(--accent); transition: width .2s ease; }
+
+.err {
+  background: #3a1d1d; border: 1px solid #6b2f2f; color: #ffbcbc;
+  padding: 7px 9px; border-radius: 6px; font-size: 12px;
+}
+
+/* Confirmations for actions with no visible result of their own -- a browser
+   download in particular is completely silent. Not an error, so not red. */
+.note {
+  margin: 0;
+  background: var(--panel2); border: 1px solid var(--line); color: var(--dim);
+  padding: 6px 9px; border-radius: 6px; font-size: 11.5px; line-height: 1.4;
+  word-break: break-word;
+}
+
+/* ------------------------------------------------------------- secmenu -- */
+/* The pipeline-section jump list, beside the collapse switch. Anchored to its
+   own button rather than to the bar, so it stays under it when the bar wraps.
+   It opens upwards: the bar is 10px off the bottom of the stage and a menu
+   dropped downwards would open past the window. */
+.secmenu { position: relative; display: inline-flex; }
+.cornerbar .seg.secmenu-btn {
+  width: 26px; padding: 4px 0;
+}
+.cornerbar .seg.secmenu-btn > svg {
+  width: 15px; height: 15px;
+  display: block; margin: 0 auto;
+}
+.secmenu-list {
+  position: absolute; z-index: 4;
+  bottom: calc(100% + 6px); right: 0;
+  min-width: 190px; max-height: 60vh; overflow-y: auto;
+  display: flex; flex-direction: column;
+  padding: 4px; border-radius: 8px;
+  background: rgba(10,11,14,.94);
+  border: 1px solid var(--line);
+  box-shadow: 0 8px 24px rgba(0,0,0,.5);
+  backdrop-filter: blur(6px);
+}
+/* Left-aligned and full width: this is a list of names to read down, not a row
+   of buttons, so the labels have to share a left edge. */
+.secmenu-item {
+  appearance: none;
+  background: none; border: 0; border-radius: 5px;
+  padding: 6px 9px;
+  color: var(--text); font: inherit; font-size: 11.5px;
+  text-align: left; white-space: nowrap; cursor: pointer;
+}
+.secmenu-item:hover { background: var(--panel2); color: var(--accent); }

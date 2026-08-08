@@ -1,0 +1,160 @@
+/* The preview: panes, the mount board, and the view bar. */
+
+/* ----------------------------------------------------------------- body -- */
+.body { display: flex; flex: 1; min-height: 0; }
+
+/* The two chequer tones come in as custom properties from `boardTones()`, so
+   the lightness is adjustable from the panel while the pattern itself stays
+   here. The fallbacks are the tones this was hard-coded to before it moved. */
+.stage {
+  flex: 1; min-width: 0;
+  display: flex; align-items: stretch;
+  background:
+    repeating-conic-gradient(
+      var(--board-a, #141519) 0% 25%,
+      var(--board-b, #101115) 0% 50%
+    ) 50% / 22px 22px;
+  overflow: hidden;
+  position: relative;
+}
+.stage.grab .panes { cursor: grab; }
+.stage.grab .panes:active { cursor: grabbing; }
+
+/* One pane in overlay mode, two in side-by-side. Each clips its own image, so
+   a pane is the viewport the fit zoom is computed against. */
+.panes { flex: 1; min-width: 0; display: flex; gap: 2px; }
+.pane { flex: 1; min-width: 0; position: relative; overflow: hidden; }
+.stage.side .pane + .pane { border-left: 1px solid var(--line); }
+
+/* Position and size come from JS -- the image is placed in source pixels
+   times the zoom, not fitted by CSS, so both panes land on identical
+   coordinates. */
+.frame {
+  position: absolute;
+  display: block;
+  user-select: none;
+  max-width: none; max-height: none;
+}
+
+.tag {
+  position: absolute; z-index: 2; top: 8px; left: 8px;
+  padding: 2px 7px; border-radius: 4px;
+  background: rgba(10,11,14,.72); border: 1px solid var(--line);
+  color: var(--dim); font-size: 10.5px; letter-spacing: .5px;
+  text-transform: uppercase; pointer-events: none;
+}
+
+/* The mount board and its drop shadow. Both are spread box-shadows drawn from
+   this element's box, which is sized to exactly the same rect as the images --
+   so it occupies no layout and cannot shift the geometry the zoom anchoring is
+   computed from. It sits under the images in DOM order and is pure furniture,
+   so it takes no pointer events and never eats a drag.
+
+   The fill matters despite being covered by the image: `place()` produces
+   fractional left/top at most zooms, and a board drawn only as a ring leaves a
+   subpixel seam of dark background between itself and the image edge. */
+.mount {
+  position: absolute;
+  pointer-events: none;
+  background: var(--mount);
+}
+
+.divider {
+  position: absolute; top: 0; bottom: 0; width: 1px;
+  background: rgba(255,255,255,.75);
+  box-shadow: 0 0 0 1px rgba(0,0,0,.45);
+  pointer-events: none;
+}
+
+/* Zoom controls, overlaid on the preview rather than parked in the panel --
+   they act on what is directly under them. */
+.viewbar {
+  position: absolute; z-index: 3; top: 10px; right: 10px;
+  display: flex; gap: 4px;
+  padding: 4px; border-radius: 8px;
+  background: rgba(10,11,14,.78);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(6px);
+}
+.viewbar .seg { padding: 4px 9px; font-size: 11.5px; }
+/* The bar carries compare, wipe and zoom now, so it can outgrow a narrow
+   stage. Wrapping keeps it usable there instead of pushing controls off the
+   edge; `justify-content: flex-end` keeps it hugging the right as it does. */
+.viewbar { flex-wrap: wrap; justify-content: flex-end; max-width: calc(100% - 20px); }
+/* Spinner placeholder: reserves space even when not spinning, so the bar
+   doesn't shift width when rendering starts/stops. */
+.spinner-placeholder {
+  flex: 0 0 16px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 1px 4px 0 4px;
+}
+.spinner-icon {
+  width: 20px;
+  height: 20px;
+  border: 1.5px solid rgba(139, 146, 158, 0.25);
+  border-radius: 50%;
+  animation: none;
+}
+.spinner-placeholder.active .spinner-icon {
+  border: 1.5px solid rgba(216, 160, 90, 0.3);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+/* Thin rule between the view-comparison group and the zoom group. */
+.viewbar .vsep {
+  width: 1px; align-self: stretch; margin: 1px 3px;
+  background: var(--line);
+}
+.viewbar .swap { flex: 0 0 auto; padding: 4px 9px; font-size: 11.5px; border-radius: 6px; }
+.viewbar .wipe { width: 96px; align-self: center; }
+.viewbar .wipe:disabled { opacity: .4; }
+.viewbar .framew { width: 72px; align-self: center; }
+/* Shown only while the view is enlarged past what the proxy can resolve. */
+.viewbar .fid {
+  display: inline-flex; align-items: center;
+  padding: 0 8px; border-radius: 5px;
+  background: #4a3410; border: 1px solid #7a5715; color: #f0c674;
+  font-size: 10.5px; letter-spacing: .5px; text-transform: uppercase;
+}
+.viewbar .seg.icon { width: 28px; padding: 4px 0; font-size: 14px; line-height: 1; }
+/* Heroicons ship at 24px with `currentColor`, so they inherit the button's
+   colour and its disabled dimming for free -- only the size has to be set. */
+.viewbar .seg.icon > svg {
+  width: 15px; height: 15px;
+  display: block; margin: 0 auto;
+}
+.viewbar .zoomval { min-width: 52px; font-variant-numeric: tabular-nums; }
+
+/* Fold the bar away to just its chevron. Both overlay bars carry this, so the
+   rule is written for either -- collapsed, the bar is the button and nothing
+   else, which is the smallest thing that can still be found and clicked. */
+/* `.seg.bartoggle` rather than `.bartoggle`: it has to outrank both
+   `.viewbar .seg.icon` here and `.cornerbar .seg` in export.css, which is
+   imported after this file. */
+.viewbar .seg.bartoggle,
+.cornerbar .seg.bartoggle {
+  flex: 0 0 auto;
+  width: 24px; padding: 4px 0;
+  align-self: center;
+  opacity: .75;
+}
+.viewbar .seg.bartoggle:hover,
+.cornerbar .seg.bartoggle:hover { opacity: 1; }
+.cornerbar .seg.bartoggle > svg {
+  width: 15px; height: 15px;
+  display: block; margin: 0 auto;
+}
+.viewbar.collapsed,
+.cornerbar.collapsed { padding: 2px; }
+
+.stage.empty { border: none; align-items: center; justify-content: center; }
+.drop {
+  display: flex; flex-direction: column; gap: 6px; align-items: center;
+  padding: 46px 60px;
+  border: 1px dashed var(--line); border-radius: 10px;
+  color: var(--dim);
+}
+.drop strong { color: var(--text); font-size: 15px; font-weight: 600; }

@@ -165,3 +165,76 @@ Verified against a real running instance rather than by inspection: every
 section reads muted on a fresh load, picking a preset flips all twelve to
 enabled in one render, and loading a preset file from disk does the same.
 
+
+## Undo/redo, and four smaller panel moves (added 2026-08-08)
+
+### Undo/redo is *observed*, not called (`useHistory`)
+
+Requested with two buttons on the preview's overlay bar and no shortcut. The
+part worth reading for is that **nothing calls into the history**. `useValues`
+has ten ways to change a value -- slider, number field, menu, preset, file,
+mute toggle, per-section reset, seed reroll, LUT pick, master reset -- and a
+history each of them had to remember to `push()` to would be one new mutator
+away from a hole in it permanently. `useHistory` instead watches the committed
+state and records the transitions it sees, so an edit added tomorrow is
+undoable the day it is written.
+
+Three things that are not free choices:
+
+* **It watches `applied`, not `values`.** `applied` only moves when a gesture is
+  finished, so a slider drag is one step rather than one per pixel of travel --
+  for free, out of a distinction the renderer already needed. The known
+  coarseness at the other end: a typed number and an arrow-key nudge each commit
+  per keystroke, so each is its own step. That is the granularity the renderer
+  sees too, and collapsing it would mean guessing where one edit ends.
+* **`muted` is recorded but does not *trigger* a step.** Mid-drag, touching a
+  control in a muted section un-mutes it a render *before* the release commits.
+  Treating that as its own transition files a state that was never on screen
+  (section live, values not yet applied), and undo lands you on it. It is read
+  at push time instead, so the step that does get filed carries the right one.
+* **A snapshot is all four of `values`, `muted`, `referenceMp`, `lut`.**
+  Restoring three of the four leaves a state the user never had -- undoing a
+  preset back to Stock with the previous look's LUT still riding under it.
+
+Equality is by object *identity*, not deep comparison: every path in
+`useValues` builds a fresh object for a real change, so a shared reference means
+nothing happened, and it makes the check cheap enough to run on every commit.
+
+The stacks are refs with a counter to force re-renders, not `useState` arrays.
+`undo` has to read and write them and then call `restore` in one go, and a state
+updater doing that runs its side effect twice under StrictMode.
+
+**Opening a photo clears the history**, on request -- a step describing a render
+that no longer exists is not somewhere you can go back to. It is keyed on
+`meta.id` and handled *inside the same effect that records steps*, rather than
+as a `reset()` the uploader calls, and that is the whole subtlety: opening a
+photo swaps the image and rerolls the seeds in one commit, so a `reset()` called
+from the handler runs *before* the effect that records the reroll and leaves it
+behind as the one undoable step on a freshly opened image. Checking the key
+first inside the effect makes the post-reroll state the new baseline instead.
+
+### The rest of the batch
+
+* **`Random Seed` in the top bar**, beside the filename. The same reroll the
+  `With random seed` checkbox does on open, on demand: a seed is not a quantity
+  you dial in, it is one you keep drawing until the grain falls somewhere you
+  like. Shown only with a photo loaded, for the same reason the filename is.
+* **Preview background lightness**, in the panel under Preview fidelity. The
+  chequerboard's two tones are now `--board-a`/`--board-b` custom properties fed
+  from `boardTones()`; the gradient itself stays in the stylesheet. Lightness
+  only -- hue and saturation stay put, because a coloured surround pulls the
+  photo's apparent white balance with it, which is the same misjudgement the
+  mount is off-white to avoid. It exists because the eye sets its black point
+  from the whole field of view, so the same photo reads contrastier against
+  near-black than against grey, and one fixed backdrop is one fixed opinion.
+* **The export controls moved to a `cornerbar`**, overlaid bottom right, on the
+  reasoning that moved Compare and Wipe to the top-right one: exporting is the
+  last thing you do to a picture you are looking at, and it was below a scroll
+  in the panel. The three paragraphs that ran under the scale menu are behind a
+  help badge now -- reasonable to scroll past in a side panel, unreasonable laid
+  over the picture, worth keeping either way. `Stage` takes the overlay as an
+  opaque `corner: ReactNode` so it does not have to know what an export job is.
+* **Collapse/expand all pipeline sections**, a single button in that same corner
+  overlay. Which way it goes is never in doubt because it reads the panel in
+  front of you: "Collapse all" while anything is open, "Expand all" once
+  everything is shut.

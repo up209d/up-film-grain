@@ -1,10 +1,12 @@
 # Film Grain Engine
 
-![Film grain sample](web/src/assets/film-grain-16x9.jpg)
+![Film grain sample](film-grain-16x9.jpg)
 
 Organic film grain, edge destruction and halation for still photographs.
 Python/PyTorch image service behind a React UI. See `TOPIC.md` for the domain
 rules and pipeline design.
+
+![Film grain sample](screenshot.jpg)
 
 ## Requirements
 
@@ -506,28 +508,44 @@ what the renderer accepts.
 
 ```
 server/
-  params.py    parameter schema -- single source of truth for engine and UI
-  engine.py    the grain pipeline (see module docstring for the invariants)
-  imageio.py   decode/encode, including a 16-bit RGB PNG writer
-  lut.py       .cube 3D LUT loading, from the folder and from an upload
-  main.py      FastAPI service
+  params/        parameter schema -- single source of truth for engine and UI
+  engine/        the grain pipeline (see package docstring for the invariants)
+    constants/     every calibrated number, grouped by the stage that reads it
+    stages/        one mixin per pipeline stage
+    noise/         hashed lattice, grain point field, smooth fields
+    tiling.py      supersampling, padding, tile sizing, render entries
+  models/        Upload and export jobs
+  services/      the one render path both preview tiers take
+  controllers/   FastAPI routers, one per area
+  runtime.py     device, engine and the render lock
+  imageio.py     decode/encode, including a 16-bit RGB PNG writer
+  lut.py         .cube 3D LUT loading, from the folder and from an upload
+  main.py        app assembly
 web/src/
-  App.tsx      UI, schema-driven slider panel
-  api.ts       typed client
-presets/       preset library -- files, not code
-luts/          3D LUTs -- drop a .cube in and it is in the menu
+  models/        value-set rules and view constants
+  services/      typed client
+  controllers/   hooks: schema, values, preview, export, upload, luts
+  views/         App composes panels/, stage/, controls/
+presets/         preset library -- files, not code
+luts/            3D LUTs -- drop a .cube in and it is in the menu
 ```
+
+`docs/architecture.md` has the reasoning behind this layout.
 
 ## Verify
 
 ```bash
-pipenv run python tests/verify.py
+pipenv run python tests/verify.py                 # everything, in parallel (~36s)
+pipenv run python tests/verify.py edges scatter   # only those modules
+pipenv run python tests/verify.py -l              # list the modules
 ```
 
 Checks tile independence, crop fidelity, colour pass-through, luminance
 response, edge bias, scatter, blue compensation, the colour-grading section and
-its `.cube` parsing, and 16-bit PNG validity — 188 checks. Run it after
-touching `server/engine.py`; it exits non-zero on failure.
+its `.cube` parsing, and 16-bit PNG validity — 349 checks across 17 modules.
+Run it after touching anything under `server/engine/`; it exits non-zero on
+failure. Naming modules runs only those, which is how you keep the loop short
+while working — see [docs/testing.md](docs/testing.md).
 
 ## Invariants worth not breaking
 

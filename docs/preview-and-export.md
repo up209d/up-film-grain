@@ -154,3 +154,15 @@ against a source *below* the threshold and confirmed all three collapse to
 the plain `_grain` tag and an identical byte size, matching the existing
 "both options render the same pixels" case extended to three.
 
+
+### The export scale now defaults to "As previewed, full size" (2026-08-08)
+
+`exportScale` opens on `preview_full` rather than `full`, on request. The
+reasoning is the section above read from the user's end: what you dialled in is
+what the preview showed you, so the file that matches it is the one that starts
+from those pixels and enlarges them. A full-size render of the same numbers is
+not a sharper version of that picture, it is a *different* one -- finer, denser
+grain, for the two reasons listed above -- so having it be the default made the
+exported file quietly disagree with the screen it was judged on. `full` is still
+there and still the right answer when you want the frame's own finest grain;
+`Render 1:1` is how you look at it before committing.

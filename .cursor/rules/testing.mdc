@@ -7,10 +7,16 @@ alwaysApply: false
 # Verification
 
 ```bash
-pipenv run python tests/verify.py
+pipenv run python tests/verify.py                 # everything, in parallel (~36s)
+pipenv run python tests/verify.py edges scatter   # only those modules
+pipenv run python tests/verify.py -l              # list the modules
+pipenv run python tests/verify.py -j 1            # one process, for a traceback
 ```
 
-Exits non-zero on failure. Run it after touching `server/engine.py`. It checks
+Exits non-zero on failure. Run it after touching anything under
+`server/engine/`. The checks live in `tests/checks/`, one module per area, and
+naming modules runs only those -- that is how you keep the loop short while
+working. `docs/testing.md` has the module table. It checks
 both hard invariants (tile independence, scale invariance) plus zoom fidelity,
 colour pass-through, luminance response, edge bias, the smooth-area guard,
 16-bit PNG validity, and each stage that ships at 0 (global grain, edge
@@ -30,5 +36,15 @@ every *other* stage that could contribute to the same measurement — e.g. the
 sanding check failed first time because `edge_jitter` defaults to 0.3 and was
 adding its own wander. Zero unrelated amounts explicitly.
 
-Note: `verify.py` has ~67 static `check()` call sites; the "79 checks" figure in
-`CLAUDE.md`/`README.md` counts loop iterations, so the printed total is higher.
+## Adding a module
+
+Drop it in `tests/checks/`, decorate `run(cx)` with `@suite(name, title)`, list
+it in `tests/checks/__init__.py` (`ORDER` is both the print order and the import
+list) and give it a `COST` entry in `runner.py` so the pool starts it early
+enough. Shared scenes belong on `Ctx` in `harness.py`, not copied per module --
+several modules are measured against the same smooth-patch sigma and the same
+"everything else off" dict, and copies that drifted apart would make them
+disagree about what they had switched off.
+
+Note: the static `check()` call-site count is lower than the printed total,
+which counts loop iterations.

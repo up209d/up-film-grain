@@ -1,0 +1,77 @@
+/* The control panel and the size-scaling readout. */
+
+/* ---------------------------------------------------------------- panel -- */
+.panel {
+  flex: 0 0 350px;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  padding: 12px 18px 12px 14px;
+  overflow-y: auto;
+  display: flex; flex-direction: column; gap: 10px;
+}
+
+.row { display: flex; gap: 6px; }
+.row > * { flex: 1; }
+
+.hint { margin: 0; color: var(--dim); font-size: 11.5px; line-height: 1.4; }
+
+.film-grain-preview {
+  width: 100%;
+  height: auto;
+  border-radius: 8px;
+  object-fit: cover;
+  margin-bottom: 12px;
+}
+/* The size-scaling readout: three numbers and the factor, always on show. */
+.scalebox {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 9px;
+  font-variant-numeric: tabular-nums;
+}
+.scalebox strong { color: var(--text); }
+
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field > label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .6px; }
+.fieldbody { display: flex; align-items: center; gap: 8px; }
+.fieldbody input[type="range"] { flex: 1; }
+.val { color: var(--dim); min-width: 46px; text-align: right; font-variant-numeric: tabular-nums; }
+
+button, select, .btn {
+  background: var(--panel2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+button:hover:not(:disabled), .btn:hover { border-color: #3a404a; }
+button:disabled { opacity: .45; cursor: default; }
+.btn { display: inline-flex; align-items: center; justify-content: center; }
+.btn.dropping { border-color: var(--accent); color: var(--accent); border-style: dashed; }
+.btn.primary { background: var(--accent); color: #1a1206; border-color: var(--accent); font-weight: 600; }
+.btn.ghost { background: transparent; }
+.seg.on { background: var(--accent); color: #1a1206; border-color: var(--accent); font-weight: 600; }
+
+/* ---------------------------------------------------------------- zoom -- */
+/* Per-section reset and on/off, in the group header. */
+.grpbtn {
+  width: 18px; height: 18px; padding: 0;
+  border-radius: 4px;
+  background: var(--panel2); border: 1px solid var(--line);
+  color: var(--dim); font-size: 11px; line-height: 1;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: 0 0 auto;
+}
+/* The first of the pair takes the slack, so both sit hard right. */
+.grpbtn:first-of-type { margin-left: auto; }
+.grpbtn:hover { color: var(--text); border-color: var(--accent); }
+.grpbtn.on { background: var(--accent); color: #1a1206; border-color: var(--accent); }
+
+.swap {
+  flex: 0 0 68px;
+  background: var(--panel2); border: 1px solid var(--line);
+  font-weight: 600; letter-spacing: .2px;
+}
+.swap.on { background: #e8ecf2; color: #14161a; border-color: #e8ecf2; }
