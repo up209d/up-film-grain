@@ -1,4 +1,109 @@
-# Edge destruction: scatter and anti-aliasing
+# Edge destruction
+
+## Soft edges were invisible, and the radius was the reason (2026-08-09)
+
+Reported as "even if I crank Edge Bias and Edge Sensitivity to max it still
+ignores a lot of edges, especially the edge between human skin and a light
+background". Both thresholds were the wrong suspects, and the report named the
+diagnostic case precisely.
+
+**A skin/background boundary is a big edge and a soft one.** Measured on
+skin (0.72, 0.56, 0.47) against a light background: 0.264 of luma step, far above
+every gate in the section. What it is not is *narrow* -- shot at any real
+aperture it ramps over tens of pixels -- and every measurement in this section is
+a high-pass, which by construction only responds to structure **finer** than its
+radius. The edge mask's peak on that boundary, by ramp width and radius:
+
+| ramp | r=1 | r=2 | r=5 | r=12 | r=30 |
+|---|---|---|---|---|---|
+| 1px | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| 12px | 0.187 | 0.400 | 1.000 | 1.000 | 1.000 |
+| 30px | 0.075 | 0.160 | 0.406 | 0.974 | 1.000 |
+| 60px | 0.037 | 0.080 | 0.203 | 0.488 | 1.000 |
+
+No threshold can rescue that. `edge_sensitivity` multiplies the response, so
+4x on a 60px ramp at the old default radius reaches 0.32 -- while promoting every
+scrap of noise elsewhere by the same factor. The radius is the control that
+decides *what is an edge*, and both of them were capped an order of magnitude
+below what a photograph contains.
+
+**There are two radii, and they serve different stages.** This cost an hour of
+measuring the wrong one:
+
+* `highpass_radius` builds the shared `edge` mask -- jitter, sanding, erosion,
+  and the grain's own edge bias. Raised 5 -> **24**. On a 30px skin ramp, jitter
+  goes 0.09 -> 2.89 8-bit levels; on 60px, 0.02 -> 0.79. Costs 2.09x overdraw at
+  24MP at the top, which is where the other radii here are capped.
+* `edge_soften_radius` is Edge Softening's own, and softening reads **nothing
+  else** -- not `highpass_radius`, not `edge_sensitivity`. Raised 8 -> **64**.
+  It is simultaneously the gate's measurement scale and the blur's reach, which
+  is why the two cannot be separated: an edge wider than the radius is not being
+  under-softened, it is not being *seen*.
+
+| ramp | sr=2 | sr=8 | sr=16 | sr=32 | sr=64 |
+|---|---|---|---|---|---|
+| 12px | 0.04 | 2.26 | 8.79 | 14.69 | 18.15 |
+| 30px | 0.01 | 0.01 | 0.96 | 6.53 | 13.07 |
+| 60px | 0.00 | 0.00 | 0.01 | 0.96 | 6.53 |
+| 100px | 0.00 | 0.00 | 0.00 | 0.04 | 1.94 |
+
+Softening's is the cheaper of the two to widen -- it enters `pad_for` once
+rather than through the high-pass's 3.3x multiplier -- so 64 costs 1.82x
+overdraw against 1.24x at the default.
+
+## The masks were luma-only, and that is why they missed edges (2026-08-09)
+
+Reported as "edge softening is still not targeting all edges... in fact the
+whole Edge Destruction section is not targeting all edges in general", and it
+was exactly right.
+
+Every mask in the family came from `lum_ref = _luma(img)`, a Rec.709 weighted
+sum. **A boundary between two colours of equal luminance is flat in that
+signal**, so nothing fired on it. Measured on a red-to-green edge at identical
+luma, against the same-size luma edge:
+
+| control | luma edge | chroma edge | blind by |
+|---|---|---|---|
+| `edge_soften` | 5.196 lv | 0.287 lv | **18x** |
+| `edge_jitter` | 6.027 lv | 0.287 lv | **21x** |
+| `edge_sand` | 4.964 lv | 0.287 lv | **17x** |
+| `edge_erosion` | 12.107 lv | 1.366 lv | 9x |
+| `acutance` | 2.409 lv | 1.302 lv | 2x |
+
+Photographs are full of such edges -- foliage against sky, skin against fabric,
+any two saturated colours a camera resolved at similar brightness.
+
+`_edge_magnitude` replaces the luma high-pass. At `edge_chroma_sense` 0 it
+returns that high-pass **bit for bit** (blur is linear, so the luma of the
+blurred frame is the blur of the luma); at 1 the magnitude is the largest
+high-pass any single channel shows, which is what the eye reads. On a neutral
+edge every channel carries the same step, so **greyscale content is identical at
+every setting** -- the control only ever adds edges, never moves the ones that
+were already found. Measured after: the chroma edge goes 0.287 -> 3.142 levels
+while the luma edge stays at 5.196 exactly.
+
+### The other threshold, now exposed
+
+`EDGE_REF = 0.06` normalised the high-pass into 0..1 and was a fixed internal
+number. It is the reference the *whole* family measures against, and everything
+gentler than it only ever reached a fraction of the mask however the sliders
+were set. `edge_sensitivity` divides it: 1 is the old number, and 4 takes the
+edge mask's mean from 0.068 to 0.101 and the share of the frame above half
+strength from 5.9% to 10.4%.
+
+**Softening is deliberately not on that control.** It has its own gate
+(`_STEP_LO`/`_STEP_HI`, exposed as `edge_soften_edges_only`) because it is
+asking a different question -- "is this a border or is it texture" rather than
+"how much of an edge is this" -- and welding the two together would mean tuning
+grain placement to fix a softening problem.
+
+### What it costs
+
+Seeing colour is a three-channel blur where luma was one. Measured on a 2400px
+proxy: **GPU +18-35%** (`Stock` 1.27s -> 1.71s, `SuperPortra` 2.04s -> 2.40s),
+**CPU +1-2%**. `edge_chroma_sense` 0 takes a one-channel fast path, so turning
+it off gets the old cost back exactly rather than computing three channels and
+discarding two.
 
 ## Scatter: diffusion without the average (added 2026-08-01)
 

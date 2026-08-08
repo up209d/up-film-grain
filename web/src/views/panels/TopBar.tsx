@@ -3,11 +3,28 @@
 import filmGrain1x1 from "../../assets/film-grain-1x1.jpg";
 import type { ImageMeta } from "../../services/api";
 
+/** How long a preview may take before the bar says the config is heavy, in ms.
+ *
+ *  Two numbers because the two devices are two different machines: 5s on a GPU
+ *  and 10s on a CPU are the budgets this app is held to. Keyed off the device
+ *  string the server already returns rather than off a guess -- a CPU-only
+ *  machine is not a slow GPU, and warning it at 5s would mean warning it
+ *  always. */
+const SLOW_MS_GPU = 5000;
+const SLOW_MS_CPU = 10000;
+
+/** The supersample factors the picker offers, lowest first. Mirrors
+ *  `SUPERSAMPLES` in `server/models/upload.py`; the server clamps to its own
+ *  list, so a drift here degrades to a nearby factor rather than an error. */
+const SS_STEPS = [0.5, 1, 1.5, 2, 3];
+
 export default function TopBar(props: {
   meta: ImageMeta | null;
   device: string;
   rendering: boolean;
   renderMs: number;
+  supersample: number;
+  onSupersample: (v: number) => void;
   dropping: boolean;
   onDropping: (v: boolean) => void;
   onFile: (f: File) => void;
@@ -16,6 +33,15 @@ export default function TopBar(props: {
   onRandomizeSeeds: () => void;
 }) {
   const { meta } = props;
+  // The device string is the server's own words ("Apple GPU (MPS)", "CUDA",
+  // "CPU"), so match on the one that means no accelerator rather than trying to
+  // enumerate the others.
+  const budget = /cpu/i.test(props.device) ? SLOW_MS_CPU : SLOW_MS_GPU;
+  const slow = !props.rendering && props.renderMs > budget;
+  // The next factor down, or null at the bottom of the list -- at 0.5x there is
+  // nothing left to suggest and the warning should say so by omission rather
+  // than offering a button that does nothing.
+  const lower = SS_STEPS.filter((s) => s < props.supersample).pop() ?? null;
   return (
     <header className="bar">
       <div className="brand">
@@ -91,10 +117,27 @@ export default function TopBar(props: {
         </button>
       )}
       <div className="spacer" />
-      <span className={`status ${props.rendering ? "busy" : ""}`}>
+      <span className={`status ${props.rendering ? "busy" : ""}${slow ? " slow" : ""}`}>
         {props.rendering && <div className="spinner" />}
         {props.rendering ? "rendering…" : `${props.renderMs}ms`}
       </span>
+      {slow && (
+        <span className="meta warn">
+          heavy config
+          {lower !== null && (
+            <>
+              {" — "}
+              <button
+                className="linkish"
+                onClick={() => props.onSupersample(lower)}
+                title={`Render at ${lower}× instead of ${props.supersample}×. Supersampling costs roughly its square, so this is about ${Math.round((props.supersample / lower) ** 2 * 10) / 10}× less work.`}
+              >
+                try {lower}×
+              </button>
+            </>
+          )}
+        </span>
+      )}
       <span className="meta">{props.device}</span>
     </header>
   );

@@ -1,5 +1,28 @@
 # Things I got wrong, so you don't repeat them
 
+* **`_grain_points` is arithmetic-bound, so restructuring its loop buys
+  nothing** (measured and reverted 2026-08-08). It is the single most expensive
+  thing in the pipeline — 4.75s of a 7.95s `SuperPortra` proxy on the GPU, 60% —
+  and the shape of it invites optimisation: `_GRAIN_SLOTS` x a 3x3 ring is 27
+  full-frame iterations, `ny`/`nx` depend only on the ring offset yet are rebuilt
+  in all 27, and each iteration does four separate advanced-index gathers.
+  Hoisting the ring loop outside the slot loop (27 index builds -> 9), stacking
+  position and radius so they gather in one op instead of three, and inlining
+  `_smoothstep` is a clean rewrite that stays bit-exact.
+
+  It measures **7.898s against 7.900s on the CPU and 1.742s against 1.745s on
+  MPS**. Nothing. The loop is ~28 element-ops per iteration over 15.4M working
+  pixels — roughly 13 G element-ops per call — so it is bound by streaming those
+  tensors, not by kernel launches or index arithmetic. Fewer, larger kernels move
+  the same bytes.
+
+  What *would* move it is less work or narrower types, and both are refused
+  elsewhere for good reasons: fewer slots or rings rerolls every preset's grain,
+  and fp16 would quantise a falloff whose whole range is 0..1. If you come back
+  to this, measure before restructuring — this is the second time an obvious-
+  looking win here measured at 1.00x, after `inference_mode` and kernel caching
+  in the 2026-08-04 audit.
+
 
 * **A shoulder normalised to reach 1.0 is not a shoulder.** A region of falling
   slope mathematically cannot reach the top; forcing it turns the shoulder into

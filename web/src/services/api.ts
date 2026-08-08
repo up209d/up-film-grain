@@ -181,19 +181,16 @@ export interface ExportJob {
   error?: string;
 }
 
-/** Which render the export writes.
+/** Supersample factors the export offers. **Every export is full size** since
+ *  2026-08-08 — this picks how finely the frame is rendered, not how big the
+ *  file is.
  *
- *  - `"full"` is the source at 1:1.
- *  - `"preview"` is the working proxy — the same render a slider change
- *    produces, so the grain sits on the proxy's pixel grid rather than being
- *    a downscale of the full-resolution one. A different look, not just a
- *    different size.
- *  - `"preview_full"` is that same proxy render, then blown back up to the
- *    source's full pixel dimensions. It guarantees a pixel match to what is
- *    on screen (just enlarged) — a fresh full-resolution render cannot,
- *    because grain resolves on a different, finer grid at full scale. Adds
- *    no detail; it is the proxy's look, magnified. */
-export type ExportScale = "full" | "preview" | "preview_full";
+ *  It replaced a three-way scale menu whose entries moved resolution and look
+ *  together: "As previewed" wrote a smaller file *and* a coarser grain, because
+ *  every length scales with the frame. Two questions on one control. Below 1
+ *  the frame renders smaller than its output and is resampled back up; above,
+ *  finer than the output grid and integrated down. */
+export const EXPORT_SUPERSAMPLES = [0.5, 1, 1.5, 2, 3] as const;
 
 export async function startExport(body: {
   id: string;
@@ -201,7 +198,6 @@ export async function startExport(body: {
   format: string;
   supersample: number;
   quality: number;
-  scale: ExportScale;
   reference_mp?: number | null;
   lut?: string | null;
 }): Promise<string> {

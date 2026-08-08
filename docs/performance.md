@@ -1,5 +1,213 @@
 # Performance
 
+## Performance audit, 2026-08-08 — memory was costing time, and the cache was dead
+
+Measured on an M4 Max (14 cores, 36GB), idle, one fresh process per
+configuration. **Benchmarked on `SuperPortra` as well as `Stock`**, which is what
+found the defect: a `Stock`-only measurement reports everything below as healthy.
+
+| | before | after |
+|---|---|---|
+| `SuperPortra` proxy preview (24MP source) | 7.47s GPU / 21.5s CPU | **1.76s / 11.3s** |
+| `VintageDarkGrainy` proxy | 1.64s / 9.36s | 1.64s / 9.47s |
+| `Stock` proxy | 1.13s / 6.81s | 1.15s / 7.17s |
+| 24MP export, `Stock` | 30.6s, **27.2GB** | **21.96s, 8.07GB** |
+| 24MP export, CPU | 154.1s, 22.5GB | 145.3s, 22.0GB |
+
+Three findings, and the first two are the kind that hide behind a healthy-looking
+default preset.
+
+**1. The Global Grain texture cache had a 0% hit rate on any preset using the
+source-masked layers.** `_GG_CACHE_BYTES` was a flat 0.5GB, sized by a comment
+reading "113MB per tile at tile 1536 / supersample 2" — written when the tile was
+a hard-coded constant and the section had **one** layer. It has five now and
+`tile_for` computes the tile, so `SuperPortra` at a 2400px proxy wants 922MB, the
+LRU held two entries, and **every render missed all five**. Re-rendering identical
+parameters measured 7.36s and 0 hits; with a budget that fits, 1.78s and 5 hits.
+`Stock` never showed it because one layer always fitted — which is why the
+2026-08-04 audit recorded this cache as working.
+
+It is `device._grain_cache_bytes()` now, a share of the same pool `tile_for`
+draws on. The two genuinely compete and the split is explicit for the first time:
+`tile_for` used to take the whole budget while the cache took 0.5GB on top, so
+their sum was never a real ceiling.
+
+**2. The MPS allocator was hoarding 17GB, and that cost time as well as memory.**
+A 24MP export peaked at **27.2GB driver-allocated against 9.9GB of live
+tensors**. On unified memory the allocator's free list is system RAM, so holding
+it starves the machine and the render slows down. `release_cache` between tiles
+brought the same render to 13.0GB *and* 1.5× faster. `_WORKING_BYTES_PER_PX` was
+also under the true figure by 17% and is now 640.
+
+Two things this got wrong on the way, both worth knowing:
+
+* **Releasing after a single-tile render is a net loss.** It has no peak to
+  bound, so all the call buys is making the next render re-acquire the blocks —
+  `Stock`'s proxy went 1.13s → 1.45s and `VintageDarkGrainy`'s 1.64s → 1.94s for
+  no memory saved. The release fires *between* tiles only.
+* **Releasing on small tiles is a net loss too.** `verify.py` renders many small
+  frames at tiles from 256 up and went **35.7s → 96.4s** with the call
+  ungated. `_RELEASE_MIN_SHARE` gates it at half the tile budget; the suite is
+  back to 36.1s and every tile large enough to matter still releases.
+
+**3. A superseded preview could not be stopped.** `render_image` polled
+`should_cancel` once per tile — but `tile_for` returns 2400 for a 2400px proxy,
+so every live preview takes the single-pass branch, where the hook was checked
+once *before* the pass and then not again. Measured on `SuperPortra`: **one poll
+in 7.91s** on the GPU, 21.5s on the CPU, every second of it spent on a frame the
+client had already abandoned while holding the render lock.
+
+The ticket machinery in `runtime.py` was correct all along; it simply could not
+act at the granularity that mattered. `_poll_cancel` now fires at all 24 stage
+boundaries inside `render()` — 25 polls in an untiled pass, against 1 — and
+`render_image` returns the abandoned render's memory rather than leaving it
+reserved against a frame nobody will see. `verify.py` pins the poll count as
+"many more than one" rather than exactly, so adding a stage does not fail it.
+
+Worth noting what was *not* wrong: the client (`usePreview.ts`) debounces and
+aborts the in-flight request on every new render, so requests never stacked, and
+queued threadpool workers exit immediately on acquiring the lock. The waste was
+one render — but on the flagship preset that is the whole interaction budget.
+
+**4. One gaussian was 101s of the 154s CPU export.** Scratch softening blurs at
+`scratch_soften * 3 * scratch_width * scale`, so the 0.9 / 14.85px that **10 of
+12 presets ship** is sigma 40 at scale 1 and **sigma 80 at supersample 2** — a
+483-tap separable convolution over the whole frame. It moves 0.04% of a frame's
+pixels by more than one 8-bit level, and it crushes the scratch layer's own peak
+from 1.00 to 0.14, which is why scratches read as barely there.
+
+`_blur` now decimates above sigma 32: pool by `k = floor(sigma / 16)`, blur at
+the residual sigma, resample back bicubic. Below the threshold `k < 2` and the
+exact path runs, **bit-identical** — pinned from both sides in `verify.py`.
+
+| | CPU | GPU |
+|---|---|---|
+| 24MP export | 145.3s → **58.9s** | 22.0s → 22.0s |
+| `SuperPortra` proxy | 11.3s → **7.98s** | 1.78s |
+| `Stock` proxy | 7.17s → **3.47s** | 1.13s |
+
+**The first version of this seamed exports, and the reason is worth keeping.**
+`avg_pool2d` lays its grid from the tensor's own top-left, so two tiles covering
+the same pixel pooled it into differently-phased cells — invariant 1, measured at
+6.35e-03 on colour grading against a 2e-03 bar. The fix is an explicit `origin`
+argument: given the tile's absolute offset the grid is shifted onto absolute
+multiples of `k`, and **a caller that cannot supply one gets the exact path**.
+The default is the safe one, and the only opt-in so far is the scratch blur —
+re-measured after gating, that alone accounts for the whole saving above.
+
+**5. Three slider ranges were open past the point of usefulness**, and one was
+open past the point of *possibility*. All three were narrowed; no shipped preset
+sat near any of the old ceilings, so nothing in `presets/` changed as a result.
+
+* `grade_recover_radius` 4…200 → **4…64**. At 200 a 12MP export is 24 tiles and
+  9.14× overdraw, 79.7s against 3.12s at the default. **No tile size rescues
+  it**: 2× overdraw would need `tile >= 4.83 * pad`, a 5072 tile whose working
+  set is ~221GB. On the CPU, 100 takes 56.5s for a *proxy*.
+* `grade_clarity_radius` 2…80 → **2…48**. Same shape, milder: 2.23× overdraw at
+  24MP, 1.76s → 2.66s at 12MP.
+* `grain_size` 0.1…10 → **0.4…10**, and the eleven presets below the new floor
+  were re-authored. 0.1 to 0.4 was a dead zone: both floor to `_MIN_CELL`, so
+  the grain field is bit-identical, and only the *secondary* fields (the edge
+  envelope at ×2 and the jitter at ×3) got finer — 1.8× the cost of the coarse
+  end for no additional grain detail. The look moves slightly and only at edges:
+  mean 0.06 levels on `Stock`, p99 1.3, with 1.1% of pixels past one 8-bit level.
+
+Worth recording what is **not** worth clamping, because it is the opposite of
+what anyone expects: `global_size_max` is **cost-flat across its entire 0.1…20
+range** (0.35–0.37s), because `_grain_points` runs a fixed 27 full-frame
+iterations whatever the cell size. Lattice density is not the cost. `octaves`
+1→10 is 1.45×, `edge_sand_grit` 0.3→20 is 1.27×, `scatter_radius` 0.5→24 is
+1.07×.
+
+**6. Supersampling is a user choice now** — 0.5× / 1× / 1.5× / **2×** / 3×,
+default unchanged. Cost is roughly the square of the factor, so this is the
+biggest single lever anyone has over render time, and the bar now says so:
+past 5s on a GPU or 10s on CPU it flags the config as heavy and offers the next
+factor down.
+
+Two things this had to get right. `render_supersampled` **keeps `avg_pool2d` for
+whole-number factors** — an antialiased `interpolate` at 2× is a 4-tap
+triangular filter, not a 2×2 box, so swapping it in unconditionally would have
+rerolled every shipped preset; `verify.py` pins 1×, 2× and 3× bit-exact
+(0.00e+00) against the old path. And a fractional factor cannot give a whole
+working grid on every tile, so the factor is rounded to whole pixels and
+`scale`, `y0`, `x0` and `full_hw` are all derived from the grid *actually*
+rendered — get that wrong and the noise lattice resolves to different global
+coordinates than the geometry does. Tile independence is now checked at all five
+factors, not just the two integers it used to cover.
+
+**7. The texture cache held superseded parameter states until pressure evicted
+them.** Everything in its key after the tile coordinates is a *generation* — the
+parameter state a field belongs to — and an older generation can never be asked
+for again, because any render that wanted one would have to put those parameters
+back and would then be current. Under plain LRU those entries sat there to the
+byte cap: on `SuperPortra` at a 2400px proxy, dragging Global Size a few times
+filled toward the whole 4.5GB allowance with fields nothing could reach.
+
+Two generations are now kept and the rest dropped on sight. Measured: resident
+memory plateaus at **461MB / 10 entries** instead of growing to the cap, and
+stepping a slider back one value still hits. Two rather than one because A/B
+against the previous value is exactly what people do — and because `scale`
+reaches the key through `gcell`, so the proxy and the 1:1 render are different
+generations and both need to survive.
+
+**SSD spill for this cache was then declined**, having been planned. The whole
+point of spilling was that the working set did not fit; two generations at 461MB
+fits comfortably on an 8GB machine, so there is nothing left to spill. The
+checkpoint chain is the better candidate and is a bigger object read once per
+tile.
+
+**8. Pipeline checkpoints: the intermediate frame at a section boundary.**
+Editing a slider near the end of the pipeline re-ran the whole thing to produce
+a frame differing only in its last few stages. Two boundaries now hold that
+intermediate — after Pre Sharpen, and immediately before Global Grain.
+
+`SuperPortra` proxy, per slider drag:
+
+| | GPU | CPU |
+|---|---|---|
+| Global Grain / Sharpening / Film Texture (35 sliders) | 1.76s → **0.20s** | 7.9s → **0.97s** |
+| Edge Destruction, Grain Structure, Halation, Tone (CP-A hit) | 1.40s | 5.2s |
+| Colour Grading (full render) | 1.76s | 8.8s |
+
+**Which boundaries are usable is a property of the pipeline, not a choice.** An
+AST liveness pass over `render()`'s 73 top-level statements found exactly seven
+where the image is the only thing live, in two clusters; the middle carries five
+to nine planes at once because `lum_ref`, `hp`, `m`, `edge` and `wgt` are derived
+early and consumed late. Within each cluster only the deepest earns its place.
+
+Three things this had to get right, and the third was got wrong first:
+
+* **The key is derived, not listed** — the whole sanitised parameter dict minus
+  the sections below the boundary, with the LUT carried by `lut.id`. A
+  hand-maintained upstream list would stop covering the next parameter anyone
+  adds, and CLAUDE.md promises adding a control is one `Param` and one
+  `p["key"]` read.
+* **Downstream comes from *execution* order, not `GROUPS`.** The panel and the
+  pipeline do not agree yet: Halation is panel section 8 and runs 5th. Slicing
+  `GROUPS` would call it "below Global Grain" and a Halation edit would hit a
+  checkpoint taken before it ran.
+* **Naming a boundary off by one is a stale hit.** CP-A is saved *after* Pre
+  Sharpen; it was first written as `GROUPS[1:]`, which put `pre_blur` itself
+  below it, so dragging Pre Blur returned the previous frame. `verify.py` caught
+  it at **9.77e-01** — most of full scale — on the first run of the check.
+
+That check is the deliverable as much as the cache is: it renders one parameter
+from every section against a warm cache and requires the result to be bit-equal
+to an engine that has never seen a checkpoint. A stale hit here renders a
+plausible, wrong *photograph*, where the texture cache's version renders only a
+wrong texture.
+
+Memory is bounded the same way the texture cache is — two generations per
+boundary, so 369–737MB at a 2400px proxy rather than growing to the cap.
+Preview tier only: at export scale a frame is 1.15GB per tile and nobody is
+dragging a slider.
+
+**9. A single large tile is no longer fastest at export scale**, contradicting
+the `tile_for` sweep below. That sweep was measured on a 2400px proxy. At 24MP,
+tile 4096 measures 22.5s / 32.9GB against tile 2288's 20.1s / 13.0GB — memory
+pressure dominates the overlap overdraw the sweep was reasoning about.
+
 ## Measured performance (Apple MPS, 24MP source, 2× supersample)
 
 **The numbers below the 2026-08-04 audit section are historical.** Read that

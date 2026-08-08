@@ -28,17 +28,18 @@
 .cornerbar .title { flex: 0 0 auto; font-size: 11.5px; cursor: help; margin: 0 0 1px 6px; }
 .cornerbar .seg { padding: 4px 9px; font-size: 11.5px; }
 .cornerbar select { padding: 4px 7px; font-size: 11.5px; }
-/* Sized rather than shrink-wrapped: the labels carry the pixel dimensions, so
-   a content-width menu would change width both with the photo that is open and
-   with the option that is picked, dragging the bar's left edge about while it
-   is being read.
+/* Sized rather than shrink-wrapped: the labels carry the photo's pixel
+   dimensions, so a content-width menu would change width both with the photo
+   that is open and with the option that is picked, dragging the bar's left edge
+   about while it is being read.
 
-   250px is measured, not guessed, and the first attempt at 214 clipped the
-   longest label to "As previewed, full size — 1344×7". "As previewed, full
-   size — 12000×8000" is 209px of text in this face at this size; the rest is
-   14px of padding, the ~20px native menu arrow and the border. A select does
-   not ellipsise, it simply cuts, so anything short here loses the dimensions
-   the label exists to carry. */
+   The widest label is now "Full size 12000×8000 / SS 1.5×" -- the export menu
+   stopped being a three-way scale choice on 2026-08-08 and became a supersample
+   choice, which is a longer string than the old "Full size — 12000×8000" but
+   shorter than the "As previewed, full size — " it replaced. 250px still clears
+   it. Do not shrink this on the evidence of one photo: a select does not
+   ellipsise, it simply cuts, so anything short here loses the dimensions the
+   label exists to carry. */
 .cornerbar .xscale { width: 250px; }
 .cornerbar .export-go { padding: 5px 12px; font-size: 11.5px; }
 /* The same rule the viewbar uses between its groups, so the two corners are

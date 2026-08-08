@@ -20,6 +20,29 @@ from ..runtime import DEVICE
 # editing rather than batch processing.
 PROXY_LONG_EDGE = 2400
 
+# The supersample factors the UI offers, and the only ones a request may ask
+# for. A menu rather than a free number because each is a different bargain and
+# there is no useful midpoint: 2 is the default and the look every preset was
+# dialled in against, 3 costs 2.25x that for a little more clump resolution,
+# 1 renders at the output grid and gives grain a hard pixel footprint, and the
+# two below 1 render *smaller than the output* and scale up -- genuinely lossy,
+# and there for machines that cannot afford anything else.
+#
+# Clamped to the list rather than to a range: a request for 2.7 is a client bug,
+# and rounding it to the nearest offered value is a more useful answer than
+# either honouring it or refusing it.
+SUPERSAMPLES: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 3.0)
+
+
+def _clamp_ss(v) -> float:
+    """Nearest offered supersample factor. Junk falls back to the default."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 2.0
+    return min(SUPERSAMPLES, key=lambda s: abs(s - f))
+
+
 
 class Upload:
     __slots__ = ("id", "name", "arr", "h", "w", "proxy", "proxy_scale",

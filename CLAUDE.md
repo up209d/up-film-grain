@@ -76,8 +76,9 @@ server/engine/        the pipeline (package docstring states the invariants)
   colour.py             transfer curves, LUT lookup, highlight reconstruction
   noise/                hashed lattice, grain point field, smooth fields
   marks.py              dust/hair/leak site lists
-  stages/               one mixin per pipeline stage
+  stages/               one mixin per panel section; render.py is the order
   tiling.py             supersampling, pad_for, tile_for, render entries
+  checkpoint.py         section-boundary frame cache (the two usable boundaries)
   grain_engine.py       GrainEngine -- composes the stage mixins
 server/models/        Upload, export jobs (domain, no HTTP)
 server/services/      render_tier -- the one path both preview tiers take
@@ -168,10 +169,10 @@ reconstruction, the bidirectional split tone, the four source-masked global
 layers with their hue masks and
 mid-tone bell, the six Global Grain blend modes, `global_seed` as an offset, and
 the film-texture section including its exact mark counts and the speck's shape
-and softness controls — 349 checks. It exits
+and softness controls — 362 checks. It exits
 non-zero on failure.
 
-Those 349 live in `tests/checks/`, one module per area, since 2026-08-08 — it
+Those 362 live in `tests/checks/`, one module per area, since 2026-08-08 — it
 was a single 3900-line function taking 4m24s, and it is 17 modules taking 39s.
 **Name the modules covering what you touched and only those run:**
 `verify.py global` is four modules and ~20s. `verify.py -l` lists them, `-j 1`
@@ -240,9 +241,10 @@ optional reading before touching the area it covers.
 
 | file | what is in it |
 |---|---|
+| [docs/using-the-controls.md](docs/using-the-controls.md) | What each control does, for a user rather than a maintainer — moved out of `README.md` 2026-08-08 |
 | [docs/architecture.md](docs/architecture.md) | Where everything lives after the 2026-08-08 package split, the two import rules that keep it acyclic, and why `Stage.tsx` was left whole |
 | [docs/pipeline-order.md](docs/pipeline-order.md) | Which stages are placed by *position* and what breaks if they move; `pre_blur` vs `micro_blur`; why `master_opacity` lives outside `render()` |
-| [docs/preview-and-export.md](docs/preview-and-export.md) | The client-scaled two-tier preview, and the three export tiers (`full`, `preview`, `preview_full`) |
+| [docs/preview-and-export.md](docs/preview-and-export.md) | The client-scaled two-tier preview, and why every export is full size with the supersample as the only choice |
 | [docs/colour-grading.md](docs/colour-grading.md) | Step −1: LUTs as *resources*, the twelve adjustments, the Shadows/Highlights rewrite, highlight reconstruction — and, filed with them, Tone Response's bidirectional split tone |
 | [docs/halation.md](docs/halation.md) | Blue compensation and why it runs before the wash; highlight recovery metered against real headroom |
 | [docs/edge-destruction.md](docs/edge-destruction.md) | Scatter (diffusion without the average) and anti-aliasing (filter along the contour) |

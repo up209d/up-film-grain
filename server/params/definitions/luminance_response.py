@@ -66,7 +66,14 @@ PARAMS: list[Param] = [
         "edge_bias", "Edge Bias", "Grain Structure",
         0.0, 1.0, 0.01, 0.75, "",
         "Pushes grain onto high-contrast micro-edges and away from flat, "
-        "smooth areas such as skies.",
+        "smooth areas such as skies.\n"
+        "\n"
+        "**What counts as an edge is set under Edge Destruction** -- High-Pass "
+        "Radius, Edge Sensitivity and Edge Colour Sensitivity build one mask "
+        "and both sections read it. This slider is the other half of the "
+        "question: not what an edge is, but how much the grain should care. At "
+        "0 it ignores the mask entirely, which is also the setting at which "
+        "those three stop affecting grain at all.",
     ),
     Param(
         "smooth_guard", "Smooth-Area Guard", "Grain Structure",
@@ -74,13 +81,5 @@ PARAMS: list[Param] = [
         "Keeps grain out of genuinely featureless regions -- skin, clear sky, "
         "studio backdrops -- by measuring local contrast over a medium radius "
         "rather than brightness. 0 = off, 1 = smooth areas left clean.",
-    ),
-    Param(
-        "highpass_radius", "High-Pass Radius", "Grain Structure",
-        0.5, 5.0, 0.05, 2.0, "px",
-        "Radius used to isolate micro-edges, at full resolution. It also sizes "
-        "the mask Edge Erosion and Acutance work through, so widening it "
-        "coarsens those two as well as the grain's edge bias.",
-        spatial=True,
     ),
 ]

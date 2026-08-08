@@ -1,4 +1,37 @@
-# Preview and export tiers
+# Preview and export
+
+## Every export is full size (2026-08-08, on request)
+
+The export menu used to offer three *scales* -- `full`, `preview` and
+`preview_full` -- and it was asking the wrong question. Its entries differed in
+two things at once, resolution **and** look, and only one of those was ever the
+choice being made: "As previewed" wrote a smaller file *and* a coarser grain,
+because every length scales with the frame, so the proxy resolves fewer, larger
+clumps per frame than a 1:1 render of the same numbers.
+
+The menu now picks the **supersample** -- 0.5, 1, 1.5, 2 (default) or 3 -- and
+the output is always the source's own dimensions. That separates the two:
+
+* below 1 the frame is rendered smaller than its output and resampled back up,
+  so the file is full size and genuinely soft;
+* above 1 it is rendered finer than the output grid and integrated down, which
+  is what gives each grain clump partial-pixel coverage instead of a hard,
+  aliased footprint.
+
+Cost is roughly the square of the factor, so 3x is 2.25x the work of 2x and 1x
+is a quarter of it.
+
+**What this gives up, and it is worth naming.** There is no longer a way to
+export the proxy's own look. `preview_full` existed for "the file I am looking
+at, enlarged", and 0.5x is *not* the same thing: it renders the full frame at
+half resolution, where the proxy renders a smaller frame with every length
+scaled to it. If that look is wanted again it needs its own control, not a
+supersample setting.
+
+Filenames carry the factor (`photo_grain_ss1_5.jpg`) unless it is the default,
+for the reason the old `_grain_2400px` tag existed: two files from one photo
+that a folder listing cannot tell apart are worth naming apart, and now that
+every export is the same dimensions, size cannot do it.
 
 ## The preview is client-scaled, two-tier (changed 2026-07-31)
 

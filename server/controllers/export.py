@@ -12,67 +12,45 @@ from fastapi.responses import Response
 
 from .. import imageio as iio
 from ..models import upload as up_model
-from ..models.export_job import EXPORT_SCALES, JOBS, run_export
+from ..models.upload import _clamp_ss
+from ..models.export_job import JOBS, run_export
 
 router = APIRouter(prefix="/api")
 
 
 @router.post("/export")
 def export(body: dict = Body(...)) -> dict:
-    """Render and encode a download.
+    """Render and encode a download. **Always at the source's full size.**
 
-    ``scale`` picks which of three renders is written:
+    ``supersample`` is the only quality choice now -- 0.5, 1, 1.5, 2 (default)
+    or 3 -- and it picks how finely the frame is rendered, not how big the file
+    is. Below 1 the render happens smaller than the output and is resampled back
+    up; above it, above the output grid and integrated down.
 
-      * ``"full"`` (default) -- the whole source at scale 1.0, the same pixels
-        the Render 1:1 button shows.
-      * ``"preview"`` -- the working proxy, identical to what a slider change
-        renders. Every length is multiplied by ``proxy_scale`` like everything
-        else, so this is not a downscale of the full render: the grain is
-        resolved at the proxy's own pixel grid, which is exactly why it looks
-        like the preview and the full render does not.
-      * ``"preview_full"`` -- the same proxy render as ``"preview"``, then
-        blown back up to the source's full pixel dimensions with a plain
-        bicubic upsample (``imageio.upscale``). Written for "export exactly
-        what I am looking at, but as a full-size file": it guarantees a pixel
-        match to the on-screen preview (just enlarged), which a fresh
-        full-resolution render cannot, because grain is resolved on a
-        different, finer grid at full scale -- see CLAUDE.md. It adds no
-        detail; it is the proxy's own look, magnified, not a substitute for
-        ``"full"``.
+    It replaced a three-way ``scale`` menu (2026-08-08, on request) whose
+    entries differed in resolution *and* look at the same time: "As previewed"
+    wrote the proxy render, which is a smaller file **and** a coarser grain,
+    because every length scales with the frame. Two things on one control, and
+    only one of them was ever the question being asked. A ``scale`` key in the
+    body is now ignored rather than rejected, so a stale client degrades to a
+    full-size export instead of a 400.
     """
     up = up_model.get(body.get("id", ""))
     p = up_model.params_for(up, body)
     fmt = body.get("format", "jpeg")
     if fmt not in iio.FORMATS:
         raise HTTPException(400, f"Unknown format {fmt!r}.")
-    ss = max(1, min(3, int(body.get("supersample", 2))))
+    ss = _clamp_ss(body.get("supersample", 2))
     quality = max(60, min(100, int(body.get("quality", 95))))
-    mode = str(body.get("scale", "full")).lower()
-    if mode not in EXPORT_SCALES:
-        raise HTTPException(400, f"Unknown scale {mode!r}.")
-
-    # "preview_full" writes the source's own dimensions -- it is the "preview"
-    # render upscaled to them, not the proxy's own (smaller) size.
-    h, w = (up.h, up.w) if mode != "preview" else up.proxy.shape[:2]
+    h, w = up.h, up.w
     job_id = uuid.uuid4().hex[:12]
     stem = Path(up.name).stem or "image"
-    downscaled = up.proxy_scale < 0.999
-    if mode == "preview" and downscaled:
-        # Preview-scale exports carry their long edge in the name. Two files
-        # from one photo that differ only in resolution are otherwise
-        # indistinguishable in a folder, and the smaller one is the
-        # surprising one.
-        tag = f"_grain_{max(w, h)}px"
-    elif mode == "preview_full" and downscaled:
-        # Same pixel dimensions as "full", so the *size* cannot tell these
-        # two apart in a folder -- the look is what differs, so that is what
-        # the name says instead.
-        tag = "_grain_previewlook"
-    else:
-        # Either "full", or the source was never bigger than the proxy in the
-        # first place, in which case every mode renders the same pixels and
-        # tagging one as different from another would be a lie.
-        tag = "_grain"
+    # Every export is the same pixel dimensions now, so the filename cannot use
+    # size to tell two apart -- it carries the supersample instead, and only
+    # when it is not the default. Same reasoning the old `_grain_2400px` tag
+    # had: two files from one photo that differ in a way a folder listing
+    # cannot show are worth naming apart.
+    tag = "_grain" if abs(ss - 2.0) < 1e-6 else f"_grain_ss{ss:g}".replace(".", "_")
     JOBS[job_id] = {
         "id": job_id, "status": "queued", "progress": 0.0,
         "filename": f"{stem}{tag}.{iio.FORMATS[fmt][1]}",
@@ -80,7 +58,7 @@ def export(body: dict = Body(...)) -> dict:
         "width": int(w), "height": int(h),
     }
     threading.Thread(
-        target=run_export, args=(job_id, up, p, fmt, ss, quality, mode),
+        target=run_export, args=(job_id, up, p, fmt, ss, quality),
         daemon=True,
     ).start()
     return {"job": job_id}

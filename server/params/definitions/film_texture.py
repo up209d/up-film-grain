@@ -64,10 +64,26 @@ PARAMS: list[Param] = [
     ),
     Param(
         "dust_opacity_var", "Dust Opacity Variation", "Film Texture",
-        0.0, 1.0, 0.01, 0.6, "",
-        "How much opacity differs between specks. At 1 the faintest are "
-        "barely there while the strongest are solid -- real dust sits at "
-        "different depths and in different thicknesses.",
+        # Ships at 0, not 0.6 (2026-08-09, on request: "I want the dust dot to
+        # reach maximum white when dust opacity is 1, don't vary opacity of
+        # dust"). At 0.6 no speck reached the opacity actually asked for --
+        # measured at `dust_opacity` 1 the brightest pixel was 0.907 and the
+        # median lit speck 0.656, which reads grey, and the slider that was
+        # supposed to control it could not fix that from any position.
+        #
+        # Variation still exists and is one slider away; what changed is which
+        # end of it is the default. A control named *variation* doing nothing at
+        # 0 is the same rule `dust_lum_var` was fixed to on 2026-08-08.
+        0.0, 1.0, 0.01, 0.0, "",
+        "How much opacity differs between specks. **0 -- the default -- puts "
+        "every speck at exactly Dust Opacity**, so setting that to 1 gives "
+        "solid, fully opaque dust. Raise this and specks spread downward from "
+        "there, the way real dust sits at different depths and thicknesses; at "
+        "1 the faintest are barely there while the strongest are solid.\n"
+        "\n"
+        "Dust Softness rides on this too. Out-of-focus debris is fainter as "
+        "well as softer, but that fade is a *variation* between specks, so it "
+        "belongs here rather than quietly reducing the opacity you asked for.",
     ),
     Param(
         "dust_lum_var", "Dust Luminosity Variation", "Film Texture",

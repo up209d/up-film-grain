@@ -48,18 +48,4 @@ PARAMS: list[Param] = [
         "everywhere, which suits a CG render that aliases on gentle steps and "
         "will visibly soften a photograph's texture.",
     ),
-    Param(
-        "global_smooth", "Global Smoothness", "Anti Aliasing",
-        0.0, 1.0, 0.01, 0.0, "",
-        "Blurs the Global Grain layer by up to half a clump, rounding its "
-        "grains off and softening the boundaries between them. It used to be "
-        "the cure for that layer breaking into rectangular blocks at large "
-        "sizes; the field is no longer built on a lattice that does that, so "
-        "this is now a shape control rather than a repair -- reach for it "
-        "when the grain reads as too crisp. Strength is held constant as you "
-        "raise it, so it changes the shape of the grain and not how much "
-        "there is. Scaled to Global Size, so one setting stays right as you "
-        "resize the clumps. Here rather than under Global Grain because it is "
-        "the same job as the sliders above it: taking the pixel grid back out.",
-    ),
 ]

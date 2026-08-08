@@ -13,6 +13,19 @@ the rest of the engine. Everything else may import it. This is what makes the
 package acyclic — the first attempt had `constants/core.py` importing the grain
 field because a *comment* mentioned it, and the import graph closed on itself.
 
+**1b. `render()` is a sequence of section calls, not a sequence of stages.**
+Added 2026-08-08, when the body went from 790 lines to 463. Halation, Tone
+Response, Global Grain and Output Sharpening each moved into their own mixin
+(`stages/halation.py`, `stages/tone.py`, `stages/global_grain.py`,
+`stages/sharpen.py`) and appear in `render()` as one line each. The extraction
+was bit-identical and asserted so by the whole suite.
+
+It is not tidiness. Pipeline *order* is a design decision the panel is supposed
+to reflect (see `docs/pipeline-order.md`), and reordering a call is reviewable
+where reordering ninety inline lines is not. The stages still carrying their body
+inline are the ones whose intermediates are shared across sections -- the edge
+and grain span, where `lum_ref`, `hp`, `edge` and `m` are all live at once.
+
 **2. Nothing above `params` may define a parameter.** `server/params/` is still
 the single source of truth. Adding a control is one `Param` in the right
 `definitions/` module and one `p["key"]` read in a stage. The UI picks it up

@@ -4,8 +4,11 @@ import math
 
 import torch
 
-from ... import params as P
-from ..constants.core import _GG_CACHE_BYTES, _GLAYER_SEEDS, _GNORM, _MIN_CELL
+from ..constants.core import (
+    _AMP_SCALE, _GLAYER_SEEDS, _GNORM, _GSRC_KEYS, _MIN_CELL,
+)
+from ..device import _grain_cache_bytes
+from ..masks import _grain_delta, _source_masks
 from ..noise.fields import _fbm, _smooth_noise
 from ..noise.grain import _grain_points
 from ..primitives import _smoothstep
@@ -148,6 +151,28 @@ class GlobalGrainMixin:
             base_seed, p["global_smooth"], p["global_chroma"],
             str(self.device),
         )
+        # Everything after the tile's own coordinates is the *generation* -- the
+        # parameter state this field belongs to. Entries from an older
+        # generation can never be asked for again: any render that could want
+        # one would have to put those parameters back, and then it would be the
+        # current generation. Under plain LRU they sit there anyway until
+        # pressure evicts them, which on an 8GB machine is most of the budget
+        # held for values the user has already dragged past.
+        #
+        # Two generations are kept, not one. One would make dragging a slider
+        # back and forth cost a full rebuild every time, and A/B against the
+        # previous value is exactly what people do. It also covers the proxy and
+        # the 1:1 render coexisting, since `scale` reaches the key through
+        # `gcell` and so makes them different generations.
+        gen = key[5:]
+        if gen != self._gg_gen:
+            self._gg_prev_gen, self._gg_gen = self._gg_gen, gen
+            live = (self._gg_gen, self._gg_prev_gen)
+            for k in [k for k in self._gg_cache if k[5:] not in live]:
+                old = self._gg_cache.pop(k)
+                self._gg_bytes -= old.element_size() * old.nelement()
+                self.gg_evicted += 1
+
         hit = self._gg_cache.get(key)
         if hit is not None:
             self._gg_cache.move_to_end(key)
@@ -244,10 +269,112 @@ class GlobalGrainMixin:
         # single-tile render of a large frame would thrash the cache empty on
         # every pass and pay the bookkeeping for nothing.
         nbytes = gg.element_size() * gg.nelement()
-        if nbytes <= _GG_CACHE_BYTES:
+        # Read per insert rather than at import: it is derived from the device's
+        # own budget now, and a process that changes `FILM_GRAIN_TILE_BUDGET_GB`
+        # to reproduce a small machine has to see the smaller cache too.
+        cap = _grain_cache_bytes()
+        if nbytes <= cap:
             self._gg_cache[key] = gg
             self._gg_bytes += nbytes
-            while self._gg_bytes > _GG_CACHE_BYTES and len(self._gg_cache) > 1:
+            while self._gg_bytes > cap and len(self._gg_cache) > 1:
                 _, old = self._gg_cache.popitem(last=False)
                 self._gg_bytes -= old.element_size() * old.nelement()
         return gg
+
+    def _global_grain(
+        self, out: torch.Tensor, h: int, w: int, y0: float, x0: float,
+        p: dict, scale: float,
+    ) -> torch.Tensor:
+        """The five overlay layers, applied to the finished frame.
+
+        Extracted from `render()` on 2026-08-08 so the pipeline body reads as
+        a sequence of sections. Bit-identical to the inline version.
+        """
+        # 13. Global grain -- five overlay layers, applied last. The first is
+        #     masked by nothing; the other four by the picture itself.
+        #
+        #     Everything above is masked: by the luminance band, by the edge
+        #     envelope, by the smooth-area guard. That is emulsion behaviour,
+        #     and it is why smooth skies and skin stay clean. This layer is
+        #     deliberately none of that. It sits on the finished frame at one
+        #     amplitude everywhere, the way a scanned print carries grain from
+        #     the print stock and the scan itself rather than from the
+        #     negative -- so it reaches exactly the areas the masks protect.
+        #
+        #     On its own seed offset: sharing the main grain's seed would lay it
+        #     directly on top of the same clumps and read as nothing more than a
+        #     louder version of the same field. Monochrome unless
+        #     `global_chroma` asks otherwise -- see below for why that is built
+        #     as a separate mean-zero field rather than by the main grain's
+        #     recipe.
+        #
+        #     Min and Max are the two ends of one grain-size distribution, and
+        #     since 2026-08-05 they select nothing else: `_grain_points` draws
+        #     every setting, Min == Max included. It used to be two
+        #     constructions, value-noise fBm below Max and a cellular field
+        #     above it, and the switch between them was a change in *kind* --
+        #     the layer's whole character, and 43% of its loudness, turned on
+        #     whether Max happened to exceed Min. Both were also reported as
+        #     showing a visible grid, from different causes. See `_GRAIN_ROT`.
+        #
+        #     Since 2026-08-05 the section renders **five** such layers, not
+        #     one. The other four are the same field on their own seeds, each
+        #     multiplied by an envelope read off the picture -- see the masks
+        #     below. The flat layer stays exactly what it was and stays first,
+        #     so a shadow the masks turn down is never left perfectly clean.
+        go = p["global_opacity"]
+        # Amounts in layer order: the flat layer, then the four masked ones,
+        # matching `_GLAYER_SEEDS` and `_source_masks`.
+        gamt = (p["global_intensity"],) + tuple(p[k] for k in _GSRC_KEYS)
+        gmode = int(round(p["global_blend"]))
+        gcell = max(_MIN_CELL, p["global_size"] * scale)
+        # Max can never pull the effective ceiling *below* Min: clamped up
+        # to it rather than swapped with it -- the two are not a symmetric
+        # pair the way the light-leak sizes are, because Min already has an
+        # established meaning on its own and Max is purely "how much
+        # further can it stretch".
+        #
+        # Derived out here rather than inside the branch because all five
+        # layers need the identical pair: two derivations that could drift
+        # apart would put them on different lattices while every slider
+        # claimed otherwise.
+        gcell_max = max(gcell, p["global_size_max"] * scale)
+
+        if go > 0.001 and any(a > 0.01 for a in gamt):
+            # The four envelopes, read off the frame **before** any of the five
+            # layers goes on, so they describe the picture rather than the grain
+            # already laid over it. Built once and only if something wants one.
+            masks = None
+            if any(a > 0.01 for a in gamt[1:]):
+                masks = _source_masks(out.clamp(0.0, 1.0))
+
+            # Composited in order, each onto the result of the one before, the
+            # way a stack of layers in an image editor behaves -- which is what
+            # `Blend Mode` has to mean for the menu to be worth having. Under
+            # Add, the default, that is identical to summing them.
+            #
+            # **Masking, not seeding.** The obvious reading of "grain that
+            # follows the picture" is to derive each grain's *seed* from the
+            # source pixel, and it fails three ways at once: a flat region
+            # hashes every pixel the same, rebuilding the axis-aligned 1px grid
+            # `_GRAIN_ROT` exists to destroy; one grain per pixel centred on
+            # that pixel makes every falloff 1, so the construction collapses to
+            # a blur of white noise with no gaps and no grain edges; and a seed
+            # drawn from the frame changes with every upstream slider, so grain
+            # rerolls and swims while you grade. A mask has none of that. The
+            # pattern comes from the seed as it always did and only the envelope
+            # moves, which is also what keeps the fields cacheable -- they read
+            # no image data, the mask does, and the mask is applied out here.
+            #
+            # The five amounts are likewise applied out here, outside the cache
+            # boundary, so dragging any of them cannot miss it.
+            for li, amt in enumerate(gamt):
+                if amt <= 0.01:
+                    continue
+                g = self._global_grain_field(
+                    h, w, y0, x0, p, gcell, gcell_max, li,
+                )
+                a = (amt / 100.0) * _AMP_SCALE * go
+                d = _grain_delta(out, g, gmode)
+                out = out + (d * a if li == 0 else d * (a * masks[li - 1]))
+        return out

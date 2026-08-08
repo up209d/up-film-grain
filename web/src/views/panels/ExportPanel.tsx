@@ -1,10 +1,11 @@
 /** Choosing what to write, and watching it render.
  *
- *  The three scales are not a size choice -- see the help text below and
- *  `docs/preview-and-export.md`. "As previewed" writes the proxy render itself
- *  because every length scales with the frame, so the same settings resolve
- *  finer grain at full size; a downscale of the 1:1 render would not match what
- *  is on screen.
+ *  **Every export is full size** (2026-08-08, on request). The menu picks the
+ *  supersample -- how finely the frame is rendered -- and nothing else. It
+ *  replaced a three-way scale menu whose entries moved resolution and look
+ *  together: "As previewed" wrote a smaller file *and* a coarser grain, because
+ *  every length scales with the frame, so the one control was answering two
+ *  questions at once and neither cleanly.
  *
  *  This sits over the photo, bottom right, rather than at the foot of the
  *  panel. The prose that used to run under the scale menu is behind the help
@@ -20,13 +21,14 @@
  *  in the button was the widest thing in the overlay.
  */
 
-import type { ExportJob, ExportScale, ImageMeta } from "../../services/api";
+import { EXPORT_SUPERSAMPLES } from "../../services/api";
+import type { ExportJob, ImageMeta } from "../../services/api";
 import Help from "../controls/Help";
 
 export default function ExportPanel(props: {
   meta: ImageMeta | null;
-  exportScale: ExportScale;
-  onExportScale: (s: ExportScale) => void;
+  exportSs: number;
+  onExportSs: (s: number) => void;
   format: string;
   onFormat: (f: string) => void;
   onExport: () => void;
@@ -35,38 +37,29 @@ export default function ExportPanel(props: {
    *  What goes in it is the caller's business. */
   headerAside?: React.ReactNode;
 }) {
-  const { meta, exportScale, job } = props;
-  // Below the proxy's own size every option renders the same pixels, so the
-  // distinction the help text draws would be a lie.
-  const sameEitherWay = !!meta && meta.proxy_width >= meta.width;
+  const { meta, exportSs, job } = props;
+  // Cost is roughly the square of the factor, which is the thing worth saying
+  // out loud: 3x is 2.25x the work of 2x, and 1x is a quarter of it.
+  const help =
+    exportSs === 2
+      ? `A full-size render of ${meta?.width}×${meta?.height} at 2× ` +
+        "supersampling — the default, and what every preset was dialled in " +
+        "against. Grain is rendered above the output grid and integrated down, " +
+        "so each clump gets genuine partial-pixel coverage instead of a hard, " +
+        "aliased footprint."
+      : exportSs > 2
+        ? "Renders finer than 2× and integrates down. Costs roughly the square " +
+          "of the factor — 3× is 2.25× the work of 2× — for a modest gain in " +
+          "how cleanly the smallest clumps resolve."
+        : exportSs === 1
+          ? "Renders at the output grid itself. Fast, but grain gets a hard, " +
+            "aliased pixel footprint — the synthetic look supersampling exists " +
+            "to avoid."
+          : "Renders *below* the output and scales up, so the file is full " +
+            "size but genuinely soft. For machines that cannot afford anything " +
+            "else, not a look.";
 
-  const help = sameEitherWay
-    ? "This photo is already smaller than the proxy, so every option renders " +
-      "the same pixels."
-    : exportScale === "preview"
-      ? "Writes the proxy render itself — the grain you are looking at, not a " +
-        "downscale of the 1:1 render. Every length scales with the frame, so " +
-        "at full size the same settings resolve finer, denser grain; if the " +
-        "preview is the look you want, this is the file that has it."
-      : exportScale === "preview_full"
-        ? `The proxy render enlarged to ${meta?.width}×${meta?.height} — a ` +
-          "pixel match to what is on screen, not a fresh full-resolution " +
-          "render. It adds no detail: zoomed in, the grain is the same softer " +
-          'proxy texture, just bigger, not the finer grain "Full size" would ' +
-          "resolve at this scale. Reach for this when the preview's look is " +
-          "what you want to keep, in a file sized for printing or sharing at " +
-          "full size."
-        : "A fresh render of every pixel at full resolution. Lengths scale " +
-          "with the frame, so grain resolves finer and denser than the proxy " +
-          "preview shows — judge it with Render 1:1 before committing to it.";
-
-  // What the button used to say. It is the tooltip now -- see the note above.
-  const action =
-    exportScale === "preview"
-      ? "Export as previewed"
-      : exportScale === "preview_full"
-        ? "Export as previewed, full size"
-        : "Export full size";
+  const action = `Export ${meta?.width}×${meta?.height} at ${exportSs}× supersampling`;
 
   return (
     <>
@@ -78,20 +71,14 @@ export default function ExportPanel(props: {
           shrink-wrapped. */}
       <select
         className="xscale"
-        value={exportScale}
-        onChange={(e) => props.onExportScale(e.target.value as ExportScale)}
+        value={exportSs}
+        onChange={(e) => props.onExportSs(Number(e.target.value))}
       >
-        <option value="full">
-          Full size{meta ? ` — ${meta.width}×${meta.height}` : ""}
-        </option>
-        <option value="preview">
-          As previewed
-          {meta ? ` — ${meta.proxy_width}×${meta.proxy_height}` : ""}
-        </option>
-        <option value="preview_full">
-          As previewed, full size
-          {meta ? ` — ${meta.width}×${meta.height}` : ""}
-        </option>
+        {EXPORT_SUPERSAMPLES.map((s) => (
+          <option key={s} value={s}>
+            Full size{meta ? ` ${meta.width}×${meta.height}` : ""} / SS {s}×
+          </option>
+        ))}
       </select>
       <select
         className="xformat"

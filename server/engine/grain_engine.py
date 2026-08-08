@@ -4,10 +4,11 @@ import collections
 
 import torch
 
-from .device import pick_device
+from .checkpoint import CheckpointCache
+from .device import _checkpoint_bytes, pick_device
 from .stages import (
     ColourGradeMixin, EdgeMixin, FilmTextureMixin, GlobalGrainMixin,
-    HalationMixin, RenderMixin,
+    HalationMixin, RenderMixin, SharpenMixin, ToneMixin,
 )
 from .tiling import TilingMixin
 
@@ -15,9 +16,11 @@ from .tiling import TilingMixin
 class GrainEngine(
     ColourGradeMixin,
     HalationMixin,
+    ToneMixin,
     EdgeMixin,
     GlobalGrainMixin,
     FilmTextureMixin,
+    SharpenMixin,
     RenderMixin,
     TilingMixin,
 ):
@@ -52,8 +55,42 @@ class GrainEngine(
         # it with.
         self.gs_hits = 0
         self.gs_misses = 0
+        # The parameter state the cache's live entries belong to, and the one
+        # before it. Anything older is unreachable and is dropped on sight
+        # rather than waiting for memory pressure -- see `_global_grain_field`.
+        self._gg_gen = None
+        self._gg_prev_gen = None
+        # Counted for the same reason the hits are: dropping too much is as
+        # invisible as dropping too little, and only a number can tell them
+        # apart.
+        self.gg_evicted = 0
+        # Pipeline checkpoints: the finished frame at a section boundary, so an
+        # edit below that boundary restores it instead of re-running everything
+        # above. See `checkpoint.py` for why only two boundaries are usable.
+        #
+        # `None` until a caller opts in by setting `_ckpt_id` -- the id of the
+        # image and tier being rendered. Without one there is nothing to key on
+        # that distinguishes two photographs of the same size, so the cache
+        # stays off rather than guessing.
+        self.ckpt = CheckpointCache(_checkpoint_bytes())
+        self._ckpt_id = None
+        # The in-flight render's "has a newer request arrived" hook, or None.
+        #
+        # On the instance rather than threaded through every signature, and that
+        # borrows the same assumption `_gg_cache` above already rests on:
+        # `runtime.RENDER_LOCK` serialises every render, so there is only ever
+        # one in flight. `render_image` sets it and clears it in a `finally`;
+        # `render_view` and `render_crop` leave it None and so never poll.
+        self._cancel = None
 
     def clear_caches(self) -> None:
         """Drop the Global Grain texture cache."""
         self._gg_cache.clear()
         self._gg_bytes = 0
+        # The generation markers go with it. Left set, the next render would
+        # compare against a state whose entries no longer exist and skip the
+        # sweep it should have done -- harmless today because the dict is empty,
+        # and exactly the kind of stale pairing that stops being harmless the
+        # first time somebody clears the cache for a reason other than a test.
+        self._gg_gen = None
+        self._gg_prev_gen = None

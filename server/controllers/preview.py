@@ -10,6 +10,7 @@ from fastapi.responses import Response
 from .. import imageio as iio
 from ..engine import RenderCancelled, device_name
 from ..models import upload as up_model
+from ..models.upload import _clamp_ss
 from ..runtime import DEVICE, RENDER_LOCK, is_superseded, next_preview_gen
 from ..services.render import render_tier
 
@@ -41,7 +42,7 @@ def preview(body: dict = Body(...)) -> Response:
     """
     up = up_model.get(body.get("id", ""))
     p = up_model.params_for(up, body)
-    ss = max(1, min(3, int(body.get("supersample", 2))))
+    ss = _clamp_ss(body.get("supersample", 2))
     full = bool(body.get("full", False))
 
     # Take a ticket *before* waiting on the lock, so a request already queued

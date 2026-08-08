@@ -171,6 +171,8 @@ export default function App() {
         device={device}
         rendering={preview.rendering}
         renderMs={preview.renderMs}
+        supersample={supersample}
+        onSupersample={setSupersample}
         dropping={upload.dropping}
         onDropping={upload.setDropping}
         onFile={upload.onFile}
@@ -202,8 +204,8 @@ export default function App() {
           corner={
             <ExportPanel
               meta={meta}
-              exportScale={exporter.exportScale}
-              onExportScale={exporter.setExportScale}
+              exportSs={exporter.exportSs}
+              onExportSs={exporter.setExportSs}
               format={exporter.format}
               onFormat={exporter.setFormat}
               onExport={exporter.doExport}
@@ -312,7 +314,9 @@ export default function App() {
               value={supersample}
               onChange={(e) => setSupersample(Number(e.target.value))}
             >
+              <option value={0.5}>0.5× (fastest, soft)</option>
               <option value={1}>1× (fast, aliased grain)</option>
+              <option value={1.5}>1.5×</option>
               <option value={2}>2× supersampled</option>
               <option value={3}>3× supersampled (slowest)</option>
             </select>

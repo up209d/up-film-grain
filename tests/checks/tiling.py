@@ -16,7 +16,13 @@ def run(cx: Ctx) -> None:
     eng, p, img = cx.eng, cx.p, cx.img
     # -- 1. tile independence ------------------------------------------------
     print("tile independence (tiled render == single-pass render)")
-    for ss in (1, 2):
+    # Fractional factors included since 2026-08-08. Invariant 2 is the one at
+    # risk there: a request like 1.5x cannot give a whole working grid on every
+    # tile, so `render_supersampled` rounds to whole pixels and then derives
+    # `scale`, `y0`, `x0` and `full_hw` from the grid it *actually* rendered.
+    # Get that wrong and the noise lattice resolves to different global
+    # coordinates than the geometry does, which shows up here and nowhere else.
+    for ss in (0.5, 1, 1.5, 2, 3):
         a = eng.render_image(img, p, 1.0, tile=4096, supersample=ss)
         b = eng.render_image(img, p, 1.0, tile=128, supersample=ss)
         d = float(np.abs(a - b).max())

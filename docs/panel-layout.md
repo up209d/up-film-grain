@@ -1,5 +1,32 @@
 # Panel layout
 
+## The edge mask moved to Edge Destruction (2026-08-09)
+
+`highpass_radius`, `edge_sensitivity` and `edge_chroma_sense` were under `Grain
+Structure`, because that is the stage that *builds* the mask -- the grain's own
+`edge_bias` needs it there, before any Edge Destruction stage runs. They are
+under `Edge Destruction` now, on request, and the reasoning is worth keeping
+because it cuts against the rule the rest of the panel follows.
+
+**These three are the one place the panel deliberately reads ahead of
+execution.** Everything else in the app is arranged so a section runs where it
+is listed; these are consumed in section 3 and listed in section 4. The trade is
+made on purpose: they define *what counts as an edge* -- the scale it is
+measured at, how hard it has to step, whether a colour boundary counts -- and to
+anyone using the app they are edge controls. Leaving them under a heading that
+does not mention edges was the more confusing of the two wrongs.
+
+`edge_bias` stayed behind, and the split is not arbitrary. Those three ask *what
+an edge is*; `edge_bias` asks *how much the grain should care*, which is a grain
+question. Measured, that is also exactly where the coupling lives: with every
+Edge Destruction control off, raising `edge_sensitivity` from 1 to 4 moves 13.4%
+of a frame's pixels at `edge_bias` 1.0, 10.5% at 0.5, and **0.0% at 0**. Turn
+`edge_bias` off and the three have no effect on grain whatsoever -- which is what
+its help text now says.
+
+Ordered mask-first within the section, since every control below them is
+weighted by what they produce.
+
 ## The Colour section is gone (2026-08-03)
 
 On request, alongside the Global Grain chroma slider (see

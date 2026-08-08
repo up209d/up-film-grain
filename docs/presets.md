@@ -1,5 +1,31 @@
 # Presets
 
+## Preset files carry every parameter now (2026-08-09)
+
+They used to carry whatever the author happened to have moved -- `Subtle` had 41
+of 112 keys, `Sandy` 54, `SuperPortra` 108 -- and the rest filled from defaults
+through `sanitize`. That is still how they *load*, and a hand-written
+`{"intensity": 40}` still works; what changed is what we write.
+
+Every shipped preset now lists all 112, **in panel order**, at the value it was
+already rendering. Verified bit-identical across all twelve (0.00e+00) -- of
+course it is, since the values written are exactly what `sanitize` was filling
+in, but a preset library is the wrong place to assume that rather than measure
+it.
+
+Two reasons it is worth the extra lines:
+
+* **A file that says what it does.** Reading a preset used to require knowing
+  which of 112 defaults it was inheriting, and the answer changed whenever a
+  default did. Now the file is the whole answer.
+* **New controls arrive visible.** `edge_sensitivity` and `edge_chroma_sense`
+  were added on 2026-08-09 and both ship at 1. Left implicit, every preset would
+  silently inherit whatever those defaults became; written out, changing a
+  default no longer reaches back into looks somebody already dialled in.
+
+Panel order rather than insertion order for the same reason the pipeline runs in
+it: the file reads top to bottom the way the app does.
+
 ## The mark-count dead zone (found 2026-08-02)
 
 `dust`, `scratches`, `hair` and `light_leak` are **counts**, and the engine

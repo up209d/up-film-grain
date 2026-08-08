@@ -14,6 +14,8 @@ from .film_texture import FilmTextureMixin
 from .global_grain import GlobalGrainMixin
 from .halation import HalationMixin
 from .render import RenderMixin
+from .sharpen import SharpenMixin
+from .tone import ToneMixin
 
 __all__ = [
     "ColourGradeMixin",
@@ -22,4 +24,6 @@ __all__ = [
     "GlobalGrainMixin",
     "HalationMixin",
     "RenderMixin",
+    "SharpenMixin",
+    "ToneMixin",
 ]

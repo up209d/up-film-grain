@@ -11,10 +11,93 @@ from .constants.core import _LUMA
 # primitives
 # --------------------------------------------------------------------------- #
 
-def _blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
-    """Separable gaussian blur with reflect padding."""
+# Sigma above which `_blur` drops to a reduced-resolution path, and the residual
+# sigma it aims for on the small grid.
+#
+# The threshold *is* the safety argument. `k = floor(sigma / _BLUR_DECIMATE_TO)`
+# is below 2 for every sigma under 32, so everything below that falls through to
+# the exact path and is **bit-identical** -- which covers every kernel this
+# pipeline uses except the scratch soften, and halation or highlight
+# reconstruction when a preset pushes their radii past 16 at supersample 2.
+#
+# 16 rather than a smaller target because the error is set by how much of the
+# gaussian the box-plus-resample approximates away. Measured against the exact
+# blur on a scratch-like field, as a share of the result's own peak:
+#
+#   target  4 -> sigma 40: 1.7%   sigma 80: 5.3%
+#   target  8 -> sigma 40: 0.8%   sigma 80: 1.5%
+#   target 16 -> sigma 40: 0.3%   sigma 80: 0.7%
+#
+# and 16 is still 24x faster at sigma 40 and ~5000x at sigma 80 on the CPU.
+_BLUR_EXACT_MAX_SIGMA = 32.0
+_BLUR_DECIMATE_TO = 16.0
+
+
+def _blur(
+    x: torch.Tensor, sigma: float, origin: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """Separable gaussian blur with reflect padding.
+
+    Cost is O(N * 6 sigma), which is fine until a stage asks for a sigma in the
+    tens. Scratch softening does: its radius is
+    ``scratch_soften * 3 * scratch_width * scale``, so a preset's 0.9 on a 14.85px
+    scratch is **sigma 40 at scale 1 and sigma 80 at supersample 2** -- a 483-tap
+    separable convolution over the whole frame. Measured 2026-08-08, that single
+    call was **101s of a 154s CPU export**, and it moves 0.04% of pixels by more
+    than one 8-bit level.
+
+    So above `_BLUR_EXACT_MAX_SIGMA` the blur is done on a decimated grid:
+    average-pool by ``k``, blur at the residual sigma, resample back. A gaussian
+    that wide has nothing above 1/sigma cycles per pixel left to lose, which is
+    why this is an approximation only in arithmetic and not in what it renders.
+
+    **``origin`` is what makes this legal, and without it the decimated path is
+    off.** ``avg_pool2d`` lays its grid from the tensor's own top-left, so two
+    tiles covering the same pixel would pool it into differently-phased cells and
+    the export would seam -- invariant 1, and it is not theoretical: the first
+    version of this seamed colour grading at 6.35e-03 against a 2e-03 bar. Given
+    the tile's absolute offset in working pixels, the grid is shifted onto
+    absolute multiples of ``k`` instead, so every tile pools the same pixels into
+    the same cells. Callers that cannot supply it get the exact path, always --
+    the default is the safe one.
+
+    Three details that are not free to get wrong:
+
+    * **The residual sigma accounts for the pool's own blur.** ``avg_pool2d`` by
+      ``k`` is a box filter of variance ``(k^2 - 1) / 12``, so asking for
+      ``sigma / k`` on the small grid over-blurs. Subtracting it in quadrature is
+      what keeps the result the same width as the exact one.
+    * **Bicubic on the way back, not bilinear.** Both are accurate here -- the
+      field being resampled is smooth by construction -- but MPS's bilinear
+      `interpolate` is pathologically slow at large upsample factors: measured
+      0.9x against the exact blur at sigma 80, where bicubic is 34x.
+    * The small grid's own border still reflects, exactly as the full-resolution
+      kernel does, so `pad_for`'s existing 3x reach covers it unchanged.
+    """
     if sigma < 0.05:
         return x
+    if sigma > _BLUR_EXACT_MAX_SIGMA and origin is not None:
+        k = int(min(64, math.floor(sigma / _BLUR_DECIMATE_TO)))
+        if k >= 2:
+            h, w = x.shape[-2:]
+            # Shift the pool grid so that absolute coordinate 0 lands on a cell
+            # boundary. `round` rather than `int`: the offset arrives as a float
+            # that is a whole number of working pixels, and truncating a value
+            # like 1023.9999997 would phase the grid one pixel out.
+            py = int(-round(origin[0])) % k
+            px = int(-round(origin[1])) % k
+            xp = F.pad(x, (px, 0, py, 0), mode="replicate") if (py or px) else x
+            ph, pw = xp.shape[-2:]
+            # `ceil_mode` so the small grid covers the whole frame; a part-full
+            # final cell only widens the effective support at the far edge, which
+            # the tile overlap already covers.
+            small = F.avg_pool2d(xp, k, ceil_mode=True)
+            resid = math.sqrt(max(sigma * sigma - (k * k - 1) / 12.0, 0.0)) / k
+            small = _blur(small, resid)
+            big = F.interpolate(
+                small, size=(ph, pw), mode="bicubic", align_corners=False,
+            )
+            return big[..., py:py + h, px:px + w]
     r = max(1, int(math.ceil(sigma * 3.0)))
     # reflect padding requires the pad to be smaller than the dimension
     r = min(r, min(x.shape[-1], x.shape[-2]) - 1)
@@ -186,3 +269,44 @@ def _isophote(
     mag = (gx_ * gx_ + gy_ * gy_).sqrt().clamp_min(1e-6)
     # The tangent is the gradient turned 90 degrees.
     return -gy_ / mag, gx_ / mag, mag
+
+
+def _edge_magnitude(
+    img: torch.Tensor, radius: float, chroma: float,
+) -> torch.Tensor:
+    """High-pass magnitude of ``img`` at ``radius``, optionally seeing colour.
+
+    **The edge masks were luma-only, and that is why they missed edges.** Every
+    mask in the Edge Destruction family -- softening's step gate, the envelope
+    jitter and sanding are weighted by, the erosion weight -- came from
+    ``_luma(img)``, a Rec.709 weighted sum. A boundary between two colours of
+    equal luminance is *flat* in that signal, so none of them fired on it.
+    Measured on a red/green edge at identical luma: softening moved 0.29 8-bit
+    levels against 5.20 for the same-size luma edge, and jitter and sanding were
+    17-21x blind the same way. Photographs are full of such edges -- foliage
+    against sky, skin against fabric -- which is exactly the "a lot of edges it
+    ignores" that was reported.
+
+    ``chroma`` 0 returns the luma high-pass **bit for bit**: blur is linear, so
+    the luma of the blurred frame is the blur of the luma, and the weighted sum
+    below is that same number. That is what lets the control ship at a value
+    that changes nothing and be turned up deliberately.
+
+    At 1 the magnitude is the largest high-pass any single channel shows. On a
+    neutral edge every channel carries the same step, so the two agree exactly
+    and greyscale content is unaffected at any setting; only coloured edges
+    gain. Blended rather than switched so the slider is continuous, and clamped
+    at zero so it can only ever *add* sensitivity.
+    """
+    if chroma <= 0.001:
+        # Seeing colour costs a three-channel blur where luma costs one, so the
+        # off setting takes the one-channel path rather than computing three and
+        # discarding two. Identical either way: blur is linear, so the luma of
+        # the blurred frame is the blur of the luma.
+        lum = _luma(img)
+        return (lum - _blur(lum, radius)).abs()
+    hp = img - _blur(img, radius)
+    r, g, b = _LUMA
+    m_lum = (hp[:, 0:1] * r + hp[:, 1:2] * g + hp[:, 2:3] * b).abs()
+    m_max = hp.abs().amax(dim=1, keepdim=True)
+    return m_lum + chroma * (m_max - m_lum).clamp_min(0.0)

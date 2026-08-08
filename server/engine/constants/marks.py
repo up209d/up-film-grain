@@ -10,12 +10,23 @@ _TEX_LUM_FLOOR = 0.25
 # Every constant below describes one speck's *shape*. See `_dust_sites` for why
 # dust is drawn one speck at a time rather than thresholded out of a field.
 #
-# Eccentricity: a speck's two semi-axes are `r * (1 +- e)` with `e` drawn up to
-# this. **Not zero, and not much larger.** A population of exact circles is the
-# single clearest tell that a texture was generated -- real debris is a chip or
-# a fibre-end seen at some angle, so it is a little oval and pointing somewhere.
-# Past about 0.4 the specks start reading as short scratches instead.
-_DUST_ECCENT = 0.35
+# Eccentricity: a speck's two semi-axes are `r * (1 +- e)`, with `e` drawn
+# uniformly up to a ceiling that `dust_irregular` slides between these two.
+#
+# **It used to be one fixed 0.35 that the slider did not touch**, which is the
+# defect this pair fixes (2026-08-08, reported): at `dust_irregular` 0 the
+# harmonics switched off but the ellipse did not, so a third of the population
+# came out as clean, obviously oval specks with nothing irregular about them --
+# the one shape that reads as generated.
+#
+# LO is 0.10 rather than 0: a population of exact circles is the *other* clearest
+# tell, and at 0.10 a speck is 90% round, which is "not quite a circle" rather
+# than "an ellipse". HI is 0.55, past the old fixed value and past the 0.4 where
+# specks start reading as short scratches -- deliberately, because that is what
+# the top of an irregularity slider is for. The harmonics scale with the same
+# slider, so the two kinds of distortion arrive together.
+_DUST_ECCENT_LO = 0.10
+_DUST_ECCENT_HI = 0.55
 
 # Amplitudes of the 3rd, 4th and 5th angular harmonics perturbing the ellipse's
 # radius, each with its own random phase. This is what "imperfect" means here
@@ -228,7 +239,8 @@ _LEAK_GAIN = 2.0
 
 __all__ = [
     '_TEX_LUM_FLOOR',
-    '_DUST_ECCENT',
+    '_DUST_ECCENT_LO',
+    '_DUST_ECCENT_HI',
     '_DUST_HARMONICS',
     '_DUST_SIZE_SPREAD',
     '_DUST_EDGE_MIN',

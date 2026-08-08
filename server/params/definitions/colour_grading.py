@@ -43,7 +43,26 @@ PARAMS: list[Param] = [
     ),
     Param(
         "grade_recover_radius", "Reconstruction Radius", "Colour Grading",
-        4.0, 200.0, 1.0, 32.0, "px",
+        # Topped at 64, not 200 (2026-08-08). **The old ceiling was
+        # unsupportable at any tile size on any machine**, not merely slow.
+        # `pad_for` triples the kernel sum and `tile_for` then shrinks the tile
+        # to fit the memory budget, so a radius costs three times over: kernel
+        # work, a smaller tile, and overdraw on every one of them. Measured at
+        # 12MP with reconstruction on, one fresh process each:
+        #
+        #   32 (default)  pad  252  tile 2208   4 tiles  1.32x   3.12s
+        #   100           pad  558  tile 1568   6 tiles  2.14x  10.45s
+        #   200           pad 1008  tile  768  24 tiles  9.14x  79.67s
+        #
+        # 25x from one slider, and 11.0x overdraw at 24MP. Holding overdraw at
+        # 2x would need `tile >= 4.83 * pad`, i.e. a 5072 tile whose working set
+        # at supersample 2 is ~221GB -- there is no tiling that rescues it. On
+        # the CPU it is worse still: 100 takes 56.5s for a *proxy* against 5.7s
+        # at the default, and 200 did not finish in four minutes.
+        #
+        # 64 holds pad at ~409. No shipped preset goes near either number, so
+        # nothing in `presets/` changes; `sanitize` clamps anything that did.
+        4.0, 64.0, 1.0, 32.0, "px",
         "How far Highlight Reconstruction looks for a valid measurement of a "
         "clipped channel, at full resolution. This is the size of the blown "
         "area it can work across: a highlight wider than the radius has no "
@@ -213,7 +232,11 @@ PARAMS: list[Param] = [
     ),
     Param(
         "grade_clarity_radius", "Clarity Radius", "Colour Grading",
-        2.0, 80.0, 0.5, 14.0, "px",
+        # Topped at 48, not 80 (2026-08-08), for `grade_recover_radius`' reason
+        # in a milder form: at 80 the pad goes 108 -> 492 and a 24MP export
+        # renders 2.23x its own area. Measured at 12MP, 1.76s -> 2.66s. 48 keeps
+        # it near 1.5x. No shipped preset exceeds the default 14.
+        2.0, 48.0, 0.5, 14.0, "px",
         "Which band Clarity works on, as a radius at full resolution. Small is "
         "fine texture and starts competing with the grain further down the "
         "pipeline; large is broad shaping that reads as light rather than as "

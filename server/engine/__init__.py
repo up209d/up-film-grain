@@ -44,7 +44,7 @@ from .colour import (
     _MID_GREY, _apply_lut, _characteristic_curve, _linear_to_srgb, _recon_estimate, _reconstruct_highlights, _shoulder, _soft_knee, _srgb_to_linear, _tone_roll,
 )
 from .device import (
-    _RENDER_BUDGET_FRACTION, _TILE_MAX, _TILE_MIN, _WORKING_BYTES_PER_PX, _render_budget_bytes, device_name, pick_device,
+    _GRAIN_CACHE_SHARE, _RENDER_BUDGET_FRACTION, _TILE_BUDGET_SHARE, _TILE_MAX, _TILE_MIN, _WORKING_BYTES_PER_PX, _grain_cache_bytes, _render_budget_bytes, _tile_budget_bytes, device_name, pick_device, release_cache,
 )
 from .exceptions import RenderCancelled
 from .marks import (
@@ -59,7 +59,7 @@ from .noise.lattice import (
     _HASH_KX, _HASH_KY, _HASH_M1, _HASH_M2, _cell_noise, _lat_span, _lattice_np, _lsr, _u64, _value_noise,
 )
 from .primitives import (
-    _blur, _hsv_to_rgb, _hue_sat, _isophote, _luma, _rotate_hue, _smootherstep, _smoothstep, _spread, _warp,
+    _BLUR_DECIMATE_TO, _BLUR_EXACT_MAX_SIGMA, _blur, _hsv_to_rgb, _hue_sat, _isophote, _luma, _rotate_hue, _smootherstep, _smoothstep, _spread, _warp,
 )
 from .constants import *  # noqa: F401,F403
 
@@ -77,7 +77,8 @@ __all__ = [
     '_BLUE_RANGE',
     '_BLUE_SAT_FLOOR',
     '_DUST_DARK_LUM',
-    '_DUST_ECCENT',
+    '_DUST_ECCENT_HI',
+    '_DUST_ECCENT_LO',
     '_DUST_EDGE_MAX',
     '_DUST_EDGE_MIN',
     '_DUST_EDGE_PX',
@@ -85,7 +86,6 @@ __all__ = [
     '_DUST_LITE_LUM',
     '_DUST_SIZE_SPREAD',
     '_DUST_SOFT_FADE',
-    '_GG_CACHE_BYTES',
     '_GLAYER_SEEDS',
     '_GNORM',
     '_GRADE_CLARITY_GAIN',
@@ -166,6 +166,8 @@ __all__ = [
     '_WARM_RAW',
     '_WORKING_BYTES_PER_PX',
     '_apply_lut',
+    '_BLUR_DECIMATE_TO',
+    '_BLUR_EXACT_MAX_SIGMA',
     '_blur',
     '_cell_noise',
     '_characteristic_curve',
@@ -193,7 +195,12 @@ __all__ = [
     '_mark_window',
     '_recon_estimate',
     '_reconstruct_highlights',
+    '_GRAIN_CACHE_SHARE',
+    '_TILE_BUDGET_SHARE',
+    '_grain_cache_bytes',
     '_render_budget_bytes',
+    '_tile_budget_bytes',
+    'release_cache',
     '_rotate_hue',
     '_scatter_offsets',
     '_shoulder',

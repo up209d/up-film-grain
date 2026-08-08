@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from .constants.marks import (
-    _DUST_ECCENT, _DUST_ROUGH_SPREAD, _DUST_SIZE_SPREAD, _HAIR_ALPHA, _HAIR_CURVE, _HAIR_LEN_SPREAD, _HAIR_SLOPE, _HAIR_WIDTH_SPREAD, _HAIR_WOBBLE, _LEAK_CORNER_BIAS, _LEAK_PHI, _MARK_JITTER, _NOISE_ICDF, _R2_A1, _R2_A2,
+    _DUST_ROUGH_SPREAD, _DUST_SIZE_SPREAD, _HAIR_ALPHA, _HAIR_CURVE, _HAIR_LEN_SPREAD, _HAIR_SLOPE, _HAIR_WIDTH_SPREAD, _HAIR_WOBBLE, _LEAK_CORNER_BIAS, _LEAK_PHI, _MARK_JITTER, _NOISE_ICDF, _R2_A1, _R2_A2,
 )
 
 def _threshold_for(fraction: float) -> float:
@@ -202,7 +202,14 @@ def _dust_sites(count: int, seed: int, balance: float) -> list[dict]:
             # Squared draw above: small debris outnumbers large debris, and a
             # flat draw puts as many 1.5x specks on the frame as 0.6x ones,
             # which reads as gravel rather than dust.
-            "eccent": _DUST_ECCENT * u[3],
+            # The raw 0..1 draw, **not** scaled by a fixed ceiling here any
+            # more (2026-08-08). How elongated a speck may get is now a
+            # function of `dust_irregular`, which the draw site cannot see --
+            # so the site records the draw and `_film_texture` scales it. It
+            # used to bake in a fixed 0..0.35, which meant even at
+            # `dust_irregular` 0 a third of the population came out as clean,
+            # obvious ellipses. Reported as exactly that.
+            "eccent": u[3],
             "angle": u[4] * 2.0 * math.pi,
             "phase": tuple(v * 2.0 * math.pi for v in u[5:8]),
             # How lumpy this particular speck is, before `dust_irregular`

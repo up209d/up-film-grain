@@ -12,7 +12,11 @@ from .constants.edge import (
     _AA_DIR_K, _AA_DIR_MIN, _AA_PASSES, _JITTER_MAX, _SAND_DIR_K, _SAND_PASSES,
 )
 from .constants.grade import _RECON_ROLL_GATE_FRAC
-from .device import _TILE_MAX, _TILE_MIN, _WORKING_BYTES_PER_PX, _render_budget_bytes
+from .device import (
+    _RELEASE_MIN_SHARE, _TILE_MAX, _TILE_MIN, _WORKING_BYTES_PER_PX,
+    _tile_budget_bytes, release_cache,
+)
+from .checkpoint import upstream_signature
 from .exceptions import RenderCancelled
 
 class TilingMixin:
@@ -59,21 +63,57 @@ class TilingMixin:
         if op <= 0.0:
             return img
 
-        if ss <= 1:
+        if abs(ss - 1.0) < 1e-6:
             r = self.render(img, p, scale, y0, x0, full_hw)
         else:
             h, w = img.shape[-2:]
+            # Rounded to whole pixels, and the *rounded* factor is what the rest
+            # of the call uses. A fractional request like 1.5 cannot give a whole
+            # working grid on every tile, and `scale`, `y0`, `x0` and `full_hw`
+            # all have to agree with the grid actually rendered or the noise
+            # lattice resolves to different global coordinates than the geometry
+            # does -- which is invariant 2, and it seams.
+            sh, sw = max(1, round(h * ss)), max(1, round(w * ss))
+            eff_y, eff_x = sh / h, sw / w
             up = F.interpolate(
-                img, size=(h * ss, w * ss), mode="bicubic", align_corners=False
+                img, size=(sh, sw), mode="bicubic", align_corners=False
             ).clamp(0.0, 1.0)
             # Working resolution and tile offset both scale, so the noise
             # lattice still resolves to the same global full-resolution
             # coordinates. Frame size scales with the working resolution
             # exactly as the tile offset does, so a normalised frame position
             # resolves the same.
-            fh = None if full_hw is None else (full_hw[0] * ss, full_hw[1] * ss)
-            r = self.render(up, p, scale * ss, y0 * ss, x0 * ss, fh)
-            r = F.avg_pool2d(r, ss)
+            fh = (None if full_hw is None
+                  else (full_hw[0] * eff_y, full_hw[1] * eff_x))
+            r = self.render(up, p, scale * eff_x, y0 * eff_y, x0 * eff_x, fh)
+            # **`avg_pool2d` whenever the factor is a whole number**, which is
+            # every setting that existed before fractional supersampling did.
+            # This is not a preference: an antialiased `interpolate` at 2x is a
+            # 4-tap triangular filter, not a 2x2 box, so swapping it in
+            # unconditionally would quietly reroll the look of every shipped
+            # preset. `verify.py` pins 2x and 3x bit-exact against the old path.
+            #
+            # Fractional factors have no whole pooling window, so they take an
+            # antialiased bilinear resample -- a triangular filter rather than a
+            # box, which is not what 2x does and does not need to be: 1.5x is a
+            # new setting with no shipped look to preserve. (`mode="area"` would
+            # be the closer analogue and is deliberately not used: MPS refuses
+            # adaptive pooling at non-divisible sizes, so it would work on CPU
+            # and raise on the GPU.) Below 1 the frame was rendered *smaller*
+            # than its output and has to come back up instead, which is bicubic
+            # like every other upsample here.
+            k = sh // h if (sh % h == 0 and sw % w == 0 and sh // h == sw // w) else 0
+            if k >= 2:
+                r = F.avg_pool2d(r, k)
+            elif sh >= h:
+                r = F.interpolate(
+                    r, size=(h, w), mode="bilinear", antialias=True,
+                    align_corners=False,
+                )
+            else:
+                r = F.interpolate(
+                    r, size=(h, w), mode="bicubic", align_corners=False,
+                ).clamp(0.0, 1.0)
 
         # Cross-faded display-referred, where both images already live, rather
         # than round-tripping through linear. This is a compositing control --
@@ -95,6 +135,43 @@ class TilingMixin:
         if op < 1.0:
             r = img + (r - img) * op
         return r
+
+    # ------------------------------------------------------------------ #
+    def _ckpt_key(self, boundary: str, p: dict, scale: float,
+                  y0: float, x0: float, h: int, w: int):
+        """Key for a checkpoint at ``boundary``, or None if checkpointing is off.
+
+        Everything the frame at that boundary depends on: which image and tier
+        (`_ckpt_id`), where in it (`y0, x0, h, w` -- absolute, like every other
+        cache here, so invariant 1 is untouched), at what working scale, and
+        every parameter above the boundary. Miss one and the app renders a
+        plausible but wrong photograph.
+        """
+        if self._ckpt_id is None or self.ckpt.cap <= 0:
+            return None
+        return (
+            self._ckpt_id, boundary, float(scale), float(y0), float(x0), h, w,
+            str(self.device), upstream_signature(p, boundary),
+        )
+
+    # ------------------------------------------------------------------ #
+    def _poll_cancel(self) -> None:
+        """Give up if a newer render has superseded this one.
+
+        Called at every stage boundary inside `render()`. **Per tile was not
+        enough and the reason is the preview**: `tile_for` returns 2400 for a
+        2400px proxy, so a proxy render takes `render_image`'s single-pass
+        branch, where `should_cancel` was checked exactly once before the pass
+        began. Measured 2026-08-08 on `SuperPortra`: **one poll in 7.91s** on the
+        GPU, 21.5s on the CPU. Every one of those seconds was spent on a frame
+        the client had already abandoned, holding the render lock throughout.
+
+        A stage boundary is the right granularity for the same reason a tile
+        boundary was: no plumbing inside the stages, and the wasted work is
+        bounded by the longest single stage rather than by the whole render.
+        """
+        if self._cancel is not None and self._cancel():
+            raise RenderCancelled()
 
     # ------------------------------------------------------------------ #
     def pad_for(self, p: dict, scale: float) -> int:
@@ -306,10 +383,18 @@ class TilingMixin:
         `_WORKING_BYTES_PER_PX` is measured, not guessed -- see its comment. The
         answer is clamped into `_TILE_MIN`..`_TILE_MAX` and never exceeds what
         the image actually needs, so a small frame still renders in one pass.
+
+        The budget is `_tile_budget_bytes`, the renderer's *share* of the pool,
+        not the whole of it. That is a real change and it costs tiles: the
+        texture cache used to take a flat 0.5GB on top of whatever this claimed,
+        so the two together overran the pool by design. Sharing it explicitly
+        makes a tile ~20% smaller and the cache large enough to hit -- measured
+        7.36s -> 1.78s on a `SuperPortra` proxy, against a few percent of extra
+        overdraw here.
         """
         pad = self.pad_for(p, scale)
-        budget = _render_budget_bytes()
-        ss = max(1, int(ss))
+        budget = _tile_budget_bytes()
+        ss = max(0.25, float(ss))
         longest = max(h, w)
 
         def fits(tile: int) -> bool:
@@ -341,7 +426,7 @@ class TilingMixin:
 
     def render_view(
         self, arr: np.ndarray, p: dict, box: tuple[int, int, int, int],
-        zoom: float = 1.0, supersample: int = 2,
+        zoom: float = 1.0, supersample: float = 2.0,
     ) -> np.ndarray:
         """Render ``box`` = (y, x, h, w) of ``arr`` at a display ``zoom``.
 
@@ -390,7 +475,7 @@ class TilingMixin:
         # zooming in would drag the leak around with the viewport.
         fh, fw = arr.shape[0] * scale, arr.shape[1] * scale
         r = self.render_supersampled(
-            t, p, scale, ya * scale, xa * scale, max(1, int(supersample)),
+            t, p, scale, ya * scale, xa * scale, max(0.25, float(supersample)),
             (float(fh), float(fw)),
         )
         r = r.squeeze(0).permute(1, 2, 0).cpu().numpy()
@@ -401,7 +486,7 @@ class TilingMixin:
 
     def render_crop(
         self, arr: np.ndarray, p: dict, box: tuple[int, int, int, int],
-        scale: float = 1.0, supersample: int = 2,
+        scale: float = 1.0, supersample: float = 2.0,
     ) -> np.ndarray:
         """1:1 render of ``box``, bit-identical to the same region of a full
         render. Thin wrapper kept for the invariant checks."""
@@ -410,30 +495,54 @@ class TilingMixin:
     # ------------------------------------------------------------------ #
     def render_image(
         self, arr: np.ndarray, p: dict, scale: float = 1.0,
-        tile: int = 1024, supersample: int = 2, progress=None,
-        should_cancel=None,
+        tile: int = 1024, supersample: float = 2.0, progress=None,
+        should_cancel=None, checkpoint_id=None,
     ) -> np.ndarray:
         """Render a whole image, tiling when it is larger than ``tile``.
 
         ``arr`` is HxWx3 float32 in 0..1. Returns the same shape.
 
-        ``should_cancel``, if given, is polled once per tile and once before the
-        single-tile path; returning true raises `RenderCancelled`. Tile
-        granularity is deliberate: it needs no plumbing inside `render`, and it
-        bounds the wasted work at one tile. It matters because the caller cannot
-        interrupt this any other way -- a Starlette threadpool worker runs to
-        completion whatever the client does, so an abandoned preview would
-        otherwise keep the render lock for its full duration and every request
-        behind it would queue on work nobody is waiting for.
+        ``should_cancel``, if given, is polled once per tile **and at every stage
+        boundary inside `render`** (see `_poll_cancel`); returning true raises
+        `RenderCancelled`. It matters because the caller cannot interrupt this any
+        other way -- a Starlette threadpool worker runs to completion whatever the
+        client does, so an abandoned preview would otherwise keep the render lock
+        for its full duration and every request behind it would queue on work
+        nobody is waiting for.
+
+        Tile granularity alone used to be the whole of it, and it was the wrong
+        unit for the case that matters: a proxy preview is a *single* tile, so it
+        polled once and then ran to completion regardless. See `_poll_cancel`.
         """
         # Nothing switched on: hand the input straight back. Not merely an
         # optimisation -- see params.is_neutral for why rendering it would
         # *not* return the input.
         if P.is_neutral(p):
             return arr
-        if should_cancel is not None and should_cancel():
-            raise RenderCancelled()
-        ss = max(1, int(supersample))
+        self._cancel = should_cancel
+        self._ckpt_id = checkpoint_id
+        try:
+            return self._render_image(arr, p, scale, tile, supersample, progress)
+        except RenderCancelled:
+            # An abandoned render's tensors are dead the moment the exception
+            # unwinds, but the allocator keeps their blocks -- which on a
+            # superseded preview is the whole working set, reserved against a
+            # frame nobody will ever see. The render that supersedes it is about
+            # to ask for the same memory, so hand it back rather than making it
+            # grow the pool.
+            release_cache(self.device)
+            raise
+        finally:
+            self._cancel = None
+            self._ckpt_id = None
+
+    def _render_image(
+        self, arr: np.ndarray, p: dict, scale: float, tile: int,
+        supersample: float, progress,
+    ) -> np.ndarray:
+        """`render_image`'s body, with the cancel hook already installed."""
+        self._poll_cancel()
+        ss = max(0.25, float(supersample))
         h, w, _ = arr.shape
         if max(h, w) <= tile:
             t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
@@ -442,6 +551,14 @@ class TilingMixin:
             )
             if progress:
                 progress(1.0)
+            # **No `release_cache` here, deliberately.** A single-tile render has
+            # no peak to bound -- it is one allocation cycle and the numbers are
+            # the same whether the blocks are handed back or not -- so all the
+            # call would buy is making the *next* render re-acquire them.
+            # Measured, and it is not free: `Stock`'s proxy went 1.13s -> 1.45s
+            # and `VintageDarkGrainy`'s 1.64s -> 1.94s with a release on this
+            # path, for no memory saved. The tiled path below is where holding
+            # the free list actually costs something.
             return out.squeeze(0).permute(1, 2, 0).cpu().numpy()
 
         # Overlap must cover every blur kernel in the pipeline plus the warp.
@@ -451,10 +568,17 @@ class TilingMixin:
         ny = math.ceil(h / tile)
         nx = math.ceil(w / tile)
         done = 0
+        # Whether handing blocks back between tiles is worth the stall it costs.
+        # Decided once from the worst tile rather than per tile, so every tile of
+        # one render behaves the same way. See `_RELEASE_MIN_SHARE`.
+        worst = (min(h, tile + 2 * pad) * ss) * (min(w, tile + 2 * pad) * ss)
+        release = (
+            worst * _WORKING_BYTES_PER_PX
+            >= _RELEASE_MIN_SHARE * _tile_budget_bytes()
+        )
         for ty in range(ny):
             for tx in range(nx):
-                if should_cancel is not None and should_cancel():
-                    raise RenderCancelled()
+                self._poll_cancel()
                 y_a, y_b = ty * tile, min((ty + 1) * tile, h)
                 x_a, x_b = tx * tile, min((tx + 1) * tile, w)
                 # padded read window, clamped to the image
@@ -475,6 +599,18 @@ class TilingMixin:
                     :,
                 ]
                 done += 1
+                # This tile's device tensors are dead the moment `r` is on the
+                # host. Handing their blocks back *between* tiles rather than
+                # letting the allocator hoard them is what keeps
+                # `_WORKING_BYTES_PER_PX` honest -- and it is faster, not merely
+                # leaner, because on unified memory the free list is system RAM.
+                #
+                # Between, not after: releasing past the last tile would only
+                # make the next render re-acquire what it is about to ask for
+                # again, which is the cost the single-tile path above measures.
+                if release and done < ny * nx:
+                    del t, r
+                    release_cache(self.device)
                 if progress:
                     progress(done / float(ny * nx))
         return out

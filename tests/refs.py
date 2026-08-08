@@ -1,4 +1,5 @@
-"""Deliberately slow reference implementations of three noise routines.
+"""Deliberately slow reference implementations of three noise routines and
+the exact gaussian blur.
 
 A faster rewrite of a noise generator is only correct if it changes
 nothing, and "the render still looks like grain" cannot tell you that --
@@ -6,6 +7,10 @@ so `verify.py` asserts bit-equality against these rather than measuring a
 property. `grain_ref` carries a second job: it searches a wider 5x5
 neighbourhood than the engine's 3x3, so it is also the proof behind
 `_GRAIN_RINGS` written out as a measurement.
+
+`blur_ref` is here for a related but distinct reason: `_blur` is *not*
+bit-exact any more above `_BLUR_EXACT_MAX_SIGMA`, so the check needs
+something that still is, on both sides of that threshold.
 
 Deleting these turns those checks into tautologies. See CLAUDE.md.
 """
@@ -16,6 +21,7 @@ import math
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from server.engine import (
     _GRAIN_COS, _GRAIN_FILL, _GRAIN_SHARE, _GRAIN_SIN, _GRAIN_SLOTS,
@@ -108,3 +114,28 @@ def grain_ref(h, w, y0, x0, lo, hi, seed, device, nfields=1):
     val = num / den.clamp_min(1e-12)
     return (0.5 + (0.5 * _grain_gain(lo, hi))
             * peak.unsqueeze(0) * val).unsqueeze(0)
+
+
+def blur_ref(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """The separable gaussian, always exact -- `_blur` before it grew a
+    decimated path for large sigma.
+
+    Kept verbatim rather than derived, because it is the thing the threshold is
+    measured against. Below `_BLUR_EXACT_MAX_SIGMA` the engine must equal this
+    bit for bit; above it, this is what the tolerance is a tolerance *of*.
+    """
+    if sigma < 0.05:
+        return x
+    r = max(1, int(math.ceil(sigma * 3.0)))
+    r = min(r, min(x.shape[-1], x.shape[-2]) - 1)
+    if r < 1:
+        return x
+    k = torch.arange(-r, r + 1, device=x.device, dtype=x.dtype)
+    k = torch.exp(-(k * k) / (2.0 * sigma * sigma))
+    k = k / k.sum()
+    c = x.shape[1]
+    kx = k.view(1, 1, 1, -1).expand(c, 1, 1, -1).contiguous()
+    ky = k.view(1, 1, -1, 1).expand(c, 1, -1, 1).contiguous()
+    x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="reflect"), kx, groups=c)
+    x = F.conv2d(F.pad(x, (0, 0, r, r), mode="reflect"), ky, groups=c)
+    return x

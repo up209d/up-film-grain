@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 
 # Luma coefficients (Rec. 709).
 _LUMA = (0.2126, 0.7152, 0.0722)
@@ -18,18 +16,21 @@ EDGE_REF = 0.06
 # per-image statistic, so tiles stay seamless.
 _GNORM = 0.55
 
-# Byte cap on the Global Grain texture cache (see `_global_grain_field`). Sized
-# for a handful of tiles at preview resolution -- one entry is [1,3,h,w] at
-# *working* resolution, so 113MB per tile at tile 1536 / supersample 2, or ~38MB
-# for the monochrome case. Capped by bytes rather than by entry count for
-# exactly that reason: an entry-count cap sized for the chroma case would hold
-# three times too much memory when chroma is off, and vice versa.
+# The Global Grain texture cache's byte cap **is not here any more** (moved
+# 2026-08-08). It is `device._grain_cache_bytes()`, derived from the same pool
+# `tile_for` sizes tiles against.
 #
-# Shared budget, not an independent one: this competes with the working set that
-# `tile_for` sizes tiles against, so raising one means lowering the other.
-_GG_CACHE_BYTES = int(
-    float(os.environ.get("FILM_GRAIN_GRAIN_CACHE_GB", "0.5")) * (1 << 30)
-)
+# It was a flat 0.5GB, and it was wrong in a way a constant cannot fix: the
+# comment sizing it described tile 1536 and *one* layer, both of which stopped
+# being true when `tile_for` started computing the tile and the section grew to
+# five layers. `SuperPortra` at a 2400px proxy needs 922MB, so the LRU held two
+# entries of five and every render missed all of them -- measured 0 hits, 5
+# misses, on re-renders with identical parameters.
+#
+# It cannot live here regardless, now that it is derived: rule 1 in
+# `docs/architecture.md` is that `engine/constants/` imports nothing from the
+# rest of the engine, and this needs `_render_budget_bytes`. The budget split
+# between renderer and cache belongs with the other memory decisions anyway.
 
 # Converts the 0..100 intensity slider into image-referred amplitude. Chosen so
 # the default intensity of 32 lands near 3.5% luminance sigma in the midtones,
@@ -126,7 +127,6 @@ __all__ = [
     '_LUMA',
     'EDGE_REF',
     '_GNORM',
-    '_GG_CACHE_BYTES',
     '_AMP_SCALE',
     '_MIN_CELL',
     '_GSRC_KEYS',

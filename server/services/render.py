@@ -26,7 +26,14 @@ def render_tier(up: Upload, p: dict, ss: int, full: bool, progress=None,
     # machine, per preset (a wide kernel pads more) and per supersample. See
     # `tile_for` for the measurements.
     tile = ENGINE.tile_for(p, sc, int(src.shape[0]), int(src.shape[1]), ss)
+    # The checkpoint id has to distinguish the *image* and the *tier*: two
+    # photographs of the same dimensions with the same parameters would
+    # otherwise key identically, and the proxy and the 1:1 render are different
+    # frames of the same photograph. The working scale is in the key too, but
+    # only via `sc`, which is 1.0 for both an untouched full-res source and the
+    # full tier -- hence naming the tier outright.
     return ENGINE.render_image(
         src, p, sc, tile=tile, supersample=ss, progress=progress,
         should_cancel=should_cancel,
+        checkpoint_id=f"{up.id}:{'full' if full else 'proxy'}",
     )

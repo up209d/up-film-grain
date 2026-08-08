@@ -8,7 +8,6 @@ import {
   exportStatus,
   startExport,
   type ExportJob,
-  type ExportScale,
   type ImageMeta,
 } from "../services/api";
 
@@ -22,17 +21,15 @@ export function useExport(opts: {
   onError: (msg: string) => void;
 }) {
   const [format, setFormat] = useState("jpeg");
-  /** Full resolution, or the proxy exactly as previewed. Not a size choice:
-   *  the proxy renders every length at proxy scale, so its grain is the grain
-   *  on screen. Downscaling a 1:1 export to the same pixels would not match.
+  /** How finely the export renders. **Not a size choice** -- every export is
+   *  the source's own dimensions now, so this is quality alone.
    *
-   *  Defaults to the enlarged proxy rather than a fresh full-size render,
-   *  changed on request: what you dialled in is what the preview showed you, so
-   *  the file that matches it is the one that starts from those pixels. A
-   *  full-size render of the same numbers is a *different* picture -- finer,
-   *  denser grain -- and having that be the default made the export quietly
-   *  disagree with the screen. */
-  const [exportScale, setExportScale] = useState<ExportScale>("preview_full");
+   *  Its own state rather than the Quality picker's, because the two are
+   *  answering different questions: that one trades preview latency for
+   *  fidelity while you work, and a file you are going to keep should not
+   *  inherit whatever you left it on. Defaults to 2, which is what every preset
+   *  was dialled in against. */
+  const [exportSs, setExportSs] = useState(2);
   const [job, setJob] = useState<ExportJob | null>(null);
 
   const doExport = async () => {
@@ -42,9 +39,8 @@ export function useExport(opts: {
         id: opts.meta.id,
         params: opts.values,
         format,
-        supersample: opts.supersample,
+        supersample: exportSs,
         quality: 95,
-        scale: exportScale,
         reference_mp: opts.scaleToRef ? opts.referenceMp : null,
         lut: opts.lut,
       });
@@ -66,5 +62,5 @@ export function useExport(opts: {
     }
   };
 
-  return { format, setFormat, exportScale, setExportScale, job, setJob, doExport };
+  return { format, setFormat, exportSs, setExportSs, job, setJob, doExport };
 }

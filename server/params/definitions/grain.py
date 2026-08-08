@@ -11,10 +11,26 @@ PARAMS: list[Param] = [
     ),
     Param(
         "grain_size", "Clump Size", "Grain Structure",
-        0.1, 10.0, 0.05, 1.6, "px",
+        # Floored at 0.4, not 0.1 (2026-08-08). **0.1 to 0.4 was a dead zone
+        # that cost 1.8x for a bit-identical grain field.** Both floor to
+        # `_MIN_CELL`, so `_grain_field` returns the same field (verified
+        # 0.00e+00); what escapes the floor is the *secondary* fields, whose
+        # cells are `grain_size * scale * 2` and `* 3` -- the ragged edge
+        # envelope and the jitter displacement. Those got finer and denser
+        # without the grain itself getting finer at all. Measured on a 2400px
+        # proxy: 0.53s at 0.1, 0.52s at 0.4, 0.47s at 0.8.
+        #
+        # Ten of the twelve shipped presets sat at 0.1 and were re-authored to
+        # 0.4 in the same change. The look moves, slightly and only at edges:
+        # mean 0.06 levels on `Stock` and 0.09 on `SuperPortra`, p99 1.3 and 1.9
+        # levels, with 1.1-1.3% of pixels moving by more than one 8-bit level.
+        0.4, 10.0, 0.05, 1.6, "px",
         "Silver-halide clump diameter, measured at full resolution -- the "
         "finest structure in the grain. Octaves stack coarser scales on top of "
-        "it. Held in full-res units, so it means the same thing at any zoom.",
+        "it. Held in full-res units, so it means the same thing at any zoom. "
+        "The bottom of the range is where the lattice hits its own floor: below "
+        "about 0.4 the clump cannot get any finer, so asking for less only "
+        "sharpens the edge envelope and the jitter around it.",
         spatial=True,
     ),
     Param(

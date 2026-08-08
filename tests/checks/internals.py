@@ -8,13 +8,16 @@ from __future__ import annotations
 
 import numpy as np
 import os
+import torch
 from server import params as P
+from tests.refs import blur_ref
 from tests.refs import grain_ref
 from tests.refs import lattice_ref
 from tests.refs import span_ref
 from tests.scene import scene
 from server.engine import (
-    GrainEngine, RenderCancelled, _grain_points, _lat_span, _lattice_np,
+    GrainEngine, RenderCancelled, _BLUR_EXACT_MAX_SIGMA, _blur, _grain_points,
+    _lat_span, _lattice_np,
 )
 from tests.harness import Ctx, check, suite
 
@@ -104,6 +107,58 @@ def run(cx: Ctx) -> None:
     check("the 3x3 search and unrolled weight change nothing",
           gr_worst < 1e-6, f"worst deviation {gr_worst:.2e} over 6 configurations")
 
+    # -- the large-sigma blur is exact below its threshold --------------------
+    #
+    # `_blur` drops to a decimated grid above `_BLUR_EXACT_MAX_SIGMA`, which is
+    # the one approximation in the pipeline. **The threshold is the whole safety
+    # argument**, so it is checked from both sides: everything below it must be
+    # bit-identical to the exact convolution, and everything above it must stay
+    # inside a stated tolerance rather than merely "look blurred".
+    #
+    # The bit-identity half is the important one. It is what lets every other
+    # check in this suite keep asserting 0.00e+00 -- if the exact path ever
+    # drifted, the failure would show up here as a threshold bug rather than as
+    # a dozen unrelated tolerances quietly needing to be loosened.
+    tb = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(dev)
+    exact_worst = 0.0
+    for s in (0.5, 2.0, 8.0, 20.0, _BLUR_EXACT_MAX_SIGMA - 0.1):
+        exact_worst = max(exact_worst, float(
+            (_blur(tb, s, (0.0, 0.0)) - blur_ref(tb, s)).abs().max()
+        ))
+    # Passing an origin is what *enables* decimation, so these pass one -- a
+    # caller that omits it gets the exact path at every sigma, which is the
+    # default and is separately worth stating.
+    no_origin = float((_blur(tb, 80.0) - blur_ref(tb, 80.0)).abs().max())
+    check("without an origin the blur is exact at any sigma",
+          no_origin == 0.0, f"sigma 80 with no origin: {no_origin:.2e}")
+    check("below the threshold the blur is the exact convolution",
+          exact_worst == 0.0,
+          f"worst deviation {exact_worst:.2e} over sigma 0.5-{_BLUR_EXACT_MAX_SIGMA - 0.1}")
+
+    # Above it, measured as a share of the blurred field's own peak -- an
+    # absolute delta says nothing useful about a field whose amplitude falls as
+    # the kernel widens.
+    #
+    # 1.5% is a real bound rather than a rubber stamp, and it is set by *this
+    # scene* rather than by the pipeline: the fixture is deliberately built out
+    # of hard synthetic edges (a black block, a 0.99 disc), which is the worst
+    # possible input for a decimated resample. Measured here it peaks at 1.11%
+    # at sigma 80; on the scratch mark field the stage actually blurs it is
+    # 0.7%, and on noise 0.22-0.64%. For scale, the whole scratch layer moves
+    # 0.06% of a frame's pixels by more than one 8-bit level, so an error of
+    # 1% *of that layer's peak* is orders below anything visible.
+    decim_worst = 0.0
+    for s in (_BLUR_EXACT_MAX_SIGMA + 0.1, 40.0, 54.0, 80.0, 120.0):
+        ref_b = blur_ref(tb, s)
+        peak = float(ref_b.abs().max())
+        decim_worst = max(decim_worst, float(
+            (_blur(tb, s, (0.0, 0.0)) - ref_b).abs().max()
+        ) / max(peak, 1e-9))
+    check("above the threshold it stays within 1.5% of peak",
+          decim_worst < 0.015,
+          f"worst {decim_worst * 100:.2f}% of peak over sigma "
+          f"{_BLUR_EXACT_MAX_SIGMA + 0.1}-120 on the hard-edged fixture")
+
     # -- the Global Grain texture cache --------------------------------------
     #
     # The one failure mode here is a key that misses an input, and it fails
@@ -168,6 +223,107 @@ def run(cx: Ctx) -> None:
     check("the cache is keyed on absolute coordinates", d < 2e-3,
           f"tiled vs whole-image, warm cache: {d:.2e}")
 
+    # A superseded parameter state can never be asked for again, so it is
+    # dropped on sight rather than left for memory pressure to evict. Two
+    # generations are kept -- one would make dragging a slider back and forth
+    # rebuild every time.
+    #
+    # Tested as *resident bytes*, not as a hit rate: the failure mode is the
+    # cache quietly holding the whole budget in fields nothing can reach, which
+    # renders perfectly and simply starves the machine. On an 8GB box that is
+    # most of the allowance.
+    ev_eng = GrainEngine(dev)
+    for i in range(6):
+        q = P.sanitize({**gp, "global_size": 1.6 + 0.1 * i})
+        ev_eng.render_image(gimg, q, 1.0, tile=4096, supersample=1)
+    gens = len({k[5:] for k in ev_eng._gg_cache})
+    check("superseded cache generations are dropped, not merely aged",
+          gens <= 2 and ev_eng.gg_evicted > 0,
+          f"{gens} generations resident after 6 distinct parameter states, "
+          f"{ev_eng.gg_evicted} entries evicted, "
+          f"{ev_eng._gg_bytes / 1e6:.0f} MB held")
+
+    # And the previous generation really is kept: going back one step must hit.
+    back = P.sanitize({**gp, "global_size": 1.6 + 0.1 * 4})
+    h0 = ev_eng.gg_hits + ev_eng.gs_hits
+    ev_eng.render_image(gimg, back, 1.0, tile=4096, supersample=1)
+    check("the previous generation survives, so A/B does not rebuild",
+          ev_eng.gg_hits + ev_eng.gs_hits > h0,
+          f"stepping back one value hit {ev_eng.gg_hits + ev_eng.gs_hits - h0} entries")
+
+    # -- pipeline checkpoints ------------------------------------------------
+    #
+    # The failure mode is the worst one in the codebase: a key that misses an
+    # input returns a frame rendered from *different parameters*, and it will
+    # look like a perfectly good photograph. So this does not test that
+    # checkpointing is fast -- it tests that a warm cache is indistinguishable
+    # from no cache, one parameter at a time, against an engine that has never
+    # seen a checkpoint.
+    print("\npipeline checkpoints (a stale hit renders the wrong photograph)")
+    ck_eng = GrainEngine(dev)
+    cold_eng = GrainEngine(dev)
+    cimg = scene(240, 360)
+    cbase = P.sanitize({"global_intensity": 9.0, "halation": 0.5,
+                        "sharpen": 4.0, "dust": 20.0, "grade_exposure": 0.1,
+                        "edge_jitter": 0.4, "intensity": 30.0})
+    # Warm it.
+    ck_eng.render_image(cimg, cbase, 1.0, tile=4096, supersample=1,
+                        checkpoint_id="t:proxy")
+    same = ck_eng.render_image(cimg, cbase, 1.0, tile=4096, supersample=1,
+                               checkpoint_id="t:proxy")
+    ref = cold_eng.render_image(cimg, cbase, 1.0, tile=4096, supersample=1)
+    check("a warm checkpoint returns the identical frame",
+          float(np.abs(same - ref).max()) == 0.0 and ck_eng.ckpt.hits > 0,
+          f"maxdiff {float(np.abs(same - ref).max()):.2e}, "
+          f"{ck_eng.ckpt.hits} hits")
+
+    # One parameter from every section, changed against a warm cache. Each must
+    # come back exactly as a cold engine renders it. A key that failed to cover
+    # an upstream section shows up here as a frame that did not move.
+    probes = [
+        ("grade_exposure", 0.35), ("pre_blur", 1.2), ("pre_sharpen", 0.6),
+        ("intensity", 55.0), ("grain_size", 2.5), ("lum_low", 0.3),
+        ("edge_jitter", 1.4), ("scatter", 0.5), ("micro_blur", 1.1),
+        ("aa_strength", 1.5), ("halation", 0.95), ("halation_radius", 60.0),
+        ("brightness", -0.3), ("toe", 0.8), ("base_fog", 0.05),
+        ("global_intensity", 40.0), ("global_size", 4.0),
+        ("sharpen", 12.0), ("dust", 90.0), ("scratches", 4.0), ("seed", 99.0),
+    ]
+    worst_k, worst_d = None, 0.0
+    for k, v in probes:
+        q = P.sanitize({**{kk: vv for kk, vv in cbase.items()
+                           if kk in P.PARAM_BY_KEY}, k: v})
+        got = ck_eng.render_image(cimg, q, 1.0, tile=4096, supersample=1,
+                                  checkpoint_id="t:proxy")
+        want = cold_eng.render_image(cimg, q, 1.0, tile=4096, supersample=1)
+        d = float(np.abs(got - want).max())
+        if d > worst_d:
+            worst_k, worst_d = k, d
+    check("every section's parameters invalidate what they should",
+          worst_d == 0.0,
+          f"worst {worst_k or '-'} at {worst_d:.2e} over {len(probes)} probes")
+
+    # Two photographs of the same size with the same parameters must not share
+    # a checkpoint -- the id is what separates them, and it is the one part of
+    # the key that cannot be derived from `p`.
+    other = np.clip(cimg * 0.6 + 0.2, 0.0, 1.0)
+    a2 = ck_eng.render_image(other, cbase, 1.0, tile=4096, supersample=1,
+                             checkpoint_id="u:proxy")
+    b2 = cold_eng.render_image(other, cbase, 1.0, tile=4096, supersample=1)
+    check("a different image does not reuse another's checkpoint",
+          float(np.abs(a2 - b2).max()) == 0.0,
+          f"maxdiff {float(np.abs(a2 - b2).max()):.2e}")
+
+    # Warm cache plus tiling: the key carries absolute (y0, x0), so a tiled
+    # render must not pick up a neighbouring tile's frame.
+    t_a = ck_eng.render_image(cimg, cbase, 1.0, tile=4096, supersample=1,
+                              checkpoint_id="t:proxy")
+    t_b = ck_eng.render_image(cimg, cbase, 1.0, tile=96, supersample=1,
+                              checkpoint_id="t:proxy")
+    check("checkpoints are keyed on absolute coordinates",
+          float(np.abs(t_a - t_b).max()) < 2e-3,
+          f"tiled vs whole-image, warm: {float(np.abs(t_a - t_b).max()):.2e}")
+
     # -- tile size is chosen, not fixed --------------------------------------
     #
     # `tile_for` now derives the tile from a memory budget, so the renderer sees
@@ -227,6 +383,23 @@ def run(cx: Ctx) -> None:
         pass
     check("cancellation raises rather than returning a partial frame",
           cancelled, f"stopped after {len(polls)} polls")
+
+    # A *single-tile* render must be interruptible too, and this is the check
+    # that would have caught the real bug. `tile_for` returns 2400 for a 2400px
+    # proxy, so every live preview takes the single-pass branch -- where the hook
+    # was polled exactly once, before the pass, and then not again. Measured on
+    # `SuperPortra`: one poll in 7.91s on the GPU and 21.5s on the CPU, all of it
+    # spent on a frame the client had already abandoned. Polls now happen at
+    # every stage boundary inside `render`.
+    #
+    # Asserted as "many more than one" rather than an exact count, so adding or
+    # removing a pipeline stage does not fail this.
+    polls.clear()
+    eng.render_image(img, p, 1.0, tile=4096, supersample=1,
+                     should_cancel=cancel_on(10 ** 9))
+    check("a single-tile render polls inside the pipeline, not just before it",
+          len(polls) > 5, f"{len(polls)} polls in one untiled pass (was 1)")
+
     polls.clear()
     never = eng.render_image(img, p, 1.0, tile=128, supersample=1,
                              should_cancel=lambda: False)

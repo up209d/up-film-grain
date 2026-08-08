@@ -47,7 +47,7 @@ export default function ScalePanel(props: {
 
   return (
     <>
-      <Field label="Size scaling">
+      <Field label="Preset scaling">
         <button
           className={scaleToRef && (manual || referenceMp) ? "seg on" : "seg"}
           onClick={props.onToggleScaleToRef}

@@ -273,9 +273,14 @@ def run(cx: Ctx) -> None:
 
     sg0 = sc_grain({})
     sg1 = sc_grain({"scatter": 0.8, "scatter_radius": 4.0})
+    # Inverted 2026-08-08 with the pipeline reorder: scatter runs after Grain
+    # Structure now, so it displaces the grain along with the picture. It costs
+    # far less than micro-blur does because it never averages -- every displaced
+    # pixel is still a bit-exact copy, so the grain moves rather than dissolving.
     check(
-        "scatter does not cost grain", abs(sg1 - sg0) < sg0 * 0.05,
-        f"grain {sg1 / sg0 * 100:.0f}% of unscattered",
+        "scatter moves grain rather than dissolving it", 0.6 < sg1 / sg0 < 1.02,
+        f"grain {sg1 / sg0 * 100:.0f}% of unscattered (micro-blur, which "
+        f"averages, keeps 29% at a comparable reach)",
     )
     for name, over in (
         ("fine", {"scatter": 1.0, "scatter_radius": 6.0}),

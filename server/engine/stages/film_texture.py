@@ -7,7 +7,7 @@ import torch
 from ... import params as P
 from ..colour import _linear_to_srgb, _srgb_to_linear
 from ..constants.marks import (
-    _BLOB_CELLS_SCRATCH, _DUST_DARK_LUM, _DUST_EDGE_MAX, _DUST_EDGE_MIN, _DUST_EDGE_PX, _DUST_HARMONICS, _DUST_LITE_LUM, _DUST_SOFT_FADE, _HAIR_LUM, _HAIR_TAPER, _HAIR_TIP, _HAIR_WIDTH, _LEAK_GAIN, _LEAK_REACH_SAFETY, _LEAK_WARP, _MARK_MIN_PX, _TEX_LUM_FLOOR,
+    _BLOB_CELLS_SCRATCH, _DUST_DARK_LUM, _DUST_ECCENT_HI, _DUST_ECCENT_LO, _DUST_EDGE_MAX, _DUST_EDGE_MIN, _DUST_EDGE_PX, _DUST_HARMONICS, _DUST_LITE_LUM, _DUST_SOFT_FADE, _HAIR_LUM, _HAIR_TAPER, _HAIR_TIP, _HAIR_WIDTH, _LEAK_GAIN, _LEAK_REACH_SAFETY, _LEAK_WARP, _MARK_MIN_PX, _TEX_LUM_FLOOR,
 )
 from ..marks import (
     _count_threshold, _dust_sites, _hair_sites, _leak_anchor, _leak_sites, _mark_window,
@@ -239,6 +239,7 @@ class FilmTextureMixin:
             out = out + self._weather(
                 line, vary, p["scratch_soften"],
                 p["scratch_soften"] * 3.0 * max(wpx, 0.6),
+                origin=(y0, x0),
             ) * 0.85
 
         # -- hair ---------------------------------------------------------
@@ -358,7 +359,13 @@ class FilmTextureMixin:
 
             for st in _dust_sites(du, seed, p["dust_balance"]):
                 r = max(r_nom * st["size"], 0.2)
-                e = st["eccent"]
+                # Eccentricity ceiling rides `dust_irregular` along with the
+                # harmonics, so the slider controls *how far from a circle* a
+                # speck can get rather than only how dented its outline is. At 0
+                # the population is 90% round; at 1 it reaches well past oval.
+                e = st["eccent"] * (
+                    _DUST_ECCENT_LO + (_DUST_ECCENT_HI - _DUST_ECCENT_LO) * irr
+                )
                 ra, rb = r * (1.0 + e), r * (1.0 - e)
                 # This speck's harmonic amplitudes. At `dust_irregular` 0 they
                 # are all zero, the radius is exactly 1 and the outline is
@@ -408,20 +415,53 @@ class FilmTextureMixin:
                 # composite, opacity is how much of the photograph the speck
                 # hides and luminosity is what colour the speck itself is, so a
                 # solid grey mote and a faint black veil are different things.
+                # **Variation spreads *inward from* full strength, not outward
+                # from the middle** (changed 2026-08-08, reported: "the light
+                # dust even with Dust opacity at 1 is still not at the brightest
+                # level"). It was centred -- `mid + (draw - 0.5) * span * var`
+                # -- so at Luminosity Variation 0 every light speck sat at 0.86,
+                # the midpoint of its range, and pure white was reachable only
+                # by the luckiest draw at variation 1. That is the wrong default
+                # twice over: a control named *variation* should do nothing at
+                # 0, and what it does nothing to should be the full-strength
+                # speck rather than a half-strength one.
+                #
+                # Now variation 0 puts every light speck at 1.0 and every dark
+                # one at 0.0, and raising it walks the population back toward
+                # the middle. Note this is still *colour*, not coverage --
+                # `dust_opacity` below decides how much of the photograph the
+                # speck hides, which is the other half of what "brightest" needs.
                 lum_lo, lum_hi = _DUST_LITE_LUM if st["light"] else _DUST_DARK_LUM
-                mid = 0.5 * (lum_lo + lum_hi)
-                col = min(max(
-                    mid + (st["lum"] - 0.5) * (lum_hi - lum_lo) * l_var, 0.0,
-                ), 1.0)
+                if st["light"]:
+                    col = lum_hi - (lum_hi - lum_lo) * (1.0 - st["lum"]) * l_var
+                else:
+                    col = lum_lo + (lum_hi - lum_lo) * st["lum"] * l_var
+                col = min(max(col, 0.0), 1.0)
                 # A speck smaller than a pixel fades rather than thinning, for
                 # `_MARK_MIN_PX`'s reason -- otherwise it registers only where
                 # it happens to land on a pixel centre, so the *count* would
                 # quietly depend on the render scale.
                 thin = min(1.0, (ra * rb) / (_MARK_MIN_PX * _MARK_MIN_PX))
-                alpha = shape * min(max(
-                    base_op * (1.0 - o_var * (1.0 - st["opacity"]))
-                    * (1.0 - _DUST_SOFT_FADE * min(soft, 1.0)) * thin, 0.0,
-                ), 1.0)
+                # **`dust_opacity` is a reachable ceiling** (changed
+                # 2026-08-09, reported as "the dust dot still looks grey at
+                # opacity 1"). Three separate terms used to cut it and only one
+                # of them was named opacity: at 1 with everything else at its
+                # default the brightest pixel measured 0.907 and the median lit
+                # speck 0.656.
+                #
+                # The soft-fade is the one that had no business being there.
+                # Out-of-focus debris really is fainter as well as softer -- the
+                # same light over a wider footprint -- but expressing that by
+                # multiplying the opacity meant the *softness* slider was
+                # quietly varying opacity, which is a second control doing the
+                # first one's job. It rides under `dust_opacity_var` now, so a
+                # variation of 0 means exactly what it says: every speck at
+                # `dust_opacity`, whatever its softness.
+                fade = 1.0 - o_var * (
+                    (1.0 - st["opacity"])
+                    + _DUST_SOFT_FADE * min(soft, 1.0) * st["opacity"]
+                )
+                alpha = shape * min(max(base_op * fade * thin, 0.0), 1.0)
                 sub = out[:, :, sl_y, sl_x]
                 out[:, :, sl_y, sl_x] = sub * (1.0 - alpha) + col * alpha
 
@@ -432,6 +472,7 @@ class FilmTextureMixin:
     def _weather(
         mark: torch.Tensor, vary: torch.Tensor, soften: float, radius: float,
         lum_floor: float = _TEX_LUM_FLOOR,
+        origin: tuple[float, float] | None = None,
     ) -> torch.Tensor:
         """Make a field of marks non-uniform in sharpness and in brightness.
 
@@ -462,7 +503,12 @@ class FilmTextureMixin:
         # the marks still looked uniform. Same fix as the light leaks needed.
         v_soft, v_lum = _spread(vary[:, 0:1]), _spread(vary[:, 1:2])
         if soften > 0.01 and radius > 0.05:
-            blurred = _blur(mark, radius)
+            # `origin` is what lets this take `_blur`'s decimated path, and it
+            # matters more here than anywhere else in the pipeline: the radius is
+            # `soften * 3 * width`, so a preset's 0.9 on a 14.85px scratch is
+            # sigma 40 at scale 1 and **sigma 80 at supersample 2**. Measured
+            # 2026-08-08, this one call was 101s of a 154s CPU export.
+            blurred = _blur(mark, radius, origin)
             # Centre the field so `soften` sets the *average* blur, with marks
             # either side of it, rather than a floor everything sits above.
             b = (soften * _smoothstep(0.15, 0.85, v_soft)).clamp(0.0, 1.0)

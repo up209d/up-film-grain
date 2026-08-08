@@ -251,25 +251,40 @@ def run(cx: Ctx) -> None:
     # eccentricity and no harmonics is exactly a circle, so this is the score a
     # perfect speck of this radius gets through the same rasteriser and the same
     # component finder.
-    # Each constant is patched on the module that reads it: the site list draws
-    # the eccentricity, the rasteriser adds the harmonics.
-    import server.engine.marks as _sites_mod
+    # Both constants now live on the rasteriser: since 2026-08-08 the site list
+    # records the raw 0..1 eccentricity draw and `_film_texture` scales it by a
+    # ceiling that `dust_irregular` slides between `_DUST_ECCENT_LO` and `_HI`.
+    # Flattening the ceiling to zero is what makes a perfect disc here.
     import server.engine.stages.film_texture as _raster_mod
-    _keep = (_sites_mod._DUST_ECCENT, _raster_mod._DUST_HARMONICS)
+    _keep = (_raster_mod._DUST_ECCENT_LO, _raster_mod._DUST_ECCENT_HI,
+             _raster_mod._DUST_HARMONICS)
     try:
-        _sites_mod._DUST_ECCENT = 0.0
+        _raster_mod._DUST_ECCENT_LO = 0.0
+        _raster_mod._DUST_ECCENT_HI = 0.0
         _raster_mod._DUST_HARMONICS = (0.0, 0.0, 0.0)
         disc_iso, disc_ratio, _ = speck_stats({"dust_size": 24.0})
     finally:
-        _sites_mod._DUST_ECCENT, _raster_mod._DUST_HARMONICS = _keep
-    iso, ratio, spread = speck_stats({"dust_size": 24.0})
+        (_raster_mod._DUST_ECCENT_LO, _raster_mod._DUST_ECCENT_HI,
+         _raster_mod._DUST_HARMONICS) = _keep
+    # **The two are measured at opposite ends of `dust_irregular` since
+    # 2026-08-08**, because the slider now controls how oval a speck may get and
+    # not merely how dented its outline is. At 0 the population is 91% round by
+    # axis ratio, which is what "round" has to mean; at 1 it reaches 29%, which
+    # is what "not a circle" has to mean. Measuring both at one setting is how
+    # the old fixed 0.35 eccentricity hid -- a third of the specks were obvious
+    # ellipses at *every* setting and both assertions still passed.
+    iso, _, _ = speck_stats({"dust_size": 24.0})
     check(
-        "a speck is round", iso > disc_iso * 0.82,
+        "a speck is round at irregularity 0", iso > disc_iso * 0.82,
         f"isoperimetric {iso:.3f} against a rendered disc's {disc_iso:.3f} "
         f"({iso / disc_iso * 100:.0f}% of a circle)",
     )
+    rough_iso, ratio, spread = speck_stats(
+        {"dust_size": 24.0, "dust_irregular": 1.0}
+    )
     check(
-        "a speck is not a circle", ratio > 1.10 and spread > 0.05,
+        "a speck is not a circle at irregularity 1",
+        ratio > 1.10 and spread > 0.05,
         f"mean axis ratio {ratio:.2f} (a disc renders {disc_ratio:.2f}), "
         f"spread {spread:.2f}",
     )
@@ -292,13 +307,12 @@ def run(cx: Ctx) -> None:
         _raster_mod._DUST_HARMONICS = (0.0, 0.0, 0.0)
         flat = dust_frame({})
     finally:
-        _raster_mod._DUST_HARMONICS = _keep[1]
+        _raster_mod._DUST_HARMONICS = _keep[2]
     d0 = float(np.abs(dust_frame({"dust_irregular": 0.0}) - flat).max())
     check(
         "irregularity 0 is exactly an ellipse", d0 == 0.0,
         f"max delta {d0:.2e} against a build with the harmonics zeroed out",
     )
-    rough_iso, _, _ = speck_stats({"dust_size": 24.0, "dust_irregular": 1.0})
     check(
         "irregularity 1 dents the outline", rough_iso < iso * 0.9,
         f"isoperimetric {iso:.3f} at 0 -> {rough_iso:.3f} at 1 "
