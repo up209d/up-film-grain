@@ -238,3 +238,73 @@ first inside the effect makes the post-reroll state the new baseline instead.
   overlay. Which way it goes is never in doubt because it reads the panel in
   front of you: "Collapse all" while anything is open, "Expand all" once
   everything is shut.
+
+## One popover menu, and no native `<select>` left (2026-08-09)
+
+Requested outright: the section-jump hamburger was the menu the user liked, so
+every native `<select>` in the app became one. Six of them — the LUT picker, a
+discrete parameter's `choices`, the preset list, the two export menus and the
+preview Quality menu.
+
+The immediate reason was the LUT folder growing to 303 entries across nine
+subfolders. A native `<select>` cannot be styled to match the panel, cannot
+group past one flat `<optgroup>` level and cannot be searched, and at seven
+entries none of that mattered.
+
+**It is two components, split where the reusable part actually is.**
+
+* **`controls/Popover.tsx`** is the shell: a trigger button, a panel anchored to
+  it, and the dismissal rules. Both of those rules were bugs before they were
+  comments, and they were lifted out of `SectionMenu` verbatim rather than
+  rewritten:
+  * dismissal listens for `pointerdown`, not `click`, so the panel is gone by
+    the time a control underneath it reacts — with `click` the panel is still on
+    screen when the thing below takes the press;
+  * the containment test is what stops the trigger closing and reopening in one
+    gesture: without it the outside handler closes the panel and the button's
+    own `onClick` immediately reopens it.
+
+  It also **measures where it can open**. `drop` is a preference — `"up"` for
+  everything on the `cornerbar`, which sits 10px off the bottom of the stage —
+  and it is overridden when the preferred side cannot fit and the other has more
+  room. The panel's height is capped inline to the space actually between the
+  trigger and the window edge; `.menu-body` and `.menu-scroll` flex into what is
+  left so the overflow becomes scroll rather than clipping.
+
+  This was a bug before it was a feature, and a well-disguised one: with a fixed
+  `drop="down"` and a `60vh` list, a trigger low in the panel put two thirds of
+  the LUT list below the window with no way to reach it. Root LUTs are the first
+  rows so they stayed pickable and folder contents did not, which reads as "the
+  gmic LUTs don't work" rather than as a placement problem. See
+  `docs/lessons.md`.
+* **`controls/SelectMenu.tsx`** is the value picker built on it: search,
+  collapsible groups, a checkmark on the current item, arrow keys and Enter.
+
+`SectionMenu` kept its own body and is deliberately **not** a `SelectMenu`,
+though it looks like one. Its entries are *commands* — jump to a section — so
+there is nothing to be "currently selected", and a component whose whole shape
+is `value`/`onPick` would carry a null the entire time. It shares `Popover`,
+which is the part that had behaviour worth sharing.
+
+### Three things in it that are not obvious
+
+* **The panel body is its own component.** `MenuBody` mounts fresh on every
+  open, which is what resets the query, the expanded groups and the keyboard
+  cursor. Reopening a menu onto last time's half-typed filter is the behaviour
+  nobody wants and everybody ships.
+* **The value is a string here and a number at most call sites.** A discrete
+  parameter's value is its index and Quality's is a supersample factor, so those
+  callers stringify in and parse out. That bargain is not new — `<select>` needed
+  the same conversion — it is just in one place now. `ParamControl` is still the
+  only file in the app that knows a discrete parameter from a continuous one.
+* **A search box forces its groups open and disables collapsing.** A search that
+  hides its own results behind a collapsed heading does not work, and a collapse
+  button that fights the query rather than clearing it is worse than no button.
+  For the same reason the panel says `role="dialog"` when it is searchable and
+  moves `role="menu"` down onto the list: a `menu` may not contain a textbox.
+
+`LutPicker`'s "None" entry needed a sentinel value, because `SelectMenu` reads a
+value it cannot find as "nothing selected, show the placeholder" and None *is* a
+selection. It is `"\\none"` — a backslash, which a folder id built by
+`as_posix()` can never contain and which `lut.resolve_path` rejects outright, so
+no real LUT can ever answer to it.

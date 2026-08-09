@@ -25,14 +25,22 @@ export interface Preset {
   lut: string | null;
 }
 
-/** A 3D LUT the server can apply: either a `.cube` in the `luts/` folder or one
+/** A 3D LUT the server can apply: either a `.cube` under `luts/` or one
  *  uploaded this session. `size` is the cube's grid resolution, and is null for
  *  folder entries because listing them deliberately does not parse them. */
 export interface LutInfo {
+  /** The path relative to `luts/` with the extension dropped, POSIX-separated
+   *  — `UP-SuperPortra` at the root, `gmic/bw/agfa_apx_100` in a folder. This
+   *  is what a preset file records, so it has to survive a restart. */
   id: string;
+  /** The bare filename, for the picker to print. It is `id`'s last segment. */
   name: string;
   size: number | null;
   source: "folder" | "upload";
+  /** Folder it came from, relative to `luts/`; `""` at the root and for every
+   *  upload. The picker groups on it — reported rather than split back out of
+   *  `id` here, because the id is a path and the server owns paths. */
+  group: string;
 }
 
 export interface Schema {

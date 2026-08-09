@@ -17,9 +17,17 @@ is the whole interface, the same way ``presets/`` is -- so names it is.
 
 Two sources, one namespace:
 
-* **Disk.** ``luts/*.cube``, named by filename stem, matching how presets are
-  named by filename rather than by the ``TITLE`` inside them. A name survives a
-  restart, so a preset can reference one.
+* **Disk.** ``luts/**/*.cube``, identified by the file's path *relative to*
+  ``luts/`` with the extension dropped -- ``UP-SuperPortra`` at the root,
+  ``gmic/colorslide/fuji_fp_100c`` in a folder. Named by the path rather than by
+  the ``TITLE`` inside the file, matching how presets are named by filename. An
+  id survives a restart, so a preset can reference one.
+
+  The folder was flat until 2026-08-09, when a library of 300 arrived organised
+  into subfolders. A bare stem would not do as an id from that point on: two
+  folders may hold the same filename, and collapsing them would make which LUT a
+  preset gets depend on directory iteration order. A root-level file's relative
+  path *is* its bare stem, so no preset needed migrating.
 * **Upload.** Held in process memory under an ``upload:`` id, LRU-capped. These
   deliberately do *not* survive a restart; a preset naming one degrades to no
   LUT rather than erroring, and the client can see the name is missing because
@@ -89,6 +97,11 @@ class Lut:
     dmin: tuple[float, float, float] = (0.0, 0.0, 0.0)
     dmax: tuple[float, float, float] = (1.0, 1.0, 1.0)
     source: str = "folder"
+    #: Folder holding it, relative to ``LUT_DIR`` and POSIX-separated; ``""``
+    #: for a root-level file and for every upload. The client groups the picker
+    #: by it, so it is reported rather than re-derived there -- the id is a path
+    #: and splitting paths is the server's business.
+    group: str = ""
     #: Cached ``[1, 3, D, H, W]`` volumes, one per device string.
     _tensors: dict[str, torch.Tensor] = field(default_factory=dict, repr=False)
 
@@ -118,6 +131,7 @@ class Lut:
             "name": self.name,
             "size": self.size,
             "source": self.source,
+            "group": self.group,
         }
 
 
@@ -133,7 +147,9 @@ _KEYWORDS = {
 _NUM = re.compile(r"^[-+.\d]")
 
 
-def parse_cube(text: str, name: str, lut_id: str, source: str) -> Lut:
+def parse_cube(
+    text: str, name: str, lut_id: str, source: str, group: str = ""
+) -> Lut:
     """Parse an Adobe ``.cube`` 3D LUT.
 
     The header is scanned line by line -- there are only a handful of lines
@@ -212,6 +228,7 @@ def parse_cube(text: str, name: str, lut_id: str, source: str) -> Lut:
         dmin=(dmin[0], dmin[1], dmin[2]),
         dmax=(dmax[0], dmax[1], dmax[2]),
         source=source,
+        group=group,
     )
 
 
@@ -220,31 +237,97 @@ def parse_cube(text: str, name: str, lut_id: str, source: str) -> Lut:
 # --------------------------------------------------------------------------- #
 
 _LOCK = threading.Lock()
-#: stem -> (mtime, size_on_disk, Lut)
+#: id (a relative path, extension dropped) -> (mtime, size_on_disk, Lut)
 _DISK: dict[str, tuple[float, int, Lut]] = {}
 #: id -> Lut, oldest first
 _UPLOADED: "OrderedDict[str, Lut]" = OrderedDict()
 
 
+def _group_of(f: Path) -> str:
+    """The folder holding ``f``, relative to ``LUT_DIR``, ``""`` at the root.
+
+    ``Path(".").as_posix()`` is ``"."`` for a root-level file; the client wants
+    "in no folder" spelled as an empty string, so that one case is translated
+    here rather than in every consumer.
+    """
+    group = f.parent.relative_to(LUT_DIR).as_posix()
+    return "" if group == "." else group
+
+
+def resolve_path(lut_id: str) -> Path | None:
+    """``lut_id`` as a file inside ``LUT_DIR``, or ``None`` if it escapes it.
+
+    This string arrives in a request body and is about to be joined onto a
+    path, so it is the security boundary for the whole LUT folder. It used to
+    be a one-liner -- reject anything with a separator in it -- which worked
+    only while the folder was flat. Separators are now the *point*, so the rule
+    has to be the stronger one it was standing in for:
+
+    * no absolute paths, no drive letters, no backslashes (a Windows-style
+      ``gmic\\bw\\x`` must not become a valid path on a POSIX box either);
+    * no ``.`` or ``..`` segment anywhere, so nothing can climb out textually;
+    * and then, having built the path, ``resolve()`` it and require the result
+      to still be under ``LUT_DIR``. That last one is what a purely textual
+      check cannot do: a symlink *inside* ``luts/`` pointing at ``/etc`` passes
+      every rule above and is caught only by resolving it.
+    """
+    if not lut_id or "\\" in lut_id or lut_id.startswith("/"):
+        return None
+    parts = lut_id.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return None
+    path = LUT_DIR / f"{lut_id}{CUBE_SUFFIX}"
+    try:
+        real = path.resolve()
+    except OSError:
+        return None
+    if not real.is_relative_to(LUT_DIR.resolve()):
+        return None
+    return path
+
+
 def list_luts() -> list[dict]:
     """Every LUT the client can pick, folder first then uploads.
 
-    The folder is re-read on each call, like ``load_presets`` -- dropping a
+    The tree is re-walked on each call, like ``load_presets`` -- dropping a
     ``.cube`` in should show up on the next page load without a restart. Only
-    the filenames are listed here; nothing is parsed until it is used, so a
-    folder of large LUTs costs nothing to browse.
+    the paths are listed here; nothing is parsed until it is used, so 300 LUTs
+    cost a directory walk to browse and nothing else.
+
+    ``rglob`` rather than ``glob``: a library of LUTs arrives organised into
+    folders and flattening it would both lose that organisation and collide
+    same-named files from different folders. It does not follow symlinks, which
+    is what we want -- a link pointing at ``/`` would otherwise walk the disk.
+
+    Root-level entries sort first and folders follow, so the picker's
+    always-visible ungrouped section is the handful of LUTs that live at the top
+    rather than an arbitrary slice of the library.
     """
+    def sort_key(f: Path) -> tuple[int, str, str]:
+        group = _group_of(f)
+        # Root first, spelled out rather than leaning on "" sorting ahead of
+        # every folder name -- that happens to be true and reads like an
+        # accident.
+        return (0 if not group else 1, group.lower(), f.name.lower())
+
     out: list[dict] = []
     try:
         files = sorted(
-            (f for f in LUT_DIR.glob("*") if f.suffix.lower() == CUBE_SUFFIX),
-            key=lambda f: f.name.lower(),
+            (f for f in LUT_DIR.rglob("*") if f.suffix.lower() == CUBE_SUFFIX),
+            key=sort_key,
         )
-    except OSError:
+    except (OSError, ValueError):
         files = []
     for f in files:
+        rel = f.relative_to(LUT_DIR)
         out.append({
-            "id": f.stem, "name": f.stem, "size": None, "source": "folder",
+            # The path, extension dropped -- see the module docstring for why a
+            # bare stem stopped being enough.
+            "id": rel.with_suffix("").as_posix(),
+            "name": f.stem,
+            "size": None,
+            "source": "folder",
+            "group": _group_of(f),
         })
     with _LOCK:
         for lut in reversed(_UPLOADED.values()):
@@ -269,12 +352,11 @@ def get(lut_id: str | None) -> Lut | None:
                 _UPLOADED.move_to_end(lut_id)
             return lut
 
-    # A name from the folder. Rejected outright if it is not a bare filename --
-    # this string arrives from a request body and is about to be joined onto a
-    # path, so "../.." must never resolve to anything.
-    if "/" in lut_id or "\\" in lut_id or lut_id in (".", ".."):
+    # A path from the folder, relative to it. `resolve_path` is the guard; see
+    # its docstring for why "no separators" stopped being the rule.
+    path = resolve_path(lut_id)
+    if path is None:
         return None
-    path = LUT_DIR / f"{lut_id}{CUBE_SUFFIX}"
     try:
         st = path.stat()
     except OSError:
@@ -291,9 +373,12 @@ def get(lut_id: str | None) -> Lut | None:
     except OSError:
         return None
     try:
-        lut = parse_cube(text, lut_id, lut_id, "folder")
+        # `name` is the stem and `id` is the path: the two agree at the root and
+        # part company in a folder, which is exactly the split `list_luts`
+        # reports, so the picker and a directly-resolved LUT label the same way.
+        lut = parse_cube(text, path.stem, lut_id, "folder", _group_of(path))
     except LutError as e:
-        print(f"[luts] skipping {path.name}: {e}")
+        print(f"[luts] skipping {lut_id}: {e}")
         return None
     with _LOCK:
         _DISK[lut_id] = (st.st_mtime, st.st_size, lut)

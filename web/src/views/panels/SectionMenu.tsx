@@ -10,68 +10,50 @@
  *
  *  It opens *upwards*: the bar is anchored to the bottom of the stage, so a
  *  menu dropped downwards from it would open off the window.
+ *
+ *  Deliberately **not** a `SelectMenu`, though it looks like one: these are
+ *  commands, not values. There is nothing here to be "currently selected", so a
+ *  component whose whole shape is `value`/`onPick` would be carrying a null the
+ *  entire time. It shares the shell -- `Popover`, which was extracted from this
+ *  file -- and that is the part that had the behaviour worth sharing.
  */
 
 import { Bars3Icon } from "@heroicons/react/24/outline";
-import { useEffect, useRef, useState } from "react";
+
+import Popover from "../controls/Popover";
 
 export default function SectionMenu(props: {
   groups: string[];
   onPick: (group: string) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement | null>(null);
-
-  // Dismissal: a click anywhere else, or Escape. `pointerdown` rather than
-  // `click` so the menu is gone by the time a control underneath it reacts,
-  // and the containment test is what keeps the button itself from closing and
-  // reopening in the same gesture.
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: PointerEvent) => {
-      if (!ref.current?.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("pointerdown", onDown);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("pointerdown", onDown);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [open]);
-
   return (
-    <div className="secmenu" ref={ref}>
-      <button
-        className={`seg icon secmenu-btn${open ? " on" : ""}`}
-        onClick={() => setOpen((x) => !x)}
-        disabled={!props.groups.length}
-        title="Jump to a pipeline section"
-        aria-label="Jump to a pipeline section"
-        aria-expanded={open}
-        aria-haspopup="menu"
-      >
-        <Bars3Icon aria-hidden="true" />
-      </button>
-      {open && (
-        <div className="secmenu-list" role="menu">
+    <Popover
+      trigger={<Bars3Icon aria-hidden="true" />}
+      drop="up"
+      align="right"
+      disabled={!props.groups.length}
+      title="Jump to a pipeline section"
+      ariaLabel="Jump to a pipeline section"
+      buttonClass="seg icon secmenu-btn"
+    >
+      {(close) => (
+        <div className="menu-scroll">
           {props.groups.map((g) => (
             <button
+              type="button"
               key={g}
-              className="secmenu-item"
+              className="menu-item"
               role="menuitem"
               onClick={() => {
                 props.onPick(g);
-                setOpen(false);
+                close();
               }}
             >
-              {g}
+              <span className="menu-text">{g}</span>
             </button>
           ))}
         </div>
       )}
-    </div>
+    </Popover>
   );
 }

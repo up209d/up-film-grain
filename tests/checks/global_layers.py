@@ -86,6 +86,22 @@ def run(cx: Ctx) -> None:
           float((bell - bell.flip(0)).abs().max()) < 1e-6,
           f"max asymmetry {float((bell - bell.flip(0)).abs().max()):.2e}")
 
+    # The pivot moves that peak. Measured as *where the maximum is*, not as a
+    # mean: a mean-only test cannot tell a moved bell from a taller one, and the
+    # two ends have to stay at zero either way or the layer starts graining
+    # solid black. Both directions, because a sign error passes one of them.
+    for pv, want in ((0.25, 64), (0.75, 192)):
+        pb = _source_masks(ramp.contiguous(), pv)[3].flatten()
+        check(f"the bell peaks at the pivot ({pv})",
+              int(pb.argmax()) == want and abs(float(pb[want]) - 1.0) < 1e-5
+              and float(pb[0]) == 0.0 and float(pb[-1]) == 0.0,
+              f"peak {float(pb.max()):.4f} at L={int(pb.argmax()) / 256:.3f}, "
+              f"ends {float(pb[0]):.4f}/{float(pb[-1]):.4f}")
+    # And the default is the shape that shipped before the control existed.
+    check("pivot 0.5 is the original mid-tone bell",
+          float((_source_masks(ramp.contiguous(), 0.5)[3].flatten()
+                 - bell).abs().max()) == 0.0, "bit-identical")
+
     # A four-patch plate: a red, a mid grey, a dark and a light. Between them
     # they separate every claim the four layers make -- and in particular the
     # dark *and* light patches together are what tell a mid-tone bell from a

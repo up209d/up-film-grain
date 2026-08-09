@@ -86,7 +86,7 @@ server/controllers/   FastAPI routers, one per area
 server/runtime.py     IS_DEV, DEVICE, ENGINE, the render lock and ticket
 server/main.py        app assembly only
 server/imageio.py     decode/encode, incl. a hand-written 16-bit RGB PNG encoder
-server/lut.py         .cube 3D LUT parsing + registry (folder and uploads)
+server/lut.py         .cube 3D LUT parsing + registry (the tree and uploads)
 web/src/models/       Values/Compare, view constants, pure value-set rules
 web/src/services/     typed API client
 web/src/controllers/  hooks: schema, values, history, preview, export, upload, luts
@@ -99,7 +99,10 @@ tests/checks/         one module per area -- where the checks live
 tests/refs.py         slow reference implementations the rewrites are held to
 tests/scene.py        synthetic test scene
 presets/              preset library -- files, not code; see below
-luts/                 3D LUTs -- files, not code; same idea as presets/
+luts/                 3D LUTs -- files, not code; same idea as presets/, but a
+                        *tree* since 2026-08-09: an id is the path relative to
+                        luts/ without the extension, and subfolders become
+                        collapsed groups in the picker
 run.sh / dev.sh       production from source / hot-reload dev
 build.sh              compiles a distribution into build/
 ```
@@ -188,16 +191,19 @@ structure above the clump, its flat amplitude, its smoothing and its chroma —
 anti-aliasing, the pre-blur, edge
 softening, edge jitter and its direction bias, edge sanding, scatter, output
 sharpening, the master opacity cross-fade, the colour-grading section with its
-3D LUT lookup, `.cube` parsing, monotone tone recovery and highlight
+3D LUT lookup, `.cube` parsing, that every LUT in the `luts/` **tree** loads and
+that no id can escape the folder, monotone tone recovery and highlight
 reconstruction, the bidirectional split tone, the four source-masked global
 layers with their hue masks and
 mid-tone bell, the six Global Grain blend modes, `global_seed` as an offset, and
 the film-texture section including its exact mark counts and the speck's shape
-and softness controls — 362 checks. It exits
+and softness controls — 367 checks. It exits
 non-zero on failure.
 
-Those 362 live in `tests/checks/`, one module per area, since 2026-08-08 — it
-was a single 3900-line function taking 4m24s, and it is 17 modules taking 39s.
+Those 367 live in `tests/checks/`, one module per area, since 2026-08-08 — it
+was a single 3900-line function taking 4m24s, and it is 17 modules taking 43s
+(39s until `luts/` grew to 303 files, every one of which the `grading` module
+parses on purpose).
 **Name the modules covering what you touched and only those run:**
 `verify.py global` is four modules and ~20s. `verify.py -l` lists them, `-j 1`
 runs in one process when you need a traceback in place. Nothing about what is

@@ -13,6 +13,7 @@
 
 import type { Schema } from "../../services/api";
 import Help from "./Help";
+import SelectMenu from "./SelectMenu";
 
 export default function ParamControl(props: {
   param: Schema["params"][number];
@@ -29,16 +30,18 @@ export default function ParamControl(props: {
         <div className="slabel">
           <Help text={p.help} label={p.label} />
         </div>
-        <select
+        {/* The value is the *index*, stringified on the way in and parsed on
+            the way out. `SelectMenu` deals in strings because a menu is a list
+            of names; the schema is where a value's type is decided, and it says
+            number. That conversion was always here -- `<select>` needed it
+            too -- and this is still the only place in the app that knows a
+            discrete parameter from a continuous one. */}
+        <SelectMenu
+          items={p.choices.map((c, i) => ({ value: String(i), label: c }))}
           value={String(value ?? p.default)}
-          onChange={(e) => onChangeNow(p.key, Number(e.target.value))}
-        >
-          {p.choices.map((c, i) => (
-            <option key={c} value={i}>
-              {c}
-            </option>
-          ))}
-        </select>
+          onPick={(v) => onChangeNow(p.key, Number(v))}
+          title={p.label}
+        />
       </div>
     );
   }

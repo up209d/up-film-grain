@@ -7,6 +7,7 @@
  */
 
 import type { Schema } from "../../services/api";
+import SelectMenu from "../controls/SelectMenu";
 
 export default function PresetPicker(props: {
   schema: Schema | null;
@@ -22,17 +23,22 @@ export default function PresetPicker(props: {
   return (
     <>
       <div className="row">
-        <select
-          defaultValue=""
-          onChange={(e) => e.target.value && props.onApplyPreset(e.target.value)}
-        >
-          <option value="">Preset…</option>
-          {props.schema?.presets.map((p) => (
-            <option key={p.name} value={p.name}>
-              {p.name}
-            </option>
-          ))}
-        </select>
+        {/* `value={null}` on purpose: this is a list of commands, not a state.
+            Applying a preset scatters its numbers across every section, and the
+            moment one slider moves the answer to "which preset is this?" is
+            "none of them" -- so holding one selected would be a lie by the
+            second gesture. It reads as a placeholder that never changes, which
+            is exactly what the old `defaultValue=""` was doing. */}
+        <SelectMenu
+          items={(props.schema?.presets ?? []).map((p) => ({
+            value: p.name,
+            label: p.name,
+          }))}
+          value={null}
+          placeholder="Preset…"
+          onPick={props.onApplyPreset}
+          title="Apply a preset"
+        />
         <button
           className="btn ghost"
           onClick={props.onShowOriginal}

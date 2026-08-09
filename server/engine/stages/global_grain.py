@@ -350,7 +350,9 @@ class GlobalGrainMixin:
             # already laid over it. Built once and only if something wants one.
             masks = None
             if any(a > 0.01 for a in gamt[1:]):
-                masks = _source_masks(out.clamp(0.0, 1.0))
+                masks = _source_masks(
+                    out.clamp(0.0, 1.0), p["global_src_l_pivot"],
+                )
 
             # Composited in order, each onto the result of the one before, the
             # way a stack of layers in an image editor behaves -- which is what

@@ -339,3 +339,68 @@
   sampling it at two points in the pipeline, is a bug that no single-control
   test can see. Find the other readers of a value before you move where it is
   read.
+* **A popover's drop direction is measured, not declared.** The LUT menu shipped
+  with a hard-coded `drop="down"` and a `60vh` list, which is correct exactly
+  when the trigger is near the top of the window. It is not, most of the time:
+  the LUT row is well down a long parameter panel, so with the trigger 30px off
+  the bottom of an 800px window the panel ran **130px past the window edge and
+  22 of its 33 rows were unreachable**. The seven root LUTs are the first rows,
+  so they stayed pickable and every LUT in a folder did not — reported as "I
+  can't select any luts from gmic", which sounds like a data or id bug and was a
+  layout one. `Popover` now measures the space on each side of the trigger,
+  keeps the stated direction only if the other side does not have more room, and
+  caps the panel's height to what is actually there.
+* **A plain `<div>` in the middle of a flex chain silently breaks it, and the
+  symptom is clipping rather than an error.** Capping the panel's height only
+  works if the cap reaches the scroll box. `MenuBody` returned its contents
+  wrapped in an unstyled `<div>` carrying the keyboard handler, and an unstyled
+  flex child has `flex: 0 1 auto` and `min-height: auto` — so it kept its
+  natural height, the list never shrank, and the panel clipped its overflow
+  instead of scrolling it. The give-away was a browser check reporting
+  `scrollHeight === clientHeight` on a 76-row list. Every element between a
+  height cap and the thing that scrolls needs `min-height: 0` and to flex.
+* **Dispatching `el.click()` to dodge a test framework's auto-scroll throws away
+  the thing you were testing.** Playwright scrolls before clicking, which moved
+  the panel and wrecked my measurements, so I switched to
+  `el.evaluate(e => e.click())`. That fires on elements that are clipped and
+  invisible — so the clipped-list bug above passed a check written to catch it.
+  If the assertion is "a user can reach this", the click has to be the one that
+  fails when they cannot.
+* **A glob in a packaging script is a silent filter, and it fails the day the
+  folder gains a subfolder.** `build.sh` bundled LUTs with `cp luts/*.cube`,
+  which was right while `luts/` was flat and wrong the moment it was not: the
+  distribution shipped **7 of 303**, the LUT menu showed the seven at the root
+  and no folders at all, and nothing in the build output said so — it cheerfully
+  reported "Bundled 7 LUT(s)". It surfaced as "I can't select any luts from
+  gmic" against a *running distribution*, while the repo checkout served all 303
+  correctly, which is the worst version of this: the bug is invisible from the
+  place you develop. `verify.py` cannot catch it either — it reads `luts/`, not
+  `build/luts/`. Two rules fall out of it: a packaging step must walk what it
+  copies, and its report must count what it *wrote*, not what it matched.
+* **`focus()` scrolls every ancestor, and `scrollIntoView` does too.** The LUT
+  menu focuses its search box on open. That box sits at the top of the panel,
+  and an upward-opening panel puts it *above* the sidebar's visible area — so
+  the browser dutifully scrolled the sidebar to reveal it, throwing the reader's
+  place away by up to 694px on every open. `focus({ preventScroll: true })` is
+  the fix, and the keyboard cursor's `scrollIntoView({ block: "nearest" })` had
+  the identical disease: it walks *all* scrollable ancestors, one of which is
+  the sidebar. Nudging the list's own `scrollTop` by hand is the version that
+  cannot reach outside itself. Rule: inside a floating panel, neither call is
+  safe — both talk to the whole ancestor chain, not to the thing you are
+  looking at.
+* **A key handler on the panel misses everything when focus never enters it.**
+  `SelectMenu`'s arrow-key handling lived on the panel body. That works for the
+  searchable LUT menu, whose search box takes focus — and silently does nothing
+  for the five menus with no search box, where focus stays on the trigger
+  *outside* the panel. Arrows did not move the cursor, and worse, reached the
+  browser and scrolled the sidebar instead. Two fixes, because they answer two
+  different questions: `Popover` swallows the scroll keys at the document level
+  while open (they belong to the open panel wherever focus is, though never
+  while someone is typing), and the list takes `tabIndex={-1}` so it can hold
+  focus when there is no search box.
+* **Separators are punctuation, and a search box should not care about them.**
+  Typing `kodak portra` matched nothing, because on disk it is
+  `kodak_portra_400`. A literal substring test makes the user guess the
+  filename's punctuation. Normalising both sides — lower-case, `_`/`-`/`/`/`.`
+  to spaces — and requiring every word to appear somewhere in `group + name`
+  makes `kodak portra`, `bw agfa` and `PORTRA` all land where you would expect.

@@ -638,16 +638,58 @@ def run(cx: Ctx) -> None:
             bad += 1
     check("bad files are refused with a reason", bad == 3, f"{bad}/3 rejected")
 
+    # -- the folder is a tree (2026-08-09) ------------------------------------
+    # `luts/` was flat and held 7 files until a library of ~300 arrived
+    # organised into subfolders. An id is a *path* relative to `luts/` from that
+    # point on, which turned the traversal guard from "reject anything with a
+    # separator" into a real one -- see `lut.resolve_path`.
     shipped = lutlib.list_luts()
-    loaded = [(x["name"], lutlib.get(x["id"])) for x in shipped]
-    check(
-        "every LUT in luts/ loads",
-        bool(loaded) and all(l is not None for _, l in loaded),
-        ", ".join(f"{n} ({l.size}^3)" if l else f"{n} FAILED" for n, l in loaded)
-        or "none present",
+    on_disk = sorted(
+        f for f in lutlib.LUT_DIR.rglob("*") if f.suffix.lower() == ".cube"
     )
     check(
+        "every .cube on disk is listed",
+        len(shipped) == len(on_disk) and bool(on_disk),
+        f"{len(shipped)} listed, {len(on_disk)} files on disk in "
+        f"{len({x['group'] for x in shipped})} groups",
+    )
+
+    loaded = [(x["id"], lutlib.get(x["id"])) for x in shipped]
+    failed = [i for i, l in loaded if l is None]
+    check(
+        "every LUT in luts/ loads",
+        bool(loaded) and not failed,
+        # Names, not a roll-call: 303 of them would bury the log. The failures
+        # are the part worth printing, and there are normally none.
+        f"{len(loaded) - len(failed)}/{len(loaded)} parsed"
+        + (f"; FAILED {', '.join(failed[:5])}" if failed else ""),
+    )
+
+    # A nested LUT is reachable by its path and *only* by its path. Two folders
+    # may hold the same filename -- `gmic/negative_new` and `gmic/negative_old`
+    # both ship a `kodak_portra_400` -- so a bare stem that still resolved would
+    # hand a preset whichever one the directory walk happened to reach first.
+    nested = next((x for x in shipped if x["group"]), None)
+    check(
+        "a nested LUT resolves by path, not by bare name",
+        nested is not None
+        and lutlib.get(nested["id"]) is not None
+        and lutlib.get(nested["name"]) is None,
+        f"{nested['id']} loads; bare {nested['name']!r} does not"
+        if nested else "no nested LUT present to test",
+    )
+
+    escapes = (
+        "../presets/Stock", "..", ".", "",
+        "gmic/../../presets/Stock",      # climbs out mid-path
+        "/etc/passwd",                   # absolute
+        "gmic\\bw\\agfa_apx_100",        # Windows separators
+        "gmic//bw/agfa_apx_100",         # empty segment
+    )
+    escaped = [e for e in escapes if lutlib.get(e) is not None]
+    check(
         "a path cannot escape the LUT folder",
-        lutlib.get("../presets/Stock") is None and lutlib.get("..") is None,
-        "traversal attempts resolve to no LUT",
+        not escaped,
+        f"{len(escapes)} traversal attempts resolve to no LUT"
+        if not escaped else f"RESOLVED: {escaped}",
     )

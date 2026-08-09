@@ -3,8 +3,9 @@
 `verify.py` was one 3900-line `main()` running 345 checks in a single process.
 It took **4m24s** and measured **83% of one core** on a 14-core machine —
 thirteen cores idle while a chain of GPU renders went past one at a time. Split
-into modules on 2026-08-08 it runs in **36s**, and the module covering whatever
-you just touched runs in seconds.
+into modules on 2026-08-08 it runs in **36s** (**42.7s** since the LUT folder
+grew to 303 files — see the last section), and the module covering whatever you
+just touched runs in seconds.
 
 Nothing about *what* is checked changed. The split was mechanical — line ranges
 lifted verbatim, no reindentation, because the body of the old `main()` and the
@@ -130,3 +131,23 @@ If a new module is genuinely its own area, add it to `tests/checks/`, list it in
 `tests/checks/__init__.py` — `ORDER` is both the print order and the import list
 — and give it a `COST` entry. A module with no `COST` entry still runs; it is
 just scheduled as if it were average.
+
+## The `grading` module got slower on purpose (2026-08-09)
+
+`luts/` went from 7 `.cube` files to 303 when a library arrived as
+`luts/gmic/`, and `"every LUT in luts/ loads"` parses every one of them. The
+module went from ~4s to **7.9s** and the suite from 36s to **42.7s**.
+
+It is not the critical path — `edges` still is — so the whole cost is real but
+none of it is on the wall clock that matters. And it is the check that catches
+a malformed `.cube` shipping in a folder nobody opens by hand, which is exactly
+the failure that would otherwise surface as one preset quietly grading nothing.
+Per `CLAUDE.md`: quality beats speed.
+
+Two things had to change with it, both about the *log* rather than the timing:
+
+* the detail string prints `303/303 parsed` and then the failures, not a roll
+  call — 303 names would bury every other line in the module;
+* a new `"every .cube on disk is listed"` counts the tree independently and
+  compares. The walk is what silently regresses: `glob` instead of `rglob` still
+  lists seven LUTs and passes every other check in the file.

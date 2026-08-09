@@ -175,6 +175,22 @@ PARAMS: list[Param] = [
         "colour anything is, so it works on a monochrome frame.",
     ),
     Param(
+        "global_src_l_pivot", "Source Lightness Pivot", "Global Grain",
+        0.05, 0.95, 0.01, 0.5, "",
+        "Where Source Lightness peaks. That layer is a bell over exposure, and "
+        "this is the tone the bell is centred on: at 0.5, the default, it is "
+        "loudest at mid grey and falls away to nothing at both black and "
+        "white. Drag it down and the grain moves into the shadows -- the peak "
+        "lands on a darker grey and the falloff toward black gets steep while "
+        "the run up to white stretches out. Drag it up and it moves into the "
+        "highlights the same way.\n"
+        "\n"
+        "The two halves are stretched independently, so the layer still "
+        "reaches exactly zero at both ends wherever you put the peak -- pure "
+        "black and pure white are never grainy. Does nothing unless Source "
+        "Lightness is above 0; it steers that layer and no other.",
+    ),
+    Param(
         "global_opacity", "Global Opacity", "Global Grain",
         0.0, 1.0, 0.01, 1.0, "",
         "How much of the global layer is mixed in. It multiplies with Global "

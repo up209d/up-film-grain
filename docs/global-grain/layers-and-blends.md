@@ -15,7 +15,7 @@ Min, Size Max, Smoothness, Chroma Grain — differing in exactly two things.
 | red | Source Red | 11003 / 12007 | `clamp(R − max(G, B))` |
 | green | Source Green | 13009 / 14011 | `clamp(G − max(R, B))` |
 | blue | Source Blue | 15013 / 16033 | `clamp(B − max(R, G))` |
-| lightness | Source Lightness | 17011 / 18013 | `t²(3−2t)`, `t = 1 − |2L − 1|` |
+| lightness | Source Lightness | 17011 / 18013 | `t²(3−2t)`, `t = 1 − dist(L, pivot)` |
 
 One `_global_grain_field(..., idx)` builds all five; `idx` selects nothing but
 the seed pair. Layer 0's pair is the historical one, so it is byte for byte the
@@ -53,6 +53,15 @@ were wrong, and the correction is the whole design:
   smoothstep on top of the triangle is not cosmetic either: it flattens the
   approach to both extremes, so the layer leaves the highlights gradually rather
   than at a constant rate.
+* **Source Lightness Pivot moves that peak** (2026-08-09, on request). The bell
+  is built from the distance to the pivot normalised by the room on *that side*,
+  so the two halves stretch independently and it still reaches exactly 0 at both
+  ends wherever the peak is put — a pivot at 0.25 grains the shadows without
+  ever graining pure black. At 0.5 the two normalisers are both 2 and the
+  expression collapses to the original `1 − |2L − 1|`, which `verify.py` asserts
+  bit-identically: the default had to stay the shape every shipped preset was
+  dialled in against. Clamped to 0.02…0.98 in the engine because one side of the
+  bell has no room left at either extreme. It steers layer 4 and nothing else.
 
 The rectified `clamp_min(0)` on a neutral area is the one place the hue mask
 could misbehave — the difference there wanders either side of zero, so

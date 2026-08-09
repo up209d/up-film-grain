@@ -31,6 +31,7 @@ import type { Compare } from "../models/types";
 import type { ImageMeta } from "../services/api";
 import filmGrain16x9 from "../assets/film-grain-16x9.jpg";
 import Field from "./controls/Field";
+import SelectMenu from "./controls/SelectMenu";
 import ExportPanel from "./panels/ExportPanel";
 import PresetPicker from "./panels/PresetPicker";
 import ScalePanel from "./panels/ScalePanel";
@@ -38,6 +39,17 @@ import SectionMenu from "./panels/SectionMenu";
 import SliderPanel from "./panels/SliderPanel";
 import TopBar from "./panels/TopBar";
 import Stage from "./stage/Stage";
+
+/** Preview supersampling. The value is the factor as a string, because a menu
+ *  deals in names; the label says what each one costs, because that is the only
+ *  question being asked here. */
+const PREVIEW_QUALITY = [
+  { value: "0.5", label: "0.5× (fastest, soft)" },
+  { value: "1", label: "1× (fast, aliased grain)" },
+  { value: "1.5", label: "1.5×" },
+  { value: "2", label: "2× supersampled" },
+  { value: "3", label: "3× supersampled (slowest)" },
+];
 
 export default function App() {
   const [error, setError] = useState<string | null>(null);
@@ -310,16 +322,14 @@ export default function App() {
           </Field>
 
           <Field label="Quality">
-            <select
-              value={supersample}
-              onChange={(e) => setSupersample(Number(e.target.value))}
-            >
-              <option value={0.5}>0.5× (fastest, soft)</option>
-              <option value={1}>1× (fast, aliased grain)</option>
-              <option value={1.5}>1.5×</option>
-              <option value={2}>2× supersampled</option>
-              <option value={3}>3× supersampled (slowest)</option>
-            </select>
+            {/* Stringified in and parsed out, like every other numeric menu --
+                see the note at the top of `SelectMenu`. */}
+            <SelectMenu
+              items={PREVIEW_QUALITY}
+              value={String(supersample)}
+              onPick={(v) => setSupersample(Number(v))}
+              title="Preview supersampling"
+            />
           </Field>
 
           <PresetPicker

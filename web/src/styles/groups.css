@@ -15,7 +15,6 @@
 .slider { margin-bottom: 9px; }
 /* Discrete parameters render as a menu instead of a track (see the params
    map in App.tsx). Full width so the row still reads as one control. */
-.slider select { width: 100%; padding: 4px 8px; }
 /* The LUT picker: a menu plus a load button, sat above its own Mix slider. Its
    own rule only so the pair reads as one control and the hint under a missing
    LUT does not butt against the slider below it. */

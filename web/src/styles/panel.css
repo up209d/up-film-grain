@@ -37,7 +37,7 @@
 .fieldbody input[type="range"] { flex: 1; }
 .val { color: var(--dim); min-width: 46px; text-align: right; font-variant-numeric: tabular-nums; }
 
-button, select, .btn {
+button, .btn {
   background: var(--panel2);
   color: var(--text);
   border: 1px solid var(--line);

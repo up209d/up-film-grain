@@ -4,7 +4,7 @@ import torch
 
 from .primitives import _luma
 
-def _source_masks(m: torch.Tensor) -> tuple[torch.Tensor, ...]:
+def _source_masks(m: torch.Tensor, pivot: float = 0.5) -> tuple[torch.Tensor, ...]:
     """The four visibility envelopes of the source-masked global layers.
 
     ``m`` is the frame **already clamped to 0..1** -- the caller's job, and not
@@ -32,12 +32,20 @@ def _source_masks(m: torch.Tensor) -> tuple[torch.Tensor, ...]:
     rarely passes 0.3-0.5, so at equal slider settings these read quieter than
     Global Intensity; the mask is taking its share, which is the whole point.
 
-    **Lightness is a mid-tone bell**, not a ramp: grain peaks at mid grey and
-    fades to nothing toward *both* white and black. ``1 - |2L - 1|`` is that
-    shape as a triangle; the smoothstep on top rounds off the kink at grey and,
-    more usefully, flattens the approach to both ends, so the layer leaves the
-    highlights and the shadows gradually instead of at a constant rate. Zero at
-    pure black and pure white, ~0.10 at L=0.1 and L=0.9, 1.0 at grey.
+    **Lightness is a mid-tone bell**, not a ramp: grain peaks at ``pivot`` and
+    fades to nothing toward *both* white and black. The triangle is built from
+    the distance to the pivot, normalised by the room on that side -- so the two
+    halves are stretched independently and the bell still reaches exactly 0 at
+    both ends wherever the peak is put. At ``pivot = 0.5`` that is literally
+    ``1 - |2L - 1|``, the shape this had before the control existed, so the
+    default is bit-identical to it. The smoothstep on top rounds off the kink at
+    the peak and, more usefully, flattens the approach to both ends, so the
+    layer leaves the highlights and the shadows gradually instead of at a
+    constant rate. Zero at pure black and pure white, ~0.10 a tenth of the way
+    in from either, 1.0 at the pivot.
+
+    The pivot is clamped away from 0 and 1: at either extreme one side of the
+    bell has no room left and the division would be by zero.
 
     Reads the frame as it stands *before* any of the five layers is added, so
     the envelopes come from the picture rather than from the grain already laid
@@ -57,7 +65,12 @@ def _source_masks(m: torch.Tensor) -> tuple[torch.Tensor, ...]:
     """
     r, g, b = m[:, 0:1], m[:, 1:2], m[:, 2:3]
     lum = _luma(m)
-    t = 1.0 - (lum * 2.0 - 1.0).abs()
+    pv = min(max(float(pivot), 0.02), 0.98)
+    d = lum - pv
+    # Each side normalised by its own room, so the bell is asymmetric but still
+    # hits 0 at both ends. `torch.where` rather than a branch: the two sides are
+    # both present in every tile.
+    t = (1.0 - torch.where(d < 0.0, -d / pv, d / (1.0 - pv))).clamp(0.0, 1.0)
     return (
         (r - torch.maximum(g, b)).clamp_min(0.0),
         (g - torch.maximum(r, b)).clamp_min(0.0),

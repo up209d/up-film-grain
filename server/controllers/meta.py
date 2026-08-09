@@ -26,12 +26,16 @@ def get_params() -> dict:
 
 @router.get("/luts")
 def get_luts() -> dict:
-    """Every 3D LUT the client can pick: the ``luts/`` folder plus any uploads.
+    """Every 3D LUT the client can pick: the ``luts/`` tree plus any uploads.
 
     Its own endpoint rather than a field on ``/api/params`` because the list
     changes during a session -- uploading one has to add to it -- while the
-    parameter schema never does. Nothing is parsed to answer this; the folder is
-    only listed, so a directory of 64-cubes costs nothing to browse.
+    parameter schema never does. Nothing is parsed to answer this; the tree is
+    only walked, so a library of 300 64-cubes costs nothing to browse.
+
+    Subfolders are walked and each entry carries the ``group`` it came from, so
+    the client can offer 300 LUTs as collapsed folders rather than one flat
+    list. The ``id`` is the path relative to ``luts/`` without the extension.
     """
     return {"luts": lutlib.list_luts()}
 

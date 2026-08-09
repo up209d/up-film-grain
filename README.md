@@ -124,7 +124,11 @@ FILM_GRAIN_PYTHON=../.venv/bin/python ./build/run.sh
   panel order, though a hand-written `{"intensity": 40}` loads just as well:
   unknown keys are dropped, values clamped, anything absent filled from its
   default. **LUTs are the `luts/` folder**, same idea, plus **Load .cube…** for
-  a one-session upload.
+  a one-session upload. Subfolders are walked and become collapsed groups in
+  the picker, which also has a filter box — a LUT is named by its path relative
+  to `luts/` without the extension, so `gmic/colorslide/fuji_fp_100c` is what a
+  preset records for one nested two deep, and `UP-SuperPortra` for one at the
+  top.
 
 Control-by-control guidance is in
 [docs/using-the-controls.md](docs/using-the-controls.md).
@@ -132,14 +136,15 @@ Control-by-control guidance is in
 ## Verify
 
 ```bash
-pipenv run python tests/verify.py                 # everything, in parallel (~36s)
+pipenv run python tests/verify.py                 # everything, in parallel (~43s)
 pipenv run python tests/verify.py edges scatter   # only those modules
 pipenv run python tests/verify.py -l              # list the modules
 ```
 
-362 checks across 17 modules — tile independence, crop fidelity, colour
+367 checks across 17 modules — tile independence, crop fidelity, colour
 pass-through, luminance response, edge bias, scatter, the colour-grading section
-and its `.cube` parsing, 16-bit PNG validity. Run it after touching anything
+and its `.cube` parsing (including that every LUT in the tree actually loads and
+that no path can escape the folder), 16-bit PNG validity. Run it after touching anything
 under `server/engine/`; it exits non-zero on failure. See
 [docs/testing.md](docs/testing.md).
 
@@ -164,7 +169,23 @@ server/
 web/src/         models/ services/ controllers/ views/
 presets/         preset library -- files, not code
 luts/            3D LUTs -- drop a .cube in and it is in the menu
+  gmic/          296 film-emulation LUTs, in folders (see Credits)
 ```
+
+## Credits
+
+The `luts/gmic/` library is **Pat David's** film emulation presets for G'MIC,
+converted to `.cube`. They are the 296 LUTs under `bw/`, `colorslide/`,
+`fujixtransiii/`, `instant_consumer/`, `instant_pro/`, `negative_color/`,
+`negative_new/`, `negative_old/` and `print/` — the reason the picker grew
+folders and a search box.
+
+* [Film Emulation Presets in G'MIC (GIMP)](https://patdavid.net/2013/09/film-emulation-presets-in-gmic-gimp/)
+  — Pat David
+* [G'MIC](https://gmic.eu/) — the image-processing framework they were built
+  for and ship with
+
+The seven LUTs at the root of `luts/` are the app's own.
 
 ## Documentation
 

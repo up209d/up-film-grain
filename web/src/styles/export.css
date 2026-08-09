@@ -27,7 +27,6 @@
    of the controls away from it. */
 .cornerbar .title { flex: 0 0 auto; font-size: 11.5px; cursor: help; margin: 0 0 1px 6px; }
 .cornerbar .seg { padding: 4px 9px; font-size: 11.5px; }
-.cornerbar select { padding: 4px 7px; font-size: 11.5px; }
 /* Sized rather than shrink-wrapped: the labels carry the photo's pixel
    dimensions, so a content-width menu would change width both with the photo
    that is open and with the option that is picked, dragging the bar's left edge
@@ -37,10 +36,13 @@
    stopped being a three-way scale choice on 2026-08-08 and became a supersample
    choice, which is a longer string than the old "Full size — 12000×8000" but
    shorter than the "As previewed, full size — " it replaced. 250px still clears
-   it. Do not shrink this on the evidence of one photo: a select does not
-   ellipsise, it simply cuts, so anything short here loses the dimensions the
-   label exists to carry. */
-.cornerbar .xscale { width: 250px; }
+   it. Do not shrink this on the evidence of one photo: the trigger ellipsises
+   now rather than cutting, which is tidier and loses the dimensions the label
+   exists to carry just the same. */
+.cornerbar .menu-btn.xscale { width: 250px; }
+/* The three format names are short and all much the same length, so this one is
+   sized only to stop it twitching between them. */
+.cornerbar .menu-btn.xformat { width: 118px; }
 .cornerbar .export-go { padding: 5px 12px; font-size: 11.5px; }
 /* The same rule the viewbar uses between its groups, so the two corners are
    punctuated identically. */
@@ -91,12 +93,11 @@
   word-break: break-word;
 }
 
-/* ------------------------------------------------------------- secmenu -- */
-/* The pipeline-section jump list, beside the collapse switch. Anchored to its
-   own button rather than to the bar, so it stays under it when the bar wraps.
-   It opens upwards: the bar is 10px off the bottom of the stage and a menu
-   dropped downwards would open past the window. */
-.secmenu { position: relative; display: inline-flex; }
+/* --------------------------------------------------- menus on this bar -- */
+/* The look lives in menu.css; what is here is only how the corner bar sizes
+   them. The hamburger is square and icon-only, and both export menus are fixed
+   width for the reason the comment above them gives -- the bar must not resize
+   as a menu changes or a differently-sized photo is opened. */
 .cornerbar .seg.secmenu-btn {
   width: 26px; padding: 4px 0;
 }
@@ -104,24 +105,7 @@
   width: 15px; height: 15px;
   display: block; margin: 0 auto;
 }
-.secmenu-list {
-  position: absolute; z-index: 4;
-  bottom: calc(100% + 6px); right: 0;
-  min-width: 190px; max-height: 60vh; overflow-y: auto;
-  display: flex; flex-direction: column;
-  padding: 4px; border-radius: 8px;
-  background: rgba(10,11,14,.94);
-  border: 1px solid var(--line);
-  box-shadow: 0 8px 24px rgba(0,0,0,.5);
-  backdrop-filter: blur(6px);
-}
-/* Left-aligned and full width: this is a list of names to read down, not a row
-   of buttons, so the labels have to share a left edge. */
-.secmenu-item {
-  appearance: none;
-  background: none; border: 0; border-radius: 5px;
-  padding: 6px 9px;
-  color: var(--text); font: inherit; font-size: 11.5px;
-  text-align: left; white-space: nowrap; cursor: pointer;
-}
-.secmenu-item:hover { background: var(--panel2); color: var(--accent); }
+.cornerbar .secmenu-btn ~ .menu-list { min-width: 190px; }
+/* Shrink-wrapped rather than the full-width default: these stand in a row of
+   bar controls, not in a panel column. */
+.cornerbar .menu-btn.menu-select { width: auto; font-size: 11.5px; }

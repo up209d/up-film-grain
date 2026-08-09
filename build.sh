@@ -77,10 +77,22 @@ fi
 # a .cube quietly grades nothing. The folder is created either way so it is
 # obvious where LUTs go. These are large -- a 64-cube is ~7MB of text -- so the
 # count and total are reported rather than left to surprise you.
+#
+# Walked, not globbed. `luts/` became a tree on 2026-08-09 and `cp luts/*.cube`
+# silently dropped every subfolder -- the distribution shipped 7 of 303 LUTs,
+# the menu showed the seven at the root and none of the folders, and nothing
+# anywhere said so. A LUT's id *is* its path relative to `luts/`, so the layout
+# has to survive the copy or every nested id in a preset stops resolving.
 mkdir -p "$OUT/luts"
-if compgen -G "luts/*.cube" > /dev/null; then
-  cp luts/*.cube "$OUT/luts/"
-  say "Bundled $(ls -1 luts/*.cube | wc -l | tr -d ' ') LUT(s), $(du -sh luts | cut -f1)"
+lut_n=0
+while IFS= read -r f; do
+  rel="${f#luts/}"
+  mkdir -p "$OUT/luts/$(dirname "$rel")"
+  cp "$f" "$OUT/luts/$rel"
+  lut_n=$((lut_n + 1))
+done < <(find luts -type f -name '*.cube')
+if [ "$lut_n" -gt 0 ]; then
+  say "Bundled $lut_n LUT(s) in $(find "$OUT/luts" -type d | wc -l | tr -d ' ') folder(s), $(du -sh "$OUT/luts" | cut -f1)"
 else
   say "No LUTs to bundle (luts/ is empty)"
 fi

@@ -43,6 +43,17 @@
 import { EXPORT_OPTIONS, exportOption } from "../../services/api";
 import type { ExportJob, ImageMeta } from "../../services/api";
 import Help from "../controls/Help";
+import SelectMenu from "../controls/SelectMenu";
+
+/** The three encoders `imageio` can write, in the order they are worth
+ *  reaching for. Hoisted out of the JSX only because it is a constant list and
+ *  rebuilding it on every render put an array literal in the middle of a row of
+ *  controls; the strings themselves are what the server matches on. */
+const EXPORT_FORMATS = [
+  { value: "jpeg", label: "JPEG 95" },
+  { value: "png16", label: "PNG 16-bit" },
+  { value: "png8", label: "PNG 8-bit" },
+];
 
 export default function ExportPanel(props: {
   meta: ImageMeta | null;
@@ -107,28 +118,32 @@ export default function ExportPanel(props: {
           differently-sized photo is opened -- the labels carry pixel
           dimensions, and an overlay that shifts its own left edge while you
           are reading it is the reason the old one was sized rather than
-          shrink-wrapped. */}
-      <select
-        className="xscale"
+          shrink-wrapped.
+
+          Both open *upwards*, for the same reason the section menu at the far
+          end of this bar does: the bar is 10px off the bottom of the stage, so
+          a menu dropped downwards opens past the window. */}
+      <SelectMenu
+        buttonClass="xscale"
+        drop="up"
+        items={EXPORT_OPTIONS.map((o) => ({
+          value: o.key,
+          label:
+            `Full size${meta ? ` ${meta.width}×${meta.height}` : ""}` +
+            (o.full ? " / 1:1 SS 1×" : ` / SS ${o.ss}×`),
+        }))}
         value={props.exportKey}
-        onChange={(e) => props.onExportKey(e.target.value)}
-      >
-        {EXPORT_OPTIONS.map((o) => (
-          <option key={o.key} value={o.key}>
-            Full size{meta ? ` ${meta.width}×${meta.height}` : ""}
-            {o.full ? " / 1:1 SS 1×" : ` / SS ${o.ss}×`}
-          </option>
-        ))}
-      </select>
-      <select
-        className="xformat"
+        onPick={props.onExportKey}
+        title="What to render"
+      />
+      <SelectMenu
+        buttonClass="xformat"
+        drop="up"
+        items={EXPORT_FORMATS}
         value={props.format}
-        onChange={(e) => props.onFormat(e.target.value)}
-      >
-        <option value="jpeg">JPEG 95</option>
-        <option value="png16">PNG 16-bit</option>
-        <option value="png8">PNG 8-bit</option>
-      </select>
+        onPick={props.onFormat}
+        title="File format"
+      />
       <button
         className="btn primary export-go"
         onClick={props.onExport}

@@ -143,7 +143,12 @@ variance here is ±1s on larger frames, so single-shot numbers are worthless):
 
 * **`build.sh` copies `luts/`.** It already had this exact bug documented for
   `presets/` — a distribution without the folder has an empty LUT menu and a
-  preset that names a `.cube` quietly grades nothing.
+  preset that names a `.cube` quietly grades nothing. It came back in a second
+  form on 2026-08-09: the copy was `cp luts/*.cube`, which drops every
+  subfolder, so the distribution shipped 7 of 303 and reported "Bundled 7
+  LUT(s)" without complaint. It walks the tree now and counts what it wrote.
+  A LUT's id *is* its path relative to `luts/`, so the layout has to survive the
+  copy or every nested id in a preset stops resolving.
 * **Editing a control in a muted section now switches that section on.** Found in
   a real browser, not by inspection: on a fresh load *every* section is muted (see
   the muted-on-boot section), so picking a LUT left the section's switch reading
@@ -155,3 +160,71 @@ variance here is ±1s on larger frames, so single-shot numbers are worthless):
   boot started muting everything, and the new section is simply where it is hit
   first. The pair is split into a pure half and a side-effecting half because a
   `setMuted` call inside a `setValues` updater would run twice under StrictMode.
+
+## The folder became a tree (2026-08-09)
+
+A library of 296 film-emulation LUTs arrived as `luts/gmic/`, organised into
+nine folders — [Pat David's film emulation presets][pd] for [G'MIC][gmic],
+converted to `.cube`. `luts/` had been flat and held seven files, and neither
+end of the app survived the change untouched.
+
+[pd]: https://patdavid.net/2013/09/film-emulation-presets-in-gmic-gimp/
+[gmic]: https://gmic.eu/
+
+**A LUT's id is now its path relative to `luts/`, extension dropped.**
+`UP-SuperPortra` at the root, `gmic/colorslide/fuji_fp_100c` in a folder. Two
+things follow, and the first is the reason for the second:
+
+* **No preset needed migrating.** A root-level file's relative path *is* its
+  bare stem, so the nine shipped presets naming `UP-SuperPortra`,
+  `ClassicNegative` and `UP-Vintage` kept resolving without being touched. That
+  is not luck — it is why a *path* was the right id rather than, say, a
+  `folder:name` pair or a hash.
+* **A bare stem could not stay sufficient.** `gmic/negative_new` and
+  `gmic/negative_old` both ship a `kodak_portra_400`. Collapsing the tree into
+  one namespace would make which of them a preset gets depend on the order the
+  directory walk happened to return them in — the same class of bug as indexing
+  a preset into a folder listing, which the top of this file rejects for the
+  same reason. `verify.py` pins it from both sides: the nested path resolves and
+  the bare name does *not*.
+
+**The traversal guard had to be rebuilt, not relaxed.** `get()` used to reject
+any id containing a separator. That is a perfectly good rule for a flat folder
+and it was the *entire* path-traversal defence, so the moment separators became
+meaningful the guard was gone. `lut.resolve_path` is the replacement and it is
+strictly stronger than what it replaced:
+
+1. no backslashes, no leading `/` — a Windows-style `gmic\bw\x` must not become
+   a valid path on a POSIX box either;
+2. no `.`, `..` or empty segment anywhere, so nothing climbs out textually;
+3. and then, having built the path, `resolve()` it and require the result to
+   still be under `LUT_DIR`.
+
+Step 3 is the one a textual check cannot do: a symlink *inside* `luts/` pointing
+at `/etc` passes 1 and 2 and is caught only by resolving. `verify.py` fires
+eight probes at it — `..`, `../presets/Stock`, `gmic/../../presets/Stock`,
+`/etc/passwd`, `gmic\bw\agfa_apx_100`, `gmic//bw/agfa_apx_100`, `.` and `""` —
+and requires every one to resolve to no LUT. An end-to-end render with
+`gmic/../../presets/Stock` as the LUT comes back bit-identical to a render with
+none, which is the behaviour `params_for` guarantees by zeroing the mix.
+
+**Listing still parses nothing.** `list_luts` walks with `rglob` and reports
+`{id, name, size: null, source, group}` per file; 303 of them cost 9ms. `rglob`
+does not follow symlinks, which matters more here than it did with `glob` — a
+link pointing at `/` would otherwise walk the disk. `group` is the parent folder
+relative to `luts/` (`""` at the root), reported rather than split back out of
+the id in the client, because the id is a path and the server owns paths.
+
+**The picker grew folders and a search box**, which is really a UI note but it
+is downstream of the number: 303 entries in a flat menu is not a menu. Folders
+are collapsed headings, the seven root LUTs sit above them and are always
+visible, and the filter matches folder names as well as LUT names — typing
+`instant` should get you the folder rather than nothing. Collapsed-by-default is
+also what keeps it cheap: nine headings and seven rows are all that is in the
+DOM until something is expanded. See `docs/client-ui.md`.
+
+**The check that loads every LUT now loads 303 of them** and the `grading`
+module went from ~4s to 7.9s (the suite, 42.7s). That is the check that catches
+a malformed `.cube` shipping, so it stays; per `CLAUDE.md`, quality beats speed.
+Its detail string prints a count and the *failures*, not a roll call — 303 names
+in the log would bury every other line in the module.

@@ -81,7 +81,12 @@ Two deliberate departures from the obvious layout:
 * **`controls/ParamControl.tsx`, not `Slider` + `Dropdown`.** A discrete
   parameter renders as a menu and a continuous one as a slider, but the value is
   a number either way and nothing else in the app ever chooses between them. Two
-  components would never vary independently.
+  components would never vary independently. The *menu* it renders is shared —
+  `controls/SelectMenu.tsx`, on `controls/Popover.tsx` — because six unrelated
+  places needed the same list-of-names widget once the native `<select>` went
+  (2026-08-09; see `docs/client-ui.md`). That is the opposite call from this
+  bullet's and for the opposite reason: those six do vary independently, and the
+  thing they share is a behaviour rather than a decision.
 * **`stage/Stage.tsx` is one 485-line component.** The zoom transform, the pane
   measurement and the two compare modes share about ten refs and a wheel
   handler that has to remember an in-flight excursion. Splitting a `Canvas` out
