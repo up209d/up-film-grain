@@ -94,7 +94,7 @@
     "global_seed": 0.0,
     "sharpen": 12.0,
     "sharpen_radius": 0.8,
-    "dust": 15.0,
+    "dust": 9.0,
     "dust_balance": 0.8,
     "dust_size": 9.2,
     "dust_irregular": 0.0,
