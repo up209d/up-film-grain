@@ -1,5 +1,116 @@
 <!-- part of docs/global-grain.md -->
 
+## The cluster depth is a slider now, and ships at 0 (2026-08-13)
+
+Reported against a blank white plate, rendered specifically to look at what this
+layer does on a smooth subject: *"the noise luminosity is not even — there is a
+lot of white area where the noise has either low opacity or low luminosity, so
+it doesn't look even across the smooth texture. This is not organic, not
+digital, it feels like somewhere in the middle."*
+
+That is decision 4 below — the multi-octave cluster field — working exactly as
+designed, at a depth that was never a choice anyone could make. `_GRAIN_CLUSTER`
+was fixed at 0.6, which scales every grain's brightness between **0.4x and
+1.6x** in soft patches. It is now `global_mottle`, 0 to 1, **defaulting to 0**.
+
+### Measured before rebuilding, because "it looks blotchy" is not a number
+
+Grain amplitude is a *local* property, so the metric has to be the **envelope**:
+local standard deviation over a small block, then how much of that envelope's
+own variation survives being blurred to a scale far above one clump. The
+distinction matters — the field's global sigma is blind to this by construction,
+because clustering scales a *signed* brightness and therefore leaves the mean,
+and very nearly every whole-frame statistic, alone. That is the same trap the
+block-means version of the clustering check fell into in the first place.
+
+On the reported render (2400px, `global_size` 2 at a 0.4 proxy, so a 0.8px
+working cell):
+
+| | envelope spread | surviving >=33px |
+|---|---|---|
+| the reported frame | 11.8% | 4.4% |
+| a perfectly even field, same estimator | ~8% | ~2% |
+
+Isolating `_grain_points` at that cell, and sweeping the two mechanisms that
+could be responsible:
+
+| | envelope spread | surviving >=33px |
+|---|---|---|
+| cluster depth 0.6 | 18.8% | 8.0% |
+| cluster depth 0 | 5.2% | 1.4% |
+| fill 1.00 / 2 slots, no cluster | 5.1% | 1.3% |
+| fill 0.62 / 3 slots, no cluster (shipped) | 5.2% | 1.4% |
+| fill 0.40 / 5 slots, no cluster | 5.3% | 1.4% |
+
+**The density variation contributes nothing measurable, and decision 3 below
+implies otherwise.** Leave that section as written — it is the record of why the
+stratified process was abandoned, and it is right that a stratified field cannot
+vary — but the Binomial(3, 0.62) count is not what varies the *amplitude*. It is
+swamped: a grain's radius runs to a full cell, so every pixel sits under roughly
+six of them and count fluctuation averages out long before it reaches the eye.
+Everything the complaint describes is the cluster field, which is what makes one
+slider enough. It also means the two halves of the report — "low opacity" and
+"low luminosity" — are one mechanism seen twice, not two.
+
+End to end on the reporter's own preset and a white plate, sweeping the new
+parameter: mottle >=33px goes **5.3% -> 1.4%**, mean luma moves 0.13 of an 8-bit
+level, and rendered grain sigma moves +1.7%. That last figure is the clamp, not
+the normaliser — an evener field reaches the +-1 rails less often, so less of it
+is clipped away, and at `global_intensity` 100 the rails are busy. It is half
+the drift `global_chroma` has for the same reason and is documented the same
+way.
+
+### Loudness is held flat, and 0.6 is bit-identical to before
+
+Deeper mottling genuinely makes the raw field louder — sigma runs 0.14163 at
+depth 0 to 0.15574 at 1.0, **6.0%**. Left alone this slider would quietly have
+been an amplitude control too, which is the exact failure `chroma.md` was
+written about: a control that moves two things at once cannot be dialled in,
+because you cannot tell which one you are hearing.
+
+`camp` has mean 1 and variance `depth^2 * Var(2m - 1)`, so
+`E[camp^2] = 1 + depth^2 * V` and the field's sigma is its square root. With
+`V = 0.196` that predicts the measured sweep to **0.30%** at the extremes and
+better in the middle — a derivation confirmed, not a curve fitted, and the small
+residual is grains reaching one pixel sharing correlated `camp` values. So
+`_grain_gain` divides by
+
+```
+sqrt((1 + 0.196 * depth^2) / (1 + 0.196 * _GRAIN_CLUSTER_REF^2))
+```
+
+Normalised at `_GRAIN_CLUSTER_REF` rather than at 0, which is the whole point:
+the correction is then **identically 1.0** at 0.6, `_GRAIN_STD_FIT` keeps meaning
+what it was fitted to mean, and a preset carrying `global_mottle: 0.6` renders
+the field as it stood before this parameter existed. Verified rather than
+argued — the reporter's preset at 0.6 against a pre-change checkout is **max abs
+diff 0.00e+00** — and `verify.py` pins the anchor with an exact equality rather
+than a tolerance, because "close" here would silently make that claim false.
+
+### Nothing was migrated, so every shipped preset is evener now
+
+Per this file's standing rule the twelve preset files were left alone. They
+carry no `global_mottle` key, so `sanitize()` fills the 0.0 default and they all
+lost their mottle on this change. That was the explicit choice: the reported
+defect is what the old fixed depth does to a smooth subject, and shipping the
+slider at the value being complained about would have made it a control nobody
+found. Any preset that wants its old look back needs one line, `"global_mottle":
+0.6`, and the paragraph above is what makes that exact.
+
+### Exposing it costs nothing, and the default is a saving
+
+The cluster field is **14.8% / 8.0% / 3.4%** of a `_grain_points` call at a
+0.8 / 1.6 / 4.0px cell for one output field, and **10.8% / 5.4% / 1.0%** for
+three — the chroma case, where the rest of the call is heavier. The fine end is
+expensive because below a 1px cell the lattice is *denser* than the pixel grid.
+At depth 0 it is skipped outright
+rather than multiplied by a plane of ones, so the new default is measurably
+faster than every render before the slider existed, and identical on a cache
+hit. The one real cost is the standard one for this section: `global_mottle`
+joins the field's cache key, so dragging it rebuilds the texture the way Size
+Min and Size Max already do. It has to — the layer looks entirely plausible at
+any depth, so a stale hit here is invisible rather than obviously broken.
+
 ## Global Grain is one tilted point field now (rewritten 2026-08-05)
 
 Reported: *"global grain really causes artifacts, makes it look fake, it renders

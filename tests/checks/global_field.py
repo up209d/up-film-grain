@@ -11,7 +11,7 @@ import torch
 from server import params as P
 from tests.harness import gridiness
 from server.engine import (
-    _GRAIN_CLUSTER, _grain_gain, _grain_points,
+    _GRAIN_CLUSTER_REF, _grain_gain, _grain_points,
 )
 from tests.harness import Ctx, check, suite
 
@@ -102,30 +102,108 @@ def run(cx: Ctx) -> None:
     # signed, so it leaves every local mean alone and moves only how grainy one
     # region is against another. A first version of this check measured block
     # means, read a flat 0.99x, and was measuring nothing.
-    # Patch the module that *reads* the constant, not the package that
-    # re-exports it: `from .constants import _GRAIN_CLUSTER` binds a name in
-    # `noise.grain`, so rebinding it on `server.engine` changes nothing the
-    # field generator can see.
-    import server.engine.noise.grain as _E  # noqa: E402
-
+    #
+    # A plain argument since 2026-08-13, where the depth became `global_mottle`.
+    # It used to have to patch `noise.grain`'s own binding of the constant --
+    # rebinding it on `server.engine` changed nothing the generator could see --
+    # and that whole hazard is gone with the constant.
     def gv_contrast_cv(cluster: float) -> float:
-        keep = _E._GRAIN_CLUSTER
-        _E._GRAIN_CLUSTER = cluster
-        try:
-            f = _grain_points(1024, 1024, 0, 0, 2.0, 4.0, 77,
-                              torch.device("cpu"), 1)[0, 0].numpy()
-        finally:
-            _E._GRAIN_CLUSTER = keep
+        f = _grain_points(1024, 1024, 0, 0, 2.0, 4.0, 77,
+                          torch.device("cpu"), 1, cluster)[0, 0].numpy()
         f = f.astype(np.float64) - 0.5
         blk = 64                                   # 16 clumps at max size 4
         b = f.reshape(1024 // blk, blk, 1024 // blk, blk).std(axis=(1, 3))
         return float(b.std() / b.mean())
 
-    flat, clustered = gv_contrast_cv(0.0), gv_contrast_cv(_GRAIN_CLUSTER)
+    # Held against `_GRAIN_CLUSTER_REF` explicitly, not against the parameter's
+    # default: the default is 0 now, and reading it here would make this check
+    # assert that no clustering produces clustering.
+    flat, clustered = gv_contrast_cv(0.0), gv_contrast_cv(_GRAIN_CLUSTER_REF)
     check("clustering gives the layer structure above the clump",
           clustered > flat * 3.0 and clustered > 0.10,
           f"local-contrast spread {clustered:.4f} clustered vs {flat:.4f} "
           f"unclustered ({clustered / flat:.1f}x)")
+
+    # -- Global Mottling, the slider on that depth (2026-08-13) ---------------
+    # The check above says clustering *can* give the layer structure. These say
+    # the new control governs how much, in both directions, and that it does
+    # nothing else -- reported against a blank white plate, where 0.6 read as
+    # "not organic, not digital", with grain amplitude varying 11.8% across the
+    # frame and 4.4% of that surviving a blur to 33px.
+    #
+    # Measured on the **amplitude envelope at a scale far above one clump**,
+    # which is the metric the complaint is actually about. Local sd over 8px
+    # blocks is the envelope; averaging those in 4x4 groups throws away the
+    # per-block estimator noise and leaves only mottle 32px and coarser. The
+    # obvious metric -- the field's own sigma -- is blind to this by
+    # construction, since clustering scales a *signed* brightness and so leaves
+    # every mean and very nearly every global statistic alone. That is the same
+    # trap the block-means version of the check above fell into.
+    def gv_mottle_cv(cluster: float, blk: int = 8, grp: int = 4) -> float:
+        f = _grain_points(1024, 1024, 0, 0, 0.8, 0.8, 8460,
+                          torch.device("cpu"), 1, cluster)[0, 0].numpy()
+        f = f.astype(np.float64) - 0.5
+        n = 1024 // blk
+        env = f.reshape(n, blk, n, blk).std(axis=(1, 3))          # the envelope
+        m = n // grp
+        env = env.reshape(m, grp, m, grp).mean(axis=(1, 3))       # >= 32px only
+        return float(env.std() / env.mean())
+
+    # The white-noise control: what a *perfectly* even field measures on this
+    # estimator. Without it the numbers below are unreadable -- some spread is
+    # unavoidable when you estimate a local sd from finitely many samples, and
+    # the whole question is whether the field beats that floor or not.
+    _rs = np.random.RandomState(0).standard_normal((1024, 1024))
+    _n = 1024 // 8
+    _e = _rs.reshape(_n, 8, _n, 8).std(axis=(1, 3))
+    _e = _e.reshape(_n // 4, 4, _n // 4, 4).mean(axis=(1, 3))
+    gv_white = float(_e.std() / _e.mean())
+
+    gv_mot = {d: gv_mottle_cv(d) for d in (0.0, 0.15, 0.3, 0.45, 0.6, 0.8, 1.0)}
+    gv_seq = [gv_mot[d] for d in (0.0, 0.15, 0.3, 0.45, 0.6, 0.8, 1.0)]
+    check("mottling is monotone in the amplitude envelope",
+          all(b > a for a, b in zip(gv_seq, gv_seq[1:])),
+          "envelope spread at >=32px: "
+          + ", ".join(f"{d:g}:{v:.4f}" for d, v in gv_mot.items()))
+    # The user-facing promise, and the reason the default is 0: at that setting
+    # the layer must be *at least as even as white noise*, not merely evener
+    # than it was. It comfortably is -- grains overlap, so neighbouring blocks
+    # are correlated where independent samples are not.
+    check("mottling at 0 is as even as noise gets",
+          gv_mot[0.0] < gv_white,
+          f"{gv_mot[0.0]:.4f} against the white-noise floor {gv_white:.4f}")
+    # ...and the far end has to be worth having, or the slider is one-sided.
+    check("mottling at the pre-slider depth still mottles",
+          gv_mot[_GRAIN_CLUSTER_REF] > gv_mot[0.0] * 3.0,
+          f"{gv_mot[_GRAIN_CLUSTER_REF]:.4f} at {_GRAIN_CLUSTER_REF:g} against "
+          f"{gv_mot[0.0]:.4f} at 0 ({gv_mot[_GRAIN_CLUSTER_REF]/gv_mot[0.0]:.1f}x)")
+
+    # Mottling must move texture and *not* loudness, the property Global Chroma
+    # Grain is built around and for the same reason: a slider that moves two
+    # things at once cannot be dialled in, because you cannot tell which one you
+    # are hearing. Uncorrected the field runs 6.0% louder from 0 to 1, which is
+    # exactly the size of effect that reads as "this made the grain stronger".
+    gv_amp = {}
+    for d in (0.0, 0.3, 0.6, 1.0):
+        f = _grain_points(1024, 1024, 0, 0, 1.6, 1.6, 4242,
+                          torch.device("cpu"), 1, d)
+        gv_amp[d] = float((f - 0.5).std())
+    lo_m, hi_m = min(gv_amp.values()), max(gv_amp.values())
+    check("mottling does not change the layer's loudness",
+          (hi_m - lo_m) / (0.5 * (hi_m + lo_m)) < 0.01,
+          f"spread {(hi_m - lo_m) / (0.5 * (hi_m + lo_m)) * 100:.2f}% over "
+          + ", ".join(f"{d:g}:{v:.4f}" for d, v in gv_amp.items()))
+
+    # The anchor. `_GRAIN_STD_FIT` was fitted with the depth pinned at
+    # `_GRAIN_CLUSTER_REF`, so the correction has to be exactly 1 there -- that
+    # is what makes "put 0.6 back to get the old look" a true statement rather
+    # than an approximate one, and it is the only reason the constant still has
+    # a name now that it is not a default.
+    for lo, hi in ((1.0, 3.0), (2.0, 2.0), (1.0, 20.0)):
+        check(f"the pre-slider depth is the gain's anchor (min={lo:g} max={hi:g})",
+              _grain_gain(lo, hi, _GRAIN_CLUSTER_REF) == _grain_gain(lo, hi),
+              "the correction must be identically 1 at "
+              f"{_GRAIN_CLUSTER_REF:g}, not merely close")
 
     # -- grains are full density, never randomly faded -----------------------
     # A grain's brightness draw decides its *direction* and nothing else (see
@@ -148,14 +226,9 @@ def run(cx: Ctx) -> None:
     # puts 0.12-0.21% above 0.9, against 6.3-6.9% here, a 30-58x separation --
     # so this is what stops the opacity draw being reintroduced as a tidy-up.
     for lo, hi in ((2.0, 4.0), (1.0, 3.0), (6.0, 6.0)):
-        keep = _E._GRAIN_CLUSTER
-        _E._GRAIN_CLUSTER = 0.0
-        try:
-            f = _grain_points(1024, 1024, 0, 0, lo, hi, 4242,
-                              torch.device("cpu"), 1)[0, 0].numpy()
-        finally:
-            _E._GRAIN_CLUSTER = keep
-        a = np.abs(2.0 * (f.astype(np.float64) - 0.5) / _grain_gain(lo, hi))
+        f = _grain_points(1024, 1024, 0, 0, lo, hi, 4242,
+                          torch.device("cpu"), 1, 0.0)[0, 0].numpy()
+        a = np.abs(2.0 * (f.astype(np.float64) - 0.5) / _grain_gain(lo, hi, 0.0))
         top, mx = float((a > 0.9).mean()), float(a.max())
         check(f"grains are full density at min={lo:g} max={hi:g}",
               mx > 0.999 and top > 0.03,
@@ -246,23 +319,39 @@ def run(cx: Ctx) -> None:
         "global_smooth": 1.0}), 1.0)
     check("pad_for still reserves for the smoothing kernel", gv_sm > gv_base,
           f"{gv_base}px -> {gv_sm}px at smoothness 1, clump 20px")
+    # Mottling is not a kernel either. It is a per-*cell* multiplier evaluated
+    # on the lattice by absolute cell index, so it reads nothing outside the
+    # window `_grain_points` already derives -- but it ships at 0 now, which
+    # means the checks above run straight past it, and a stage nobody pads for
+    # seams a tiled export along exactly its reach while every preview looks
+    # fine. So it gets its own row rather than an argument.
+    gv_mt = eng.pad_for(P.sanitize({k: 0.0 for k in P.NEUTRAL_ZERO} | {
+        "global_intensity": 40.0, "global_size": 20.0, "global_opacity": 1.0,
+        "global_mottle": 1.0}), 1.0)
+    check("pad_for reserves nothing for mottling", gv_mt == gv_base,
+          f"{gv_mt}px against {gv_base}px with the layer off")
 
     # And the same thing end to end through the renderer, at the sizes and
     # smoothing settings where a reach bug would actually bite.
     gv_scene = np.ascontiguousarray(
         (np.random.RandomState(9).rand(320, 480, 3) * 0.5 + 0.25).astype(np.float32)
     )
-    for lo, hi, smooth, tile in (
-        (0.4, 1.0, 0.0, 64), (1.0, 2.0, 0.6, 64), (0.8, 20.0, 1.0, 96),
+    # The last row carries mottling, for the reason the `pad_for` row above
+    # does: it ships at 0, so every other row here renders straight past it, and
+    # the cluster field is the one part of this construction that reads a
+    # *second* lattice on its own derived window.
+    for lo, hi, smooth, mottle, tile in (
+        (0.4, 1.0, 0.0, 0.0, 64), (1.0, 2.0, 0.6, 0.0, 64),
+        (0.8, 20.0, 1.0, 0.0, 96), (1.0, 3.0, 0.0, 1.0, 64),
     ):
         p = P.sanitize({"global_intensity": 40, "global_size": lo,
                         "global_size_max": hi, "global_opacity": 1.0,
-                        "global_smooth": smooth})
+                        "global_smooth": smooth, "global_mottle": mottle})
         wide = eng.render_image(gv_scene, p, 1.0, tile=4096, supersample=1)
         narrow = eng.render_image(gv_scene, p, 1.0, tile=tile, supersample=1)
         d = float(np.abs(wide.astype(float) - narrow.astype(float)).max())
-        check(f"tile independence (min={lo}, max={hi}, smooth={smooth})",
-              d < 2e-3, f"max delta {d:.2e}")
+        check(f"tile independence (min={lo}, max={hi}, smooth={smooth}, "
+              f"mottle={mottle})", d < 2e-3, f"max delta {d:.2e}")
 
     # Chroma shares the geometry generator, so a colour variant of a wide
     # size range must still decorrelate the channels.

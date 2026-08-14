@@ -72,11 +72,11 @@ class GlobalGrainMixin:
         ``idx`` picks the layer -- 0 is the flat one, 1-4 the source-masked set
         -- and it selects **nothing but a pair of seed offsets** out of
         `_GLAYER_SEEDS`. All five layers are otherwise the same field through the
-        same code: same size range, same smoothing, same chroma construction,
-        same normalise-and-clamp. That is what puts the five amount sliders on
-        one scale before their masks take a share, and what makes Size Min, Size
-        Max, Smoothness and Chroma Grain mean one thing across the section
-        rather than five.
+        same code: same size range, same smoothing, same mottling, same chroma
+        construction, same normalise-and-clamp. That is what puts the five amount
+        sliders on one scale before their masks take a share, and what makes Size
+        Min, Size Max, Smoothness, Mottling and Chroma Grain mean one thing
+        across the section rather than five.
 
         Different offsets per layer is the whole reason they are separate calls
         rather than five brightness fields off one geometry: a red-masked grain
@@ -122,6 +122,11 @@ class GlobalGrainMixin:
           sees. Keying on the two separately would be equally correct and would
           miss on a pair that had merely swapped which slider carried the total.
         * ``global_smooth`` -- `_smooth_noise` is inside this boundary.
+        * ``global_mottle`` -- the cluster depth, which changes both the field's
+          texture and, through `_grain_gain`, its normalisation. It is the one
+          key here that is cheap to *leave out* and expensive to get wrong: the
+          layer looks entirely plausible at any depth, so a stale hit is
+          invisible rather than obviously broken.
         * ``global_chroma`` -- decides whether the second field is built at all,
           and changes the returned channel count.
         * the device -- these are device-resident tensors.
@@ -149,7 +154,7 @@ class GlobalGrainMixin:
         key = (
             idx, h, w, float(y0), float(x0), gcell, gcell_max,
             base_seed, p["global_smooth"], p["global_chroma"],
-            str(self.device),
+            p["global_mottle"], str(self.device),
         )
         # Everything after the tile's own coordinates is the *generation* -- the
         # parameter state this field belongs to. Entries from an older
@@ -192,10 +197,12 @@ class GlobalGrainMixin:
 
         off_mono, off_chroma = _GLAYER_SEEDS[idx]
 
+        mottle = p["global_mottle"]
+
         def field(seed_off: int, nfields: int) -> torch.Tensor:
             return _grain_points(
                 h, w, y0, x0, gcell, gcell_max,
-                base_seed + seed_off, self.device, nfields,
+                base_seed + seed_off, self.device, nfields, mottle,
             )
 
         gg = field(off_mono, 1)

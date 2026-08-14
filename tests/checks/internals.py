@@ -192,7 +192,7 @@ def run(cx: Ctx) -> None:
     # must come back bit-exact when reverted.
     for key, delta in (("seed", 1.0), ("global_size", 0.6),
                        ("global_size_max", 2.0), ("global_smooth", 0.4),
-                       ("global_chroma", -0.5)):
+                       ("global_chroma", -0.5), ("global_mottle", 0.6)):
         q = P.sanitize({**gp, key: gp[key] + delta})
         before = gg_eng.gg_misses
         other = gg_eng.render_image(gimg, q, 1.0, tile=4096, supersample=1)

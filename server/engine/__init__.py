@@ -53,7 +53,7 @@ from .marks import (
 from .masks import _grain_delta, _source_masks
 from .noise.fields import _fbm, _scatter_offsets, _smooth_noise
 from .noise.grain import (
-    _GRAIN_CLUSTER, _GRAIN_CLUSTER_CELLS, _GRAIN_CLUSTER_OCTAVES, _GRAIN_CLUSTER_ROUGHNESS, _GRAIN_COS, _GRAIN_FILL, _GRAIN_RINGS, _GRAIN_ROT, _GRAIN_SHARE, _GRAIN_SIN, _GRAIN_SLOTS, _GRAIN_STD_FIT, _GRAIN_TARGET_STD, _SCATTER_NAMES, _SCATTER_STENCILS, _grain_cluster, _grain_gain, _grain_lattice_noise, _grain_points,
+    _GRAIN_CLUSTER_CELLS, _GRAIN_CLUSTER_OCTAVES, _GRAIN_CLUSTER_REF, _GRAIN_CLUSTER_ROUGHNESS, _GRAIN_CLUSTER_VAR, _GRAIN_COS, _GRAIN_FILL, _GRAIN_RINGS, _GRAIN_ROT, _GRAIN_SHARE, _GRAIN_SIN, _GRAIN_SLOTS, _GRAIN_STD_FIT, _GRAIN_TARGET_STD, _SCATTER_NAMES, _SCATTER_STENCILS, _grain_cluster, _grain_gain, _grain_lattice_noise, _grain_points,
 )
 from .noise.lattice import (
     _HASH_KX, _HASH_KY, _HASH_M1, _HASH_M2, _cell_noise, _lat_span, _lattice_np, _lsr, _u64, _value_noise,
@@ -94,10 +94,11 @@ __all__ = [
     '_GRADE_TINT_GAIN',
     '_GRADE_TONE_KNEE',
     '_GRADE_TONE_MAX',
-    '_GRAIN_CLUSTER',
     '_GRAIN_CLUSTER_CELLS',
     '_GRAIN_CLUSTER_OCTAVES',
+    '_GRAIN_CLUSTER_REF',
     '_GRAIN_CLUSTER_ROUGHNESS',
+    '_GRAIN_CLUSTER_VAR',
     '_GRAIN_COS',
     '_GRAIN_FILL',
     '_GRAIN_RINGS',

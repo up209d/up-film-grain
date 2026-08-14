@@ -73,9 +73,11 @@ _GRAIN_RINGS = 1
 # from 2.6e-04 to 1.2e-06.
 _GRAIN_SHARE = 3
 
-# The cluster field: how deeply a grain's brightness is modulated by a smooth
-# multi-octave field, its base pitch in *cells*, and that field's own octave
-# count and roughness.
+# The cluster field: the base pitch in *cells* of the smooth multi-octave field
+# a grain's brightness is modulated by, and that field's own octave count and
+# roughness. **How deeply it modulates is no longer a constant** -- it is the
+# `global_mottle` parameter, passed in (see `_grain_cluster`). What is left here
+# is the field's shape, which is not a control.
 #
 # **This is the answer to "no pattern when zooming out", and nothing else in
 # the construction can supply it.** Points, however well randomised, give a
@@ -83,7 +85,7 @@ _GRAIN_SHARE = 3
 # such field averages to a featureless screen, which is exactly what reads as a
 # repeating mesh. Real emulsion does not do that: crystals clump, clumps mottle,
 # and the mottling has no single size. So each grain's brightness is scaled by
-# ``1 + CLUSTER * (m * 2 - 1)`` with ``m`` a three-octave field, giving the
+# ``1 + depth * (m * 2 - 1)`` with ``m`` a three-octave field, giving the
 # layer real contrast variation at 6, 12 and 24 cells at once.
 #
 # Single-octave clustering was built first and is visibly wrong: it gives every
@@ -91,19 +93,45 @@ _GRAIN_SHARE = 3
 # blobs -- a different repeating pattern rather than none. Three octaves is
 # where the eye stops finding a characteristic size.
 #
-# Depth 0.6 keeps ``1 + 0.6*(...)`` strictly positive, so the modulation can
-# thin a region out but never invert a grain's sign. Swept 0.4 / 0.6 / 0.8:
-# 0.4 is barely visible at a distance, 0.8 starts reading as patchiness in the
-# image rather than as grain.
+# Depths up to 1 keep ``1 + depth*(...)`` non-negative, so the modulation can
+# thin a region out but never invert a grain's sign -- which is what makes the
+# slider's whole range meaningful rather than only its lower half.
 #
 # Pitched in *cells* rather than pixels on purpose, so the mottling scales with
 # the clump the way `reference_mp` scales everything else: a preset dialled in
 # at one grain size keeps the same relationship between clump and cluster when
 # the size slider moves.
-_GRAIN_CLUSTER = 0.6
 _GRAIN_CLUSTER_CELLS = 6.0
 _GRAIN_CLUSTER_OCTAVES = 3
 _GRAIN_CLUSTER_ROUGHNESS = 0.7
+
+# The depth `_GRAIN_STD_FIT` below was fitted at, and therefore the depth the
+# amplitude normaliser is anchored on -- **not a default**. `global_mottle`
+# defaults to 0; this number is the one that reproduces the field as it stood
+# before that slider existed, which is why it is still worth having a name.
+#
+# It was chosen by sweeping 0.4 / 0.6 / 0.8 when the depth was fixed: 0.4 was
+# barely visible at a distance, 0.8 started reading as patchiness in the image
+# rather than as grain. What that sweep missed is that 0.6 is *already* over
+# the line for a smooth subject -- reported 2026-08-13 against a blank white
+# plate, where the layer reads as neither organic nor digital. Measured on that
+# frame, grain amplitude varied 11.8% across it with 4.4% of the variation
+# surviving a blur to 33px, against ~2% for a perfectly even field. Hence the
+# slider: the right depth depends on the picture, so it cannot be one number.
+_GRAIN_CLUSTER_REF = 0.6
+
+# Variance of the cluster field's own ``2m - 1``, which is what the amplitude
+# correction in `_grain_gain` needs.
+#
+# **Derived, then confirmed, rather than fitted.** ``camp`` has mean 1 and
+# variance ``depth**2 * Var(2m - 1)``, so ``E[camp**2] = 1 + depth**2 * V`` and
+# the field's sigma goes as its square root. Measured field sigma against that
+# form across depth 0, 0.15, 0.3, 0.45, 0.6, 0.8 and 1.0 agrees to **0.30%**
+# at the extremes and better in the middle -- the small residual is the grains
+# reaching one pixel sharing correlated ``camp`` values, so the expectation is
+# not quite exact. 0.3% is an order inside the 6.8% flatness the size range
+# already holds to.
+_GRAIN_CLUSTER_VAR = 0.196
 
 # Amplitude normalisation. The field is scaled so its standard deviation is
 # `_GRAIN_TARGET_STD` at every Min/Max setting, using a closed form in the
@@ -142,15 +170,32 @@ _GRAIN_TARGET_STD = 0.29
 _GRAIN_STD_FIT = (-0.04938, -0.02158, 0.16008, 0.48341)
 
 
-def _grain_gain(lo: float, hi: float) -> float:
+def _grain_gain(lo: float, hi: float, cluster: float = _GRAIN_CLUSTER_REF) -> float:
     """Amplitude normaliser for `_grain_points`, a closed form in ``lo/hi``.
 
     See `_GRAIN_TARGET_STD` for why this is a fitted constant rather than a
     measurement of the field in hand.
+
+    ``cluster`` is the mottling depth, and it has to be here or `global_mottle`
+    would quietly be a loudness control as well as a texture one -- deeper
+    mottling raises the field's own sigma, by 6.0% from 0 to 1. That is the
+    exact failure `global_chroma` was built to avoid (see the block above `gc`
+    in `stages/global_grain.py`): a slider that moves two things at once cannot
+    be dialled in, because you cannot tell which one you are hearing.
+
+    The correction is `_GRAIN_CLUSTER_VAR`'s derivation solved for sigma, and it
+    is normalised at `_GRAIN_CLUSTER_REF` rather than at 0 on purpose: that
+    makes it exactly 1.0 there, so the cubic above keeps meaning what it was
+    fitted to mean and a preset carrying ``global_mottle: 0.6`` renders the
+    field as it stood before this parameter existed.
     """
     r = min(max(lo / hi, 0.0), 1.0)
     a, b, c, d = _GRAIN_STD_FIT
-    return _GRAIN_TARGET_STD / (((a * r + b) * r + c) * r + d)
+    g = _GRAIN_TARGET_STD / (((a * r + b) * r + c) * r + d)
+    k = _GRAIN_CLUSTER_VAR
+    return g * math.sqrt(
+        (1.0 + k * _GRAIN_CLUSTER_REF**2) / (1.0 + k * cluster * cluster)
+    )
 
 
 def _grain_lattice_noise(
@@ -199,8 +244,12 @@ def _grain_lattice_noise(
 
 def _grain_cluster(
     iy0: int, ix0: int, hl: int, wl: int, seed: int, device: torch.device,
+    depth: float,
 ) -> torch.Tensor:
     """Per-cell brightness multiplier: the multi-octave clumping field.
+
+    ``depth`` is `global_mottle`. At 0 this returns a scalar 1.0 rather than a
+    plane of ones, and the caller skips it entirely -- see `_grain_points`.
 
     Variance-preserving across octaves for `_fbm`'s reason -- otherwise adding
     structure would quietly turn the modulation down, and the cluster depth
@@ -219,12 +268,13 @@ def _grain_cluster(
         wsum += wgt
         wsq += wgt * wgt
     m = 0.5 + (total / wsum - 0.5) * (wsum / math.sqrt(wsq))
-    return 1.0 + _GRAIN_CLUSTER * (m * 2.0 - 1.0)
+    return 1.0 + depth * (m * 2.0 - 1.0)
 
 
 def _grain_points(
     h: int, w: int, y0: float, x0: float, lo: float, hi: float, seed: int,
     device: torch.device, nfields: int = 1,
+    cluster: float = _GRAIN_CLUSTER_REF,
 ) -> torch.Tensor:
     """The Global Grain layer's noise: discrete grains of independently drawn
     size, scattered on a rotated lattice and clustered at every scale.
@@ -262,7 +312,8 @@ def _grain_points(
       so the size distribution is exactly what the two sliders promise.
     * Position jitters over the **whole** cell. Brightness is a *sign* drawn per
       output field -- every grain that exists is at full density, never a random
-      fraction of it -- scaled by that cell's cluster multiplier.
+      fraction of it -- scaled by that cell's cluster multiplier, which
+      ``cluster`` sets the depth of and switches off at 0.
     * A pixel's amplitude is the single largest falloff over every candidate
       (so a gap stays a gap), and its brightness is those candidates' brightness
       averaged under ``falloff ** _GRAIN_SHARE`` (so overlapping grains trade
@@ -279,6 +330,17 @@ def _grain_points(
     frame -- it has to, or the layer is a screen -- but it varies through how
     many grains land where, how they overlap and the cluster field, never by
     handing an individual grain a fractional opacity.
+
+    **``cluster`` is the only one of those three that is worth much**, which is
+    not what the construction's own comments used to imply. Measured on the
+    field's amplitude envelope at a 0.8px cell: forcing full density (fill 1.0
+    over 2 slots) against the shipped 0.62 over 3 and against a sparse 0.40
+    over 5 gives 5.1% / 5.2% / 5.3% envelope spread -- the count fluctuation is
+    real but is swamped, because a grain's radius runs to a full cell and every
+    pixel is under several of them. The same sweep on ``cluster`` gives 5.2% at
+    0 and 18.8% at `_GRAIN_CLUSTER_REF`. So the layer's unevenness is this
+    parameter and essentially nothing else, which is what makes one slider
+    enough to take it from mottled to flat.
 
     Returns ``[1, nfields, h, w]``. Geometry -- which cells hold grains, where,
     and how big -- is shared across fields and only brightness is drawn per
@@ -329,7 +391,19 @@ def _grain_points(
 
     cell_iy = torch.arange(iy0, iy0 + hl, device=device, dtype=torch.float32)[:, None]
     cell_ix = torch.arange(ix0, ix0 + wl, device=device, dtype=torch.float32)[None, :]
-    camp = _grain_cluster(iy0, ix0, hl, wl, seed + 991, device)
+    # Skipped outright at 0 rather than multiplied by a plane of ones, and that
+    # is the whole reason exposing this costs nothing: the field is 14.8% / 8.0%
+    # / 3.4% of this call at a 0.8 / 1.6 / 4.0px cell for one output field, and
+    # 10.8% / 5.4% / 1.0% for three (the chroma case, where the rest of the call
+    # is heavier). So `global_mottle`'s default is a *saving* against every
+    # render before the slider existed, not a cost. It is worth most at the fine
+    # end because below a 1px cell the lattice is denser than the pixel grid.
+    # `camp` is then a plain 1.0 and broadcasts against `su` below with no
+    # allocation at all.
+    camp = (
+        1.0 if cluster <= 0.001
+        else _grain_cluster(iy0, ix0, hl, wl, seed + 991, device, cluster)
+    )
 
     piy = (torch.floor(Yr).long() - iy0).clamp(0, hl - 1)
     pix = (torch.floor(Xr).long() - ix0).clamp(0, wl - 1)
@@ -410,7 +484,7 @@ def _grain_points(
     # matter either way.
     val = num / den.clamp_min(1e-12)
     return (
-        0.5 + (0.5 * _grain_gain(lo, hi)) * peak.unsqueeze(0) * val
+        0.5 + (0.5 * _grain_gain(lo, hi, cluster)) * peak.unsqueeze(0) * val
     ).unsqueeze(0)
 
 

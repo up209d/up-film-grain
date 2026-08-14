@@ -187,7 +187,8 @@ exports are wrong.
 pass-through, the luminance-response band and that it is keyed on developed
 density rather than on the softened frame, edge bias, the smooth-area guard, 16-bit PNG
 validity, the global-grain point field — its freedom from the pixel grid, its
-structure above the clump, its flat amplitude, its smoothing and its chroma —
+structure above the clump, its flat amplitude, its smoothing, its chroma and its
+mottling —
 anti-aliasing, the pre-blur, edge
 softening, edge jitter and its direction bias, edge sanding, scatter, output
 sharpening, the master opacity cross-fade, the colour-grading section with its
@@ -197,10 +198,10 @@ reconstruction, the bidirectional split tone, the four source-masked global
 layers with their hue masks and
 mid-tone bell, the six Global Grain blend modes, `global_seed` as an offset, and
 the film-texture section including its exact mark counts and the speck's shape
-and softness controls — 367 checks. It exits
+and softness controls — 377 checks. It exits
 non-zero on failure.
 
-Those 367 live in `tests/checks/`, one module per area, since 2026-08-08 — it
+Those 377 live in `tests/checks/`, one module per area, since 2026-08-08 — it
 was a single 3900-line function taking 4m24s, and it is 17 modules taking 43s
 (39s until `luts/` grew to 303 files, every one of which the `grading` module
 parses on purpose).

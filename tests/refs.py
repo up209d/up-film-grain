@@ -24,8 +24,8 @@ import torch
 import torch.nn.functional as F
 
 from server.engine import (
-    _GRAIN_COS, _GRAIN_FILL, _GRAIN_SHARE, _GRAIN_SIN, _GRAIN_SLOTS,
-    _grain_cluster, _grain_gain, _lattice_np, _smoothstep,
+    _GRAIN_CLUSTER_REF, _GRAIN_COS, _GRAIN_FILL, _GRAIN_SHARE, _GRAIN_SIN,
+    _GRAIN_SLOTS, _grain_cluster, _grain_gain, _lattice_np, _smoothstep,
 )
 
 
@@ -54,7 +54,8 @@ def span_ref(n, origin, cell, pad_lo, pad_hi, dev):
     return i0, int(math.floor(float(t[-1]))) + pad_hi - i0 + 1
 
 
-def grain_ref(h, w, y0, x0, lo, hi, seed, device, nfields=1):
+def grain_ref(h, w, y0, x0, lo, hi, seed, device, nfields=1,
+              cluster=_GRAIN_CLUSTER_REF):
     rings = 2
     cell = hi
     ca, sa = _GRAIN_COS, _GRAIN_SIN
@@ -80,7 +81,11 @@ def grain_ref(h, w, y0, x0, lo, hi, seed, device, nfields=1):
                        dtype=torch.float32)[:, None]
     cix = torch.arange(ix0, ix0 + wl, device=device,
                        dtype=torch.float32)[None, :]
-    camp = _grain_cluster(iy0, ix0, hl, wl, seed + 991, device)
+    # Deliberately *not* mirroring the engine's skip-at-zero shortcut: the
+    # reference is here to say what the field is, and computing the field at
+    # depth 0 and multiplying is the honest statement of that. If the two ever
+    # disagree the shortcut is wrong, which is exactly what this should catch.
+    camp = _grain_cluster(iy0, ix0, hl, wl, seed + 991, device, cluster)
     piy = (torch.floor(Yr).long() - iy0).clamp(0, hl - 1)
     pix = (torch.floor(Xr).long() - ix0).clamp(0, wl - 1)
     peak = torch.zeros(h, w, device=device)
@@ -112,7 +117,7 @@ def grain_ref(h, w, y0, x0, lo, hi, seed, device, nfields=1):
                 den = den + wgt
                 peak = torch.maximum(peak, sh)
     val = num / den.clamp_min(1e-12)
-    return (0.5 + (0.5 * _grain_gain(lo, hi))
+    return (0.5 + (0.5 * _grain_gain(lo, hi, cluster))
             * peak.unsqueeze(0) * val).unsqueeze(0)
 
 

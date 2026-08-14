@@ -213,6 +213,32 @@ PARAMS: list[Param] = [
         "resize the clumps.",
     ),
     Param(
+        "global_mottle", "Global Mottling", "Global Grain",
+        0.0, 1.0, 0.01, 0.0, "",
+        "How much the layer's grain strength varies from place to place. At 0 "
+        "the grain is dead even -- the same loudness in every part of a smooth "
+        "area, which is what you want when an unbroken tone is reading as "
+        "blotchy rather than as film. Raise it and grain thins out in some "
+        "regions and crowds into others, in soft patches several clumps "
+        "across, the way real emulsion mottles.\n"
+        "\n"
+        "**0.6 is what this layer did before this slider existed**, so that is "
+        "the number to put back if an older look is what you are after. It is "
+        "not the default, because on smooth subjects -- a sky, a wall, a "
+        "studio backdrop -- it lands the wrong side of the line: the noise "
+        "stops reading as either organic or digital and starts reading as "
+        "patches of nothing. On a busy frame the same setting is what keeps "
+        "the layer from looking like an even screen when you step back from "
+        "it. Which is right depends on the picture, which is why it is a "
+        "slider and not a constant.\n"
+        "\n"
+        "Above about 0.8 it reads as patchiness in the photograph rather than "
+        "as grain, at any subject. Strength is held flat as you raise it -- to "
+        "within 0.3% across the whole range -- so this changes where the grain "
+        "is and never how much of it there is. Governs all five layers in the "
+        "section.",
+    ),
+    Param(
         "global_seed", "Global Seed", "Global Grain",
         0.0, 9999.0, 1.0, 0.0, "",
         "Reshuffles where every grain in this section falls, without touching "

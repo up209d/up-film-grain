@@ -298,7 +298,8 @@ every grain's strength modulated by a multi-scale clumping field. In practice:
   quilt, the layer scores 0.03–0.05 where the old field scored 1.4–1.7.
 * **No repeating mesh when you zoom out.** The clumping field gives the layer
   real variation at scales far above one grain — some regions grainier than
-  others, with no characteristic patch size.
+  others, with no characteristic patch size. How much of that variation you get
+  is **Global Mottling**, below.
 * **Consistent.** The old field lost up to 35% of its strength whenever the
   clump size landed near a whole number of pixels — which is where a slider
   lands — so the same settings could look good or flat for no visible reason.
@@ -317,6 +318,26 @@ anything to repair. It is now a shape control: it blurs the layer by up to half
 a clump, rounding grains off and softening where they meet. It still holds the
 strength constant as you raise it, so it changes the *shape* of the grain and
 not how much there is; Global Intensity remains the only amplitude control.
+
+**Global Mottling** is how much the grain's strength varies from place to
+place — the difference between "the same amount of grain everywhere" and "grain
+that thins out here and crowds in there". At 0 a smooth area takes the layer
+dead even. Raise it and soft patches several grains across get grainier and
+less grainy than each other, which is what stops the layer reading as a flat
+screen when you step back from a busy frame.
+
+It is the control to reach for first when an unbroken tone — a sky, a wall, a
+backdrop — is coming out blotchy rather than filmic. That effect is the whole
+reason this slider exists: the depth used to be fixed at 0.6, and on a smooth
+subject 0.6 lands the wrong side of the line, where the noise stops reading as
+either organic or digital. On a busy frame the same number is what keeps the
+layer alive. Which is right depends on the picture, so it cannot be one number.
+
+**0.6 is what this layer did before the slider existed**, so that is what to
+put back for an older look — exactly, not approximately. Past about 0.8 it
+reads as patchiness in the photograph at any subject. Strength is held flat as
+you raise it, to within a third of a percent, so it moves where the grain is
+and never how much of it there is.
 
 **One thing to expect from the rewrite:** `global_intensity` used to mean two
 different loudnesses depending on whether Max exceeded Min — a 43% gap. It now
