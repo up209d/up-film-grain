@@ -28,6 +28,14 @@ class Param:
     #: shape has no midpoint between "cross" and "diagonal", and a slider that
     #: pretends otherwise invites you to leave it at 2.5.
     choices: tuple[str, ...] = ()
+    #: True for an on/off control, rendered as a checkbox rather than a slider.
+    #: The value is still a number -- 0 or 1 -- so the engine, a preset file and
+    #: `sanitize` are unchanged; only `ParamControl` knows the difference, the
+    #: same bargain `choices` makes. Distinct from `choices=("Off", "On")`
+    #: because a two-entry menu is a worse control for a binary than a checkbox
+    #: is: it costs a click to open and reads as though there might be a third
+    #: option.
+    toggle: bool = False
 
 
 # The Global Grain blend modes, indexed by ``global_blend``. Defined here rather
@@ -54,6 +62,13 @@ GLOBAL_BLENDS: tuple[str, ...] = (
 # `docs/panel-layout.md`, which also has why this list is not, and cannot be,
 # pipeline-ordered as a whole.
 GROUPS: list[str] = [
+    # Step -2, above Colour Grading and therefore above everything. Its own
+    # section rather than a control inside Colour Grading because it is a
+    # different kind of decision: grading says what the photograph should look
+    # like, this says what it *is* before anyone decides that. It is also the
+    # only section whose settings are read from the image rather than dialled
+    # in -- see `server/engine/stages/normalize.py`.
+    "Normalize",
     "Colour Grading",
     "Pre Blur",
     "Pre Sharpen",

@@ -1,5 +1,83 @@
 # Things I got wrong, so you don't repeat them
 
+* **"Strictly increasing" is not "detail survives", and a check that confuses
+  them will pass while the stage destroys the picture** (reported by the user
+  2026-08-16). Normalize's highlight roll was verified by asserting the transfer
+  was monotone over a 4096-step ramp — 0 non-increasing steps, exact, and
+  completely worthless. Monotone permits increasing by a millionth per step,
+  which is a flat white patch at 8-bit. Measured properly on a real photograph,
+  the source band 0.70..1.00 — 77 levels of highlight — was arriving as **3.2
+  levels**, and everything above source 0.5 rendered as white.
+
+  This is the split tone's lesson one layer up and I still walked into it: if a
+  control's failure mode is *being invisible*, the assertion has to be in units
+  a human perceives. The module counts **distinct 8-bit levels surviving in the
+  highlight band** now, on real photographs as well as synthetic ramps, and
+  keeps the monotonicity check beside it explicitly labelled
+  necessary-but-not-sufficient. A mathematically exact check on the wrong
+  quantity gives more false confidence than no check at all.
+
+* **A fixed knee cannot serve a variable gain.** The same bug's other half. The
+  roll compressed everything above 0.82 — fine for a small lift, catastrophic
+  for a large one, because at +2 EV every source value above 0.29 already lands
+  above 0.82 and 70% of the tonal range had to be crammed into 18% of the
+  output. The knee decides how much of the picture gets compressed while the
+  gain decides how much arrives above it; pinning one while the other moves is
+  the whole defect. The fix was not a better knee but no knee: an extended
+  Reinhard tone map in linear light, whose only parameter is the frame's own
+  measured maximum. Same photograph, same lift, **35.3 levels instead of 3.2**.
+
+* **Optimising a provable property at the expense of the picture.** The same
+  roll was sized from the frame's *true maximum* rather than a percentile, and I
+  documented the reason as making the no-clip guarantee "unconditional rather
+  than true-for-most-pixels". It read like rigour. What it actually did was let
+  the 0.84% of pixels that were **already blown** — flat white, carrying no
+  detail whatsoever — dictate the compression for the 99.16% that still had
+  something in them. When a guarantee's cost is paid by the data you were trying
+  to protect, the guarantee is the wrong one; ask what the pixels being sacrificed
+  were worth before defending the bound.
+
+* **A validity mask that is right for one estimator can invert the sign of
+  another** (caught by measurement 2026-08-16, building Normalize). Auto
+  exposure and auto white balance were metered over one shared "trustworthy
+  pixel" mask, excluding anything clipped — which is correct for colour, since a
+  clipped pixel's ratios are set by the ceiling rather than by the light. It is
+  catastrophic for *level*. An over-exposed frame is mostly clipped, so the
+  surviving samples are its **dark** pixels, and the log average over those says
+  the photograph is dark. Measured on a frame 1.4 stops over, the metering asked
+  for **+1.38 stops brighter**: the right magnitude with the sign inverted, on
+  precisely the input the control exists to fix.
+
+  Two things generalise. A mask encodes *a question* — "is this a good sample of
+  the local colour" is not "is this a good sample of the local brightness" — so
+  two estimators sharing one mask need the questions to actually match. And an
+  auto control's failure mode is not being slightly off, it is being confidently
+  wrong; every check on one has to assert the *direction* against a known-wrong
+  input, because "the frame changed" passes just as happily on a correction
+  applied backwards.
+
+* **Sizing a correction from the picture instead of from the correction.** The
+  toe that keeps shadow separation when Normalize darkens a frame was first
+  sized from the frame's own black level. That is a different question, and it
+  showed: a well-exposed photograph with genuine deep shadows measured a toe of
+  0.216 and had its blacks lifted to fix a problem it did not have — the deep
+  shadows were the photographer's. Darkening by `ev` stops compresses everything
+  below the knee by exactly `2**ev`, so what the correction *cost* is a property
+  of the correction alone, and brightening cannot crush a shadow at all. Ask what
+  your stage did, not what the input looked like.
+
+* **A positional slice of a list other people insert into is a tripwire**
+  (2026-08-16). `checkpoint.py` decided which sections sit below each boundary
+  with `GROUPS[3:]` and `GROUPS[6:]`. Adding `Normalize` at index 0 shifted both
+  by one, so `GROUPS[3:]` silently stopped meaning "Grain Structure down" and
+  started meaning "Pre Sharpen down" — putting Pre Sharpen below a checkpoint
+  saved *after* it ran. That is character for character the stale hit the
+  comment on that very boundary already records from 2026-08-09, reintroduced by
+  an edit in a different file that never mentions checkpoints. The fix is not to
+  be careful next time: both are `_from("<section>")` now, which takes the suffix
+  by name, so the position cannot matter. A comment warning about an off-by-one
+  is evidence the construction allows one.
+
 * **"Runs below the checkpoint" does not mean "can be left out of its key"**
   (caught by `verify.py` on 2026-08-09). Moving Global Grain and Sharpening
   below Film Texture made the panel and the pipeline agree so exactly that

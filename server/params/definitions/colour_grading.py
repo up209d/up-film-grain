@@ -118,7 +118,14 @@ PARAMS: list[Param] = [
     ),
     Param(
         "grade_exposure", "Exposure", "Colour Grading",
-        -2.0, 2.0, 0.01, 0.0, "EV",
+        # Widened to +/-5 stops on request (2026-08-16), from +/-2. Nothing in
+        # the stage needed changing -- it is a multiply in linear light, so the
+        # range is a question about how far the control should reach rather
+        # than about what it can express. +5 is 32x the light, which will clip
+        # most frames outright; the sRGB encoding still rolls the top rather
+        # than stretching it flat, and Highlights below is still the clip-free
+        # way to bring a bright frame back.
+        -5.0, 5.0, 0.01, 0.0, "EV",
         "A stops-based exposure multiply in linear light, ahead of Shadows "
         "and Highlights so their masks measure the frame at the light level "
         "actually being graded rather than the one that arrived -- raise this "

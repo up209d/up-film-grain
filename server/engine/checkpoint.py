@@ -17,7 +17,15 @@ derived early and consumed late. An AST liveness pass over the 73 top-level
 statements found seven boundaries where the image is the *only* thing live, in
 two clusters -- three near the top and four near the bottom -- and within each
 cluster only the deepest is worth keeping, since the shallower ones protect
-strictly less for the same bytes. That leaves the two here.
+strictly less for the same bytes. That left the two deep ones here.
+
+`Colour Grading` joined them on 2026-08-16 and is the exception that proves the
+rule rather than a counter-example: `Normalize` arrived as a new section above
+everything, so the boundary under it has *nothing* above it at all -- one live
+plane by construction, and a signature of a single key. It protects the least
+work of the three (one per-pixel curve; the metering it applies is measured once
+per upload) and hits the most often, which is the opposite trade from the deep
+one and is why both are worth keeping.
 
 **A stale hit is the worst failure this codebase has.** The texture cache's
 version renders a plausible but wrong *texture*; this one renders a plausible but
@@ -57,7 +65,32 @@ from ..params.param import GROUPS
 #: section against a warm cache. Anything added here has to be a section whose
 #: keys nothing above the boundary reads, which is a stronger condition than
 #: "runs below the boundary" and cannot be read off the panel.
+def _from(section: str) -> frozenset[str]:
+    """Every section from ``section`` down, by name.
+
+    Name-based rather than a `GROUPS[n:]` literal, and that is the fix for a
+    trap rather than a tidy-up: the slices used to be written as indices, so
+    inserting a section anywhere above one shifted it silently. `Normalize`
+    joining the top in 2026-08-16 would have turned `GROUPS[3:]` from "Grain
+    Structure down" into "Pre Sharpen down", putting Pre Sharpen below a
+    checkpoint saved *after* it had run -- exactly the stale hit the comment on
+    that boundary already records, reintroduced by an edit nowhere near it.
+    """
+    return frozenset(GROUPS[GROUPS.index(section):])
+
+
 _BELOW: dict[str, frozenset[str]] = {
+    # Saved after Normalize, so what is below it is everything from Colour
+    # Grading down and the only thing above it is Normalize itself.
+    #
+    # The shallowest boundary, and the cheapest thing it could protect -- one
+    # per-pixel curve, since the metering it applies is measured once per upload
+    # and cached on the `Upload` rather than per render. It exists because
+    # Normalize is the one stage whose *input* is the untouched source: holding
+    # its output means every edit anywhere below replays from a normalised frame
+    # without the stage running again, and the section above it is empty, so its
+    # signature is one key and it hits on literally every other edit.
+    "Colour Grading": _from("Colour Grading"),
     # Saved after Pre Sharpen, so what is below it is everything from Grain
     # Structure down. Protects little on the GPU (~17%) and ~24% on the CPU,
     # where highlight reconstruction alone is 2.55s of a 10.4s `SuperPortra`
@@ -69,7 +102,7 @@ _BELOW: dict[str, frozenset[str]] = {
     # itself below a checkpoint saved *after* pre-blur had run -- so dragging
     # Pre Blur returned the previous frame. `verify.py` caught it at 9.77e-01,
     # which is most of full scale.
-    "Grain Structure": frozenset(GROUPS[3:]),
+    "Grain Structure": _from("Grain Structure"),
     # The valuable one: 89% of the GPU render and 68% of the CPU one sits above
     # it, and 35 sliders sit below.
     #
@@ -82,11 +115,11 @@ _BELOW: dict[str, frozenset[str]] = {
     # above for nothing. `Tone Response` is the one section between the boundary
     # and the bottom of the pipeline that is deliberately **not** here, for the
     # double-evaluation reason above: it is applied below, and read above.
-    "Halation": frozenset(GROUPS[6:]) - {"Tone Response"},
+    "Halation": _from("Halation") - {"Tone Response"},
 }
 
 #: Boundaries in the order they execute, shallowest first.
-CHECKPOINTS: tuple[str, ...] = ("Grain Structure", "Halation")
+CHECKPOINTS: tuple[str, ...] = ("Colour Grading", "Grain Structure", "Halation")
 
 
 def _downstream(boundary: str) -> frozenset[str]:

@@ -23,6 +23,15 @@ Working and verified end to end as of 2026-07-31.
 **In scope — the point of the app:** detail destruction, edge softening and
 edge noising, grain, halation, chromatic edge fringing.
 
+**In scope as of 2026-08-16:** a `Normalize` section **above** Colour Grading —
+one checkbox, shipping off, that corrects an input photograph's lightness and
+white balance and compresses its dynamic range so neither end clips. Requested
+outright, and requested as *its own* logic: "totally new logic on top of
+everything... Dont make it mess up with any color grading logic." So it is a
+separate group, module, mixin, constants file and check module, and it touches
+nothing in `stages/colour_grade.py`. It is the only stage whose settings are
+measured from the image rather than dialled in. See `docs/normalize.md`.
+
 **In scope as of 2026-08-04:** a `Colour Grading` section at the very top of the
 pipeline — 3D LUTs plus temperature, tint, exposure, shadows, highlights,
 contrast, black point, a two-way clarity, vibrance and saturation. Requested
@@ -66,6 +75,8 @@ and the two import rules that keep it acyclic.
 ```
 server/params/        parameter schema -- SINGLE SOURCE OF TRUTH for engine + UI
   param.py              the Param record, GROUPS, GLOBAL_BLENDS
+                          (`choices` renders a menu, `toggle` a checkbox; the
+                           value is a number either way)
   definitions/          the controls, one module per panel section
   registry.py           PARAM_BY_KEY, DEFAULTS, NEUTRAL_ZERO, rescale
   sanitize.py           the only door params enter the engine through
@@ -78,7 +89,10 @@ server/engine/        the pipeline (package docstring states the invariants)
   marks.py              dust/hair/leak site lists
   stages/               one mixin per panel section; render.py is the order
   tiling.py             supersampling, pad_for, tile_for, render entries
-  checkpoint.py         section-boundary frame cache (the two usable boundaries)
+  checkpoint.py         section-boundary frame cache (three boundaries; `_BELOW`
+                          takes its suffixes **by name**, never by index -- a
+                          positional slice breaks silently the moment a section
+                          is inserted above one, and did)
   grain_engine.py       GrainEngine -- composes the stage mixins
 server/models/        Upload, export jobs (domain, no HTTP)
 server/services/      render_tier -- the one path both preview tiers take
@@ -130,9 +144,29 @@ or it ships.
 
 Adding a parameter means adding one `Param` to the right module under
 `server/params/definitions/` and reading `p["key"]` in the engine. The UI picks it up automatically — never hand-add a
-slider in a view. Give it `choices=(...)` and it renders as a menu instead;
-the value is still a number everywhere else, so nothing but the one branch in
+slider in a view. Give it `choices=(...)` and it renders as a menu instead, or
+`toggle=True` and it renders as a checkbox; the value is still a number
+everywhere else, so nothing but the branches in
 `views/controls/ParamControl.tsx` knows the difference.
+
+One asymmetry to know when adding a field to `Param`: the server ships it to the
+client for free (`schema.py` uses `asdict`), but the client's own `Param` in
+`web/src/services/api.ts` is a **hand-written mirror**, so a field left out
+there is simply invisible — `spatial` has been shipping unread for exactly that
+reason.
+
+## Pipeline order (a section added at the top 2026-08-16)
+
+`Normalize` is step **-2**, above Colour Grading and so above everything. It is
+the first section in `GROUPS` and the first in the panel, and it brought a third
+checkpoint with it (`"Colour Grading"`, named for the section it sits above).
+
+Adding it exposed a live tripwire worth knowing before you insert any section
+anywhere: `checkpoint.py` sliced `GROUPS[3:]` and `GROUPS[6:]` **positionally**,
+so a new group at index 0 shifted both and quietly put `Pre Sharpen` below a
+checkpoint saved after it ran. That is the same stale hit the comment on that
+boundary already recorded from 2026-08-09, reintroduced from a different file.
+Both suffixes are taken by name now. See `docs/normalize.md`.
 
 ## Pipeline order (changed 2026-08-09)
 
@@ -198,11 +232,15 @@ reconstruction, the bidirectional split tone, the four source-masked global
 layers with their hue masks and
 mid-tone bell, the six Global Grain blend modes, `global_seed` as an offset, and
 the film-texture section including its exact mark counts and the speck's shape
-and softness controls — 377 checks. It exits
+and softness controls, and Normalize — that its metering corrects in the right
+*direction* on a known-wrong frame, that its white balance is luma-neutral to
+0.00e+00 and backs off to exactly identity on a scene that is legitimately one
+colour, and that its highlight roll keeps 250 of 256 8-bit levels in a real
+photograph's bright region where the version it replaced kept 153, and that Highlight Priority hands that band back at 21 levels against 79 — 416 checks. It exits
 non-zero on failure.
 
-Those 377 live in `tests/checks/`, one module per area, since 2026-08-08 — it
-was a single 3900-line function taking 4m24s, and it is 17 modules taking 43s
+Those 416 live in `tests/checks/`, one module per area, since 2026-08-08 — it
+was a single 3900-line function taking 4m24s, and it is 18 modules taking ~72s
 (39s until `luts/` grew to 303 files, every one of which the `grading` module
 parses on purpose).
 **Name the modules covering what you touched and only those run:**
@@ -272,6 +310,7 @@ optional reading before touching the area it covers.
 
 | file | what is in it |
 |---|---|
+| [docs/normalize.md](docs/normalize.md) | Step −2: the one stage whose settings are *measured* rather than dialled, why the metering is per-upload and not per-tile, and why the shoulder is uncapped where the toe is not |
 | [docs/using-the-controls.md](docs/using-the-controls.md) | What each control does, for a user rather than a maintainer — moved out of `README.md` 2026-08-08 |
 | [docs/architecture.md](docs/architecture.md) | Where everything lives after the 2026-08-08 package split, the two import rules that keep it acyclic, and why `Stage.tsx` was left whole |
 | [docs/pipeline-order.md](docs/pipeline-order.md) | Which stages are placed by *position* and what breaks if they move; `pre_blur` vs `micro_blur`; why `master_opacity` lives outside `render()` |

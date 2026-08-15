@@ -10,6 +10,7 @@ import numpy as np
 import os
 import torch
 from server import params as P
+from tests.checks.normalize import _PROBE as _NORM_PROBE
 from tests.refs import blur_ref
 from tests.refs import grain_ref
 from tests.refs import lattice_ref
@@ -281,6 +282,7 @@ def run(cx: Ctx) -> None:
     # come back exactly as a cold engine renders it. A key that failed to cover
     # an upstream section shows up here as a frame that did not move.
     probes = [
+        ("normalize", 1.0),
         ("grade_exposure", 0.35), ("pre_blur", 1.2), ("pre_sharpen", 0.6),
         ("intensity", 55.0), ("grain_size", 2.5), ("lum_low", 0.3),
         ("edge_jitter", 1.4), ("scatter", 0.5), ("micro_blur", 1.1),
@@ -293,6 +295,13 @@ def run(cx: Ctx) -> None:
     for k, v in probes:
         q = P.sanitize({**{kk: vv for kk, vv in cbase.items()
                            if kk in P.PARAM_BY_KEY}, k: v})
+        # Normalize's six measured floats are not `Param`s -- `sanitize` has
+        # never seen them, so they have to be attached the way `params_for`
+        # does it. Without them the stage runs with the identity correction and
+        # the probe would pass by changing nothing, which is the one way a
+        # checkpoint probe can lie.
+        if q["normalize"] >= 0.5:
+            q.update(_NORM_PROBE)
         got = ck_eng.render_image(cimg, q, 1.0, tile=4096, supersample=1,
                                   checkpoint_id="t:proxy")
         want = cold_eng.render_image(cimg, q, 1.0, tile=4096, supersample=1)

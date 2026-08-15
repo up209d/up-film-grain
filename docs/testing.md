@@ -48,6 +48,7 @@ whole log in order with the failure in place.
 | `tiling` | tile independence, crop fidelity, zoom fidelity |
 | `colour` | colour pass-through, the Original button, vibrance, split tone |
 | `presets` | `reference_mp` rescaling, the mark-count dead zone |
+| `normalize` | auto exposure, auto white balance, the toe and shoulder, the metering's direction |
 | `grading` | the Colour Grading section, highlight reconstruction, `.cube` parsing |
 | `response` | the luminance-response band, edge bias, the smooth-area guard |
 | `global_grain` | global grain unmasked and tile-independent, and its chroma |

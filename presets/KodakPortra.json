@@ -5,6 +5,8 @@
   "reference_mp": 24,
   "lut": "gmic/negative_new/kodak_portra_800",
   "values": {
+    "normalize": 1,
+    "highlight_priority": 1,
     "grade_recover": 0.85,
     "grade_recover_radius": 20,
     "grade_temp": -0.3,

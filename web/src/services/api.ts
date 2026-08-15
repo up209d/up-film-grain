@@ -12,6 +12,13 @@ export interface Param {
    *  control is a menu rather than a slider -- the value is still a number,
    *  so nothing else here has to care. */
   choices: string[];
+  /** True for an on/off control, rendered as a checkbox. The value is still a
+   *  number -- 0 or 1 -- so nothing else here has to care either. Declared
+   *  explicitly because the client's `Param` is a hand-written mirror of the
+   *  server dataclass rather than a generated one, and a field left out here is
+   *  simply invisible: `spatial` has been shipping unread for exactly that
+   *  reason. */
+  toggle: boolean;
 }
 
 export interface Preset {

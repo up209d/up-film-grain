@@ -50,6 +50,32 @@ class RenderMixin:
         if hit_a is not None:
             img = hit_a
         else:
+            # -2. Normalize, above Colour Grading and so above everything.
+            #
+            #     Grading says what the photograph should look like; this says
+            #     what it *is* before anyone gets to decide that. An
+            #     under-exposed or colour-cast frame handed to the section below
+            #     is graded on top of an error, and every film stage under that
+            #     is calibrated around a normally exposed picture -- the
+            #     characteristic curve and Contrast both pivot on `_MID_GREY`,
+            #     and the grain envelope peaks in the mid-tones.
+            #
+            #     Its own checkpoint, and the shallowest one. Nothing sits above
+            #     it, so its signature is a single key and it hits on every edit
+            #     anywhere else in the app -- see checkpoint.py. The stage itself
+            #     is per-pixel arithmetic on six numbers `models/upload.py`
+            #     measured once from the whole frame, so it reserves nothing in
+            #     `pad_for` and the metering never re-runs.
+            ck_n = self._ckpt_key("Colour Grading", p, scale, y0, x0, h, w)
+            hit_n = None if ck_n is None else self.ckpt.get(ck_n)
+            if hit_n is not None:
+                img = hit_n
+            else:
+                img = self._normalize(img, p)
+                if ck_n is not None:
+                    self.ckpt.put(ck_n, img)
+
+            self._poll_cancel()
             img = self._grade(img, p, scale)
 
             self._poll_cancel()

@@ -13,6 +13,7 @@ from .edge import EdgeMixin
 from .film_texture import FilmTextureMixin
 from .global_grain import GlobalGrainMixin
 from .halation import HalationMixin
+from .normalize import NormalizeMixin
 from .render import RenderMixin
 from .sharpen import SharpenMixin
 from .tone import ToneMixin
@@ -23,6 +24,7 @@ __all__ = [
     "FilmTextureMixin",
     "GlobalGrainMixin",
     "HalationMixin",
+    "NormalizeMixin",
     "RenderMixin",
     "SharpenMixin",
     "ToneMixin",

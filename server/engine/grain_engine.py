@@ -8,12 +8,13 @@ from .checkpoint import CheckpointCache
 from .device import _checkpoint_bytes, pick_device
 from .stages import (
     ColourGradeMixin, EdgeMixin, FilmTextureMixin, GlobalGrainMixin,
-    HalationMixin, RenderMixin, SharpenMixin, ToneMixin,
+    HalationMixin, NormalizeMixin, RenderMixin, SharpenMixin, ToneMixin,
 )
 from .tiling import TilingMixin
 
 
 class GrainEngine(
+    NormalizeMixin,
     ColourGradeMixin,
     HalationMixin,
     ToneMixin,
@@ -66,7 +67,8 @@ class GrainEngine(
         self.gg_evicted = 0
         # Pipeline checkpoints: the finished frame at a section boundary, so an
         # edit below that boundary restores it instead of re-running everything
-        # above. See `checkpoint.py` for why only two boundaries are usable.
+        # above. See `checkpoint.py` for which boundaries are usable and why the
+        # answer is a property of the pipeline rather than a choice.
         #
         # `None` until a caller opts in by setting `_ckpt_id` -- the id of the
         # image and tier being rendered. Without one there is nothing to key on

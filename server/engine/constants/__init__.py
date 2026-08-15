@@ -12,6 +12,7 @@ from .edge import *  # noqa: F401,F403
 from .grade import *  # noqa: F401,F403
 from .halation import *  # noqa: F401,F403
 from .marks import *  # noqa: F401,F403
+from .normalize import *  # noqa: F401,F403
 from .tone import *  # noqa: F401,F403
 
 __all__ = [
@@ -65,6 +66,19 @@ __all__ = [
     '_MARK_MIN_PX',
     '_MIN_CELL',
     '_NOISE_ICDF',
+    '_NORM_EV_MAX',
+    '_NORM_HP_HI',
+    '_NORM_HP_LO',
+    '_NORM_MAX_SAMPLES',
+    '_NORM_TARGET_LIN',
+    '_NORM_TOE_KNEE',
+    '_NORM_TONE_MAX',
+    '_NORM_VALID_HI',
+    '_NORM_VALID_LO',
+    '_NORM_WB_DIV_HI',
+    '_NORM_WB_DIV_LO',
+    '_NORM_WB_MAX',
+    '_NORM_WB_P',
     '_R2_A1',
     '_R2_A2',
     '_RECON_CEIL',

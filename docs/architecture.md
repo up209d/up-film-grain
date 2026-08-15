@@ -26,6 +26,13 @@ where reordering ninety inline lines is not. The stages still carrying their bod
 inline are the ones whose intermediates are shared across sections -- the edge
 and grain span, where `lum_ref`, `hp`, `edge` and `m` are all live at once.
 
+**1c. A stage that needs a whole-image statistic measures it outside the
+engine.** `stages/normalize.py` is the only one, and it is written in two halves
+for that reason: `meter()` runs once per upload on the full frame and returns
+six plain floats, `_normalize()` applies them per tile. Invariant 1 forbids the
+obvious version — see `docs/normalize.md`. If a second stage ever needs this,
+copy the shape rather than reaching for the tile.
+
 **2. Nothing above `params` may define a parameter.** `server/params/` is still
 the single source of truth. Adding a control is one `Param` in the right
 `definitions/` module and one `p["key"]` read in a stage. The UI picks it up

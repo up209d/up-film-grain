@@ -24,6 +24,9 @@ DEFAULTS: dict[str, float] = {p.key: p.default for p in PARAMS}
 # a worse failure than any of them being over-zealous. `verify.py` renders with
 # these and asserts the output is the input.
 NEUTRAL_ZERO: tuple[str, ...] = (
+    # Step -2, above everything. It changes pixels when on, so "Original" has
+    # to switch it off or the untouched photograph would come back corrected.
+    "normalize", "highlight_priority",
     # Colour grading. `lut_amount` belongs here and the LUT *name* deliberately
     # does not: this list is what "Original" applies, and it has to be a set of
     # numbers the engine can be handed. Zeroing the mix switches the LUT off as

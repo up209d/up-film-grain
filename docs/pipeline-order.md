@@ -7,7 +7,16 @@ breaks their whole purpose. Read alongside `docs/film-texture/placement.md`,
 which covers the one stage whose position was deliberately given up: Film
 Texture moved above Global Grain and Sharpening on 2026-08-09, on request.
 
-* `Colour Grading` (step -1) is above everything, `pre_blur` included. Every
+* `Normalize` (step -2) is above Colour Grading and so above everything else.
+  Grading decides what the photograph should look like; this decides what it
+  *is* first, which is why it cannot sit inside that block. It has its own
+  checkpoint — the shallowest, with nothing above it — and its settings are the
+  only ones in the app *measured from the image* rather than dialled in. One
+  consequence is named rather than hidden: it runs above highlight
+  reconstruction, which finds blown areas by looking for channels pinned at the
+  ceiling, so normalising an over-exposed frame first moves them off it and
+  reconstruction stops firing. See `docs/normalize.md`.
+* `Colour Grading` (step -1) is above everything below it, `pre_blur` included. Every
   stage below it models an emulsion; this is the decision about what the
   photograph *is* before any of that runs. Put it after the film stages and it
   grades grain, halation and dust along with the picture, and a LUT built to be

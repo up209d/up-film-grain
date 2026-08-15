@@ -120,7 +120,7 @@ FILM_GRAIN_PYTHON=../.venv/bin/python ./build/run.sh
   against 9.82MB for 16-bit PNG, encoded 4:4:4 so chroma grain survives. Choose
   **PNG 16-bit** when the file is going on for further grading.
 * **Presets are the `presets/` folder**, one `.json` each, read fresh on every
-  page load — drop a file in and it appears. Each lists all 112 parameters in
+  page load — drop a file in and it appears. Each lists 112 of the 115 in
   panel order, though a hand-written `{"intensity": 40}` loads just as well:
   unknown keys are dropped, values clamped, anything absent filled from its
   default. **LUTs are the `luts/` folder**, same idea, plus **Load .cube…** for
@@ -136,15 +136,16 @@ Control-by-control guidance is in
 ## Verify
 
 ```bash
-pipenv run python tests/verify.py                 # everything, in parallel (~43s)
+pipenv run python tests/verify.py                 # everything, in parallel (~72s)
 pipenv run python tests/verify.py edges scatter   # only those modules
 pipenv run python tests/verify.py -l              # list the modules
 ```
 
-367 checks across 17 modules — tile independence, crop fidelity, colour
+416 checks across 18 modules — tile independence, crop fidelity, colour
 pass-through, luminance response, edge bias, scatter, the colour-grading section
 and its `.cube` parsing (including that every LUT in the tree actually loads and
-that no path can escape the folder), 16-bit PNG validity. Run it after touching anything
+that no path can escape the folder), Normalize's metering and its no-clip
+guarantee, 16-bit PNG validity. Run it after touching anything
 under `server/engine/`; it exits non-zero on failure. See
 [docs/testing.md](docs/testing.md).
 

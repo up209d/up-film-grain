@@ -4,6 +4,8 @@
   "name": "ExtraGrain",
   "reference_mp": 24,
   "values": {
+    "normalize": 1,
+    "highlight_priority": 1,
     "grade_recover": 0.0,
     "grade_recover_radius": 32.0,
     "grade_temp": 0.0,

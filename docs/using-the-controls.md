@@ -9,12 +9,73 @@ to place it — lives in the other files indexed from
 Every slider is generated from the server's schema, so the panel always matches
 what the renderer accepts.
 
+## Normalize
+
+One checkbox, at the very top of the panel and the very top of the pipeline.
+Off by default.
+
+It measures the photograph you loaded and corrects three things before anything
+else runs: the **exposure**, so the mid-tones land where the rest of the
+pipeline expects them; the **colour of the light**, so a tungsten or open-shade
+cast comes back toward neutral without changing the brightness; and the
+**dynamic range**, so a frame carrying more range than fits is compressed
+inward at both ends rather than clipped.
+
+Reach for it when a photo is visibly under- or over-exposed, or shot under the
+wrong lamp. Everything below is calibrated around a normally exposed frame, so
+a frame two stops under does not merely look dark — the grain lands in the
+wrong tones and the preset you picked stops reading the way it should.
+
+Three things worth knowing:
+
+* **It does not cost you the ends.** Brightening a dark frame would normally
+  burn the highlights off the top; here they roll off along a curve that is
+  strictly increasing everywhere, so two tones that differed before still
+  differ after. Nothing reaches pure white or pure black. The compression is
+  deliberately gentle — enough to keep the ends, well short of the flat look a
+  log video profile has, because every preset here expects a normally
+  contrasted picture.
+* **It leaves a good photo alone.** The correction is sized to what the frame
+  actually needs, so a well-exposed, neutral one comes back essentially
+  untouched. There is no penalty for leaving it ticked.
+* **It cannot invent what was never recorded.** A highlight already blown out
+  in the file arrives as a flat patch and stays one — that is what Highlight
+  Reconstruction is for. Note the two do not combine: reconstruction finds
+  blown areas by looking for channels pinned at the ceiling, and Normalize runs
+  first and moves them off it. Use one or the other.
+
+### Highlight Priority
+
+The second control in the section, 0 to 1, default 0. It only does anything with
+Normalize ticked.
+
+There is a real trade underneath it. Lifting a dark frame's mid-tones leaves the
+bright end nowhere to go — it is already near white in the file — so the
+correction has to compress it, and compressed highlights lose the fine
+separation that reads as texture in a sky, a cloud or a lit face. No curve
+avoids that; something between the lifted mid-tones and the fixed ceiling has to
+give. This slider is where you say which half you want.
+
+At 0 the whole frame is corrected together and the highlights take whatever that
+costs. Raise it and the bright areas are blended back toward what the original
+file recorded, in proportion to how bright they are — so at 1 the highlights
+come back at their original tonal spacing, with every level the source had,
+while the mid-tones and shadows keep most of the correction. Measured on a dark
+photograph lifted two stops: the 0.70–1.00 band carries 21 of its 77 levels at 0
+and all of them at 1, and the mid-tones still keep 87% of the lift.
+
+What it costs is brightness up there, not detail — highlights land nearer their
+original level than the corrected one, so a scene with a lot of bright area
+reads as less lifted as you raise it. It cannot bring back a highlight that was
+already blown out in the file; there is nothing recorded to recover, so those
+stay white.
+
 ## Colour Grading, and 3D LUTs
 
-The first section in the panel, and the first thing in the pipeline — above
-Pre Blur and above every film stage. Everything below it models an emulsion;
-this is the decision about what the photograph *is* before any of that runs.
-It all ships at 0, so nothing here changes an existing look until you ask.
+The second section in the panel, above Pre Blur and above every film stage.
+Everything below it models an emulsion; this is the decision about what the
+photograph *is* before any of that runs. It all ships at 0, so nothing here
+changes an existing look until you ask.
 
 The section reads in the order it runs:
 

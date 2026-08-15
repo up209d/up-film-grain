@@ -7,6 +7,7 @@ import {
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { type ExportJob, type ImageMeta } from "../../services/api";
 import type { Compare } from "../../models/types";
+import PreviewFrame from "./PreviewFrame";
 import {
   FIT_PADDING,
   FIT_SNAP,
@@ -102,6 +103,13 @@ function Stage(props: {
   // you did not collapse yourself reads as missing rather than as tidy.
   const [topBarOpen, setTopBarOpen] = useState(true);
   const [bottomBarOpen, setBottomBarOpen] = useState(true);
+  // Prefilter the picture on the way down to the screen instead of letting the
+  // browser reduce it in one step -- see `PreviewFrame`. A view control like the
+  // mount: it cannot change a render or an export, only what the display is
+  // shown. On by default because the failure it addresses is one you have to
+  // *not* be looking for to miss, and the toggle is there to get the browser's
+  // own behaviour back for comparison.
+  const [filtered, setFiltered] = useState(true);
 
   // A new image inherits neither the old pan nor the old magnification -- a
   // corner crop of the last photo is never where you want to land. The bars
@@ -352,6 +360,15 @@ function Stage(props: {
   const proxyLimit = (meta?.proxy_width ?? 0) / iw;
   const softened = !previewFull && eff > proxyLimit * 1.05;
 
+  // Whether the picture is actually being *reduced* on the way to the display,
+  // in device pixels -- the only regime where prefiltering can change anything.
+  // Enlarged, there is nothing to fold. The bar follows its own rule that a
+  // control which cannot do anything is not shown, the way the wipe appears only
+  // in overlay mode, so the toggle is gated on this rather than always present.
+  const dpr = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
+  const natural = previewFull ? 1 : (meta?.proxy_width ?? iw) / iw;
+  const downscaling = eff * dpr < natural * 0.999;
+
   // One bar for compare mode, the wipe, the zoom and the mount -- grouped left
   // to right in the order you reach for them, with the wipe next to the mode
   // that owns it.
@@ -487,6 +504,21 @@ function Stage(props: {
           >
             +
           </button>
+          {/* Sits with the zoom group because it is only ever about zooming
+          out, and shown only while something is actually being reduced. */}
+          {downscaling && (
+            <button
+              className={filtered ? "seg on" : "seg"}
+              onClick={() => setFiltered(!filtered)}
+              title={
+                "Prefilter the picture on the way down to the screen, instead " +
+                "of letting the browser reduce it in one step. Affects the " +
+                "display only — never the render or the exported file."
+              }
+            >
+              Filtered
+            </button>
+          )}
           <span className="vsep" />
           {/* Third group: the mount. A view control like everything else on this
           bar -- it changes nothing that gets rendered or exported. The width
@@ -561,12 +593,13 @@ function Stage(props: {
             <span className="tag">Before</span>
             {mount()}
             {sourceUrl && (
-              <img
-                className="frame"
+              <PreviewFrame
                 style={place()}
                 src={sourceUrl}
                 alt="before"
-                draggable={false}
+                dw={dw}
+                dh={dh}
+                filtered={filtered}
               />
             )}
           </div>
@@ -574,12 +607,13 @@ function Stage(props: {
             <span className="tag">After</span>
             {mount()}
             {previewUrl && (
-              <img
-                className="frame"
+              <PreviewFrame
                 style={place()}
                 src={previewUrl}
                 alt="after"
-                draggable={false}
+                dw={dw}
+                dh={dh}
+                filtered={filtered}
               />
             )}
           </div>
@@ -606,24 +640,26 @@ function Stage(props: {
         <div className="pane">
           {mount()}
           {sourceUrl && (
-            <img
-              className="frame"
+            <PreviewFrame
               style={place()}
               src={sourceUrl}
               alt="before"
-              draggable={false}
+              dw={dw}
+              dh={dh}
+              filtered={filtered}
             />
           )}
           {previewUrl && (
-            <img
-              className="frame"
+            <PreviewFrame
               style={{
                 ...place(),
                 clipPath: `inset(0 0 0 ${(1 - split) * 100}%)`,
               }}
               src={previewUrl}
               alt="after"
-              draggable={false}
+              dw={dw}
+              dh={dh}
+              filtered={filtered}
             />
           )}
           {split > 0.001 && split < 0.999 && (

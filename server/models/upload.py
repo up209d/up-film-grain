@@ -12,6 +12,7 @@ from fastapi import HTTPException
 from .. import imageio as iio
 from .. import lut as lutlib
 from .. import params as P
+from ..engine.stages import normalize
 from ..runtime import DEVICE
 
 # Long edge of the working proxy used for live preview renders. Measured on a
@@ -46,7 +47,7 @@ def _clamp_ss(v) -> float:
 
 class Upload:
     __slots__ = ("id", "name", "arr", "h", "w", "proxy", "proxy_scale",
-                 "src_enc", "touched")
+                 "src_enc", "norm", "touched")
 
     def __init__(self, uid: str, name: str, arr: np.ndarray) -> None:
         self.id = uid
@@ -60,7 +61,27 @@ class Upload:
         # "encoded" rather than a format: it follows `iio.encode_preview`, which
         # is JPEG now, and a full-resolution PNG of a 24MP source was ~76MB.
         self.src_enc: bytes | None = None
+        # What Normalize measured from this photograph, or None until something
+        # asks. Six floats; see `engine/stages/normalize.py`.
+        #
+        # Cached here rather than computed per render for two separate reasons,
+        # and only the first is about speed. It is a pass over the whole frame,
+        # so doing it per preview would put it in the drag loop -- but more
+        # importantly the numbers have to be *the same* for every render of this
+        # image, or the proxy preview and the 1:1 export would normalise
+        # differently and "export what I am looking at" would stop being true.
+        # One measurement per photograph makes that structural.
+        #
+        # Lazy rather than computed in `__init__` like `proxy`, because the
+        # control ships off: a session that never switches it on never pays.
+        self.norm: dict[str, float] | None = None
         self.touched = time.time()
+
+    def norm_stats(self) -> dict[str, float]:
+        """The metered correction for this photograph, measured once."""
+        if self.norm is None:
+            self.norm = normalize.meter(self.arr)
+        return self.norm
 
 
 UPLOADS: dict[str, Upload] = {}
@@ -113,4 +134,22 @@ def params_for(up: Upload, body: dict) -> dict[str, float]:
     p["lut"] = lut
     if lut is None:
         p["lut_amount"] = 0.0
+
+    # Normalize's six measured floats ride alongside the values for the same
+    # reason the LUT does: they are not quantities anyone dials, they are what
+    # the stage measured from *this photograph*. Attached after sanitize and
+    # rescale, both of which only touch keys in PARAMS and so leave these alone.
+    #
+    # **Plain floats, deliberately.** `checkpoint.upstream_signature` walks
+    # `sorted(p)` and keeps anything that is an int or a float, so these land in
+    # the checkpoint key automatically and two photographs can never share a
+    # cached frame. A tuple or an array would be silently dropped by that filter
+    # -- the LUT needs its own line in that function for exactly this reason --
+    # and the symptom would be one photograph rendering with another's
+    # correction, which is a plausible and wrong picture.
+    #
+    # Measured only when the control is on. The metering is a pass over the full
+    # frame and the stage ships off, so an untouched session never pays for it.
+    if p["normalize"] >= 0.5:
+        p.update(up.norm_stats())
     return p

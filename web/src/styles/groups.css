@@ -21,6 +21,23 @@
 .lutpick .slabel > .seg { padding: 2px 8px; font-size: 11px; }
 .lutpick .hint { margin-top: 5px; }
 .lutpick { margin-bottom: 11px; }
+/* An on/off parameter renders as a checkbox rather than a track. Sized and
+   coloured from the panel's own scale rather than reusing `.checkfield` from
+   the app bar, which is a 12.5px `--dim` control built for a different row. */
+.toggle {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12px; cursor: pointer; user-select: none;
+}
+.toggle input {
+  margin: 0; flex: none;
+  width: 13px; height: 13px;
+  accent-color: var(--accent); cursor: pointer;
+}
+/* `Help` gives the label `flex: 1` via `.title` so a numeric field can sit to
+   its right. There is no field here, so let it size to its text -- otherwise
+   the hover target for the tooltip stretches across the whole empty row. */
+.toggle .title { flex: none; }
+
 .slabel {
   display: flex; align-items: center; gap: 6px;
   margin-bottom: 3px; font-size: 12px;
