@@ -61,6 +61,23 @@ def _leak_sites(count: float, seed: int, var: float) -> list[dict]:
     def mix(u: float, lo: float, hi: float) -> float:
         return 0.5 * (lo + hi) + var * (u - 0.5) * (hi - lo)
 
+    # Where the run of leaks starts on the perimeter. **Drawn from the seed**,
+    # and that is a fix rather than a flourish (2026-08-16): it used to be the
+    # constant 0.37 with only the +-0.05 jitter below to move it, and 0.37 of
+    # the perimeter is past the top border and short of the bottom-right corner
+    # at *every* aspect ratio -- 0.37 of 16:9, of 3:2, of square and of 2:3 all
+    # land on the right-hand edge. A tenth of a perimeter of jitter is nowhere
+    # near enough to leave a border, so a single leak came out on the right of
+    # the frame for every seed, which is what was reported. Swept over the whole
+    # seed space, `light_leak 1` reached exactly one of the four borders.
+    #
+    # Drawn **once for the whole list** rather than per leak, which is what
+    # keeps `_LEAK_PHI`'s promise: every leak still sits at `base + phi*k` off a
+    # base that does not know how many leaks there are, so leak 3 does not move
+    # when leak 9 is added. Same trick and same reason as `_mark_spread`'s
+    # per-seed offset, which is why it borrows that function's generator.
+    base = float(_mark_rng(seed, 4409, 0).random(1)[0])
+
     sites = []
     for k in range(n):
         # Seeded per leak, not once per frame, for the same reason the
@@ -73,8 +90,9 @@ def _leak_sites(count: float, seed: int, var: float) -> list[dict]:
         sites.append({
             # Where on the perimeter, 0..1. The jitter is small on purpose --
             # the golden step already spreads them, and a large jitter just
-            # lets two leaks land on top of each other.
-            "pos": (0.37 + _LEAK_PHI * k + 0.10 * (u[0] - 0.5)) % 1.0,
+            # lets two leaks land on top of each other. It is `base` above,
+            # not this, that makes the placement answer to the seed.
+            "pos": (base + _LEAK_PHI * k + 0.10 * (u[0] - 0.5)) % 1.0,
             # Reach is the one draw `var` does not touch: the two size sliders
             # state its spread outright, and the help text promises variation
             # changes everything *except* size.

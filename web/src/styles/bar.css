@@ -9,6 +9,17 @@
   flex: 0 0 auto;
 }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; letter-spacing: .2px; }
+/* The AGPL section 13 source offer. Deliberately quiet -- it is a licence
+   obligation rather than a feature, so it reads at the weight of the device
+   readout and not at the weight of the brand it sits beside. Do not remove it
+   to tidy the bar up: see the comment in TopBar.tsx. */
+.source-link {
+  font-weight: 400; font-size: 11.5px; letter-spacing: 0;
+  color: var(--dim); text-decoration: none;
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 1px 6px; margin-left: 2px;
+}
+.source-link:hover { color: var(--accent); border-color: var(--accent); }
 .film-grain-icon {
   width: 20px; height: 20px;
   border-radius: 4px;

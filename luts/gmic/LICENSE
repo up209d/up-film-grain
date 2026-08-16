@@ -1,0 +1,83 @@
+THIRD-PARTY CONTENT -- NOT COVERED BY THE PROJECT'S AGPL LICENCE
+================================================================
+
+The 296 .cube files in this directory and its subdirectories are third-party
+data redistributed with this project. They are not the work of the Film Grain
+Engine authors and the repository's AGPL-3.0 licence does not apply to them.
+
+
+WHAT THEY ARE
+-------------
+
+Pat David's film emulation presets for G'MIC, converted from HaldCLUT images to
+the .cube 3D LUT format. They approximate the colour response of photographic
+film stocks and are organised here by the upstream categories:
+
+    bw/                 25   black and white
+    colorslide/         26   colour reversal / slide
+    fujixtransiii/      15   Fujifilm X-Trans III camera simulations
+    instant_consumer/   54   consumer instant film
+    instant_pro/        68   professional instant film
+    negative_color/     13   colour negative
+    negative_new/       39   colour negative, current stocks
+    negative_old/       44   colour negative, discontinued stocks
+    print/              12   print film
+
+
+LICENCE
+-------
+
+Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)
+
+    https://creativecommons.org/licenses/by-sa/4.0/
+    https://creativecommons.org/licenses/by-sa/4.0/legalcode
+
+You are free to share and adapt this material, including commercially, provided
+you give appropriate credit and distribute any adapted LUTs under the same
+licence.
+
+There is NO NonCommercial restriction. Note also what ShareAlike does and does
+not reach: it applies to the LUT data and to modified LUTs derived from it. It
+does not apply to photographs you grade through a LUT. Images you produce with
+this software are yours, and you may sell them freely -- see the root NOTICE
+file.
+
+
+ATTRIBUTION
+-----------
+
+    Film emulation presets by Pat David
+    https://patdavid.net/
+    https://patdavid.net/2013/09/film-emulation-presets-in-gmic-gimp/
+
+    Distributed with G'MIC (GREYC's Magic for Image Computing)
+    https://gmic.eu/color_presets/
+
+    Licensed under CC BY-SA 4.0
+
+The wider G'MIC colour preset collection draws on several contributors
+including RawTherapee's Creative Pack, Marc Roovers' PictureFX, the PIXLS.US
+community, Stuart Sowerby and Juan Melara. The subset redistributed here is
+Pat David's film emulation set. Full attribution for the whole collection is
+listed at https://gmic.eu/color_presets/
+
+
+TRADEMARKS
+----------
+
+The filenames reference film stocks and camera systems -- Agfa, Fujifilm,
+Kodak, Polaroid and others -- whose names are trademarks of their respective
+owners. Those names appear for the sole purpose of identifying which film stock
+a given LUT approximates. Neither this project nor the upstream authors are
+affiliated with, endorsed by, or sponsored by any of those companies, and no
+claim is made to any of those marks. This mirrors the disclaimer carried
+upstream at https://gmic.eu/color_presets/
+
+
+IF YOU REDISTRIBUTE THIS FOLDER
+-------------------------------
+
+CC BY-SA requires the credit above and a link to the licence to travel with the
+data. Keep this file alongside the .cube files. build.sh copies it into the
+distribution for exactly that reason -- do not filter it out when changing the
+LUT copy step.

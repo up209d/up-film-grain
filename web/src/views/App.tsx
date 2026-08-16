@@ -78,7 +78,10 @@ export default function App() {
   // The photo's id is passed in so the edit history starts over when a
   // different one is opened -- a step describing a render that no longer
   // exists is not somewhere you can go back to.
-  const v = useValues(schema, booted, meta?.id ?? null);
+  // The seed switch is passed in as well as read here: a preset carries a seed
+  // of its own, and while the switch is on it must not overwrite the one this
+  // photo was given. See `applyPreset`.
+  const v = useValues(schema, booted, meta?.id ?? null, randomizeSeedOnOpen);
   const { showBefore, setShowBefore } = useBeforePeek();
 
   /** The reference size the *render* uses, which is not always the one the

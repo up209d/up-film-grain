@@ -18,6 +18,29 @@ A web app that applies organic film grain to still photographs. Python/PyTorch
 image service, React UI, single service (FastAPI serves the built client).
 Working and verified end to end as of 2026-07-31.
 
+**Licensed AGPL-3.0-or-later as of 2026-08-16** (it had no licence at all before
+then, which meant all-rights-reserved on a public repo — nobody could legally
+use it). AGPL rather than GPL or MIT specifically *because it is a web app*: the
+user's requirement was that nobody fork it, rebrand it and pass it off as their
+own, and §13 is the only clause that reaches someone who hosts a modified copy
+without ever distributing a binary. Three consequences that constrain code:
+
+* The `Source` link in `TopBar.tsx` is the §13 offer, not decoration. Its
+  `SOURCE_URL` must be a lone constant so a fork can repoint it.
+* `build.sh` copies `LICENSE` and `NOTICE` and **fails** without them —
+  distributing a build without the text is the *builder's* breach.
+* `luts/gmic/` is **not** AGPL. It is Pat David's film emulation set under
+  CC BY-SA 4.0 (attribution + share-alike, **no** NonCommercial clause, so
+  users selling their photos is safe). `luts/gmic/LICENSE` must travel with the
+  data — `build.sh` copies it in a second walk because the LUT walk filters on
+  `*.cube` and would drop the one file that makes the redistribution lawful.
+
+The name, logo and `UP-` LUT names are reserved under GPL-3.0 §7(e); copyright
+keeps a fork open, the name reservation is what stops it being marketed as this
+product. Duc Duong is sole author across the whole history, so dual-licensing
+(AGPL for the community, paid commercial licence for closed use) stays
+available — accepting outside PRs without a CLA or DCO is what would erode it.
+
 ## Priorities (from the user, and they override TOPIC.md's original draft)
 
 **In scope — the point of the app:** detail destruction, edge softening and
@@ -192,6 +215,34 @@ below — taking a plain `GROUPS` suffix there made a `brightness` edit come bac
 2.3e-01 wrong. `verify.py` catches it by re-rendering one parameter per section
 against a warm cache.
 
+## Two reported bugs, both "the seed does nothing" (fixed 2026-08-16)
+
+Filed together and unrelated in the code, but they rhyme: in both, something
+that looks randomised is not, and on any single render it is indistinguishable
+from something that is.
+
+* **A lone light leak was always on the right-hand edge.** Leak `k` sits at
+  `base + φ·k` of the perimeter and `base` was the constant `0.37`, which lands
+  on the right border at *every* aspect ratio. Swept over the whole seed space,
+  `light_leak 1` reached one of four borders. `base` is drawn from
+  `texture_seed` now — once for the whole list, so the φ step still means
+  raising the count *adds* leaks instead of rerolling them. This moves the leaks
+  in every existing preset, deliberately.
+  See `docs/film-texture/light-leaks.md`.
+* **`With random seed` was doing nothing at all.** Not a drag-and-drop bug —
+  both entry points call the same `onFile`. The reroll was written into a muted
+  section's kept snapshot *instead of* the live values, and every session boots
+  with every section muted; then `applyPreset` dropped the snapshots and laid the
+  preset's own fixed `seed` over the top. Measured on the shipped build, every
+  photo rendered with `seed 1234`. See `docs/client-ui.md` — and note the
+  schema grew a `neutral_zero` field so the client can tell an *amount* from a
+  seed, which is the distinction all three parts of that fix turn on.
+
+Both are pinned by `verify.py`, and the leak fix broke four checks that had been
+measuring the old arrangement rather than the geometry — `docs/testing.md` has
+what they were doing wrong, because the pattern (a probe reading a fixed window
+of the frame and assuming a mark is sitting in it) will recur.
+
 ## Two invariants that must not break
 
 Both are silent killers: break either and previews still look fine while
@@ -231,15 +282,16 @@ that no id can escape the folder, monotone tone recovery and highlight
 reconstruction, the bidirectional split tone, the four source-masked global
 layers with their hue masks and
 mid-tone bell, the six Global Grain blend modes, `global_seed` as an offset, and
-the film-texture section including its exact mark counts and the speck's shape
-and softness controls, and Normalize — that its metering corrects in the right
+the film-texture section including its exact mark counts, the speck's shape
+and softness controls and that a lone light leak can land on any of the four
+borders rather than always the right-hand one, and Normalize — that its metering corrects in the right
 *direction* on a known-wrong frame, that its white balance is luma-neutral to
 0.00e+00 and backs off to exactly identity on a scene that is legitimately one
 colour, and that its highlight roll keeps 250 of 256 8-bit levels in a real
-photograph's bright region where the version it replaced kept 153, and that Highlight Priority hands that band back at 21 levels against 79 — 416 checks. It exits
+photograph's bright region where the version it replaced kept 153, and that Highlight Priority hands that band back at 21 levels against 79 — 418 checks. It exits
 non-zero on failure.
 
-Those 416 live in `tests/checks/`, one module per area, since 2026-08-08 — it
+Those 418 live in `tests/checks/`, one module per area, since 2026-08-08 — it
 was a single 3900-line function taking 4m24s, and it is 18 modules taking ~72s
 (39s until `luts/` grew to 303 files, every one of which the `grading` module
 parses on purpose).

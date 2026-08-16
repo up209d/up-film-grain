@@ -213,6 +213,44 @@ from the handler runs *before* the effect that records the reroll and leaves it
 behind as the one undoable step on a freshly opened image. Checking the key
 first inside the effect makes the post-reroll state the new baseline instead.
 
+### `With random seed` was doing nothing at all (fixed 2026-08-16)
+
+Reported against drag-and-drop, but the entry point was innocent: the drop
+handler and the file picker both call the same `onFile`, in the source and in
+the shipped bundle. Driven from a browser, the render request went out with
+`seed 1234` on *every* open either way. Three things were wrong and each one on
+its own was enough:
+
+* **The reroll went where nothing could see it.** `randomizeSeeds` wrote the new
+  seed into the live values *or* into a muted section's kept snapshot, never
+  both, on the reasoning that a muted section's live values should stay neutral.
+  But a seed is not an amount — it cannot switch a stage on, and while the
+  section is muted it changes nothing — so there was nothing to protect and the
+  split only hid the draw. Every session boots with **every** section muted, so
+  on the first photo opened the reroll reached neither the panel nor the
+  renderer. It writes both now, which also keeps them in step for when
+  `toggleGroup` restores the snapshot later.
+* **Choosing a look put the seed back.** `applyPreset` drops the snapshots
+  wholesale and lays the preset's own values over the current ones, and every
+  shipped preset carries a fixed `seed` and `texture_seed` — whatever was dialled
+  in when it was saved. So `boot → drop a photo → pick a look`, which is the
+  everyday path, pinned every photo to the same grain and the same dust. While
+  the switch is on, a preset now brings its look and leaves those two keys
+  alone; switched off it still reproduces its own grain exactly.
+* **`Original` undid the draw.** It handed over `schema.neutral` wholesale,
+  which put every *shape* back to its default too — so it was a partial Reset
+  wearing the wrong name, in flat contradiction of the comment above it
+  promising that "sizes, radii and seeds are left alone". It zeroes only the
+  amounts now, which is the same set the server reads to decide a render is a
+  pass-through.
+
+That last one is why the schema grew a `neutral_zero` field. The client had been
+answering "is this the original?" by comparing *every* key against `neutral`,
+which counts a rerolled seed as a change to the picture; it now mirrors the
+server's `is_neutral` off the server's own list. Inferring the list client-side
+does not work and `global_seed` is the proof — its default is 0 and it is not an
+amount.
+
 ### The rest of the batch
 
 * **`Random Seed` in the top bar**, beside the filename. The same reroll the

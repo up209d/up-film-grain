@@ -152,3 +152,40 @@ Two things had to change with it, both about the *log* rather than the timing:
 * a new `"every .cube on disk is listed"` counts the tree independently and
   compares. The walk is what silently regresses: `glob` instead of `rglob` still
   lists seven LUTs and passes every other check in the file.
+
+## Four leak checks were measuring the arrangement, not the geometry (2026-08-16)
+
+Seeding the light-leak placement (`docs/film-texture/light-leaks.md`) broke four
+checks that had passed for a fortnight, and none of them broke because the
+engine got worse. They were reading a **fixed window** of the frame and assuming
+a leak would be sitting in it, which had been reliably true only because the old
+constant placement put one there. With the placement free, they measured
+whatever tail happened to reach the window: a 240px leak came back as 126px
+deep from the side against 233px from the top, and "both frame axes agree"
+failed on an asymmetry that does not exist.
+
+It does not exist — measured properly, one unclipped 240px leak reaches a median
+of 205, 212, 215 and 221px from the four borders. What the probes needed was to
+**find their leak rather than assume one**, which is what `lone_leaks` does: it
+sweeps seeds, drops the leaks a corner has truncated, rotates each so its own
+border is row 0, and hands back the lot. The checks take a median over that.
+
+Two things fell out of the rewrite that are worth copying:
+
+* **One sample of a spread is not a measurement.** The feather check took the
+  first seed whose leak was unclipped. Over the sweep, the same 20px feather
+  measures anywhere from 22px to 55px depending on which leak is asked — so
+  that check had been reading the noise, and reading it stably only because the
+  placement was frozen. The median is 29px.
+* **A probe that samples two of four borders will say so eventually.**
+  `leak_peaks` read the top and bottom rows, which was a slice of one border's
+  worth of the population dressed as a slice of the frame. It reads all four
+  now: 34 leaks sampled where there were 8, and the hardness ratio it feeds
+  moved from a marginal 1.98 to 2.37 against a bar of 2.0.
+
+Both new checks are placement checks and neither renders anything: one counts
+how many of the four borders a lone leak can reach over 400 seeds (1 of 4 before
+the fix, 4 of 4 after), and one asserts that raising the count does not move the
+leaks already placed — the property the golden-ratio step exists for, and the
+one a plausible-looking "draw the position per leak" fix would destroy
+invisibly.

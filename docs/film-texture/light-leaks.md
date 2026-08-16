@@ -59,6 +59,38 @@ Four things about that are deliberate:
   domain warp on `u` and `v`. That inversion is the whole difference between an
   organic outline and fog.
 
+### Where a leak lands has to answer to the seed (fixed 2026-08-16)
+
+Reported as "when light leak count is 1 it is most likely on the right edge of
+the photo, so not really randomizing at all", and it was worse than *most
+likely* — it was **always**, at every seed and every aspect ratio.
+
+Leak `k` sits at `(base + φ·k + 0.10·(u−0.5)) mod 1` of the perimeter, and
+`base` was the constant `0.37`. The perimeter is walked top → right → bottom →
+left, so 0.37 of it lands past the top border and short of the bottom-right
+corner whether the frame is 16:9, 3:2, square or 2:3 — and a tenth of a
+perimeter of jitter is nowhere near a border's width. Swept over the whole seed
+space on three frame shapes, one leak reached **one** of the four borders. The
+seed was moving the leak's reach, lean, hardness and hue, which is why it read
+as randomised until you noticed it never moved.
+
+`base` is now drawn from `texture_seed`, off the same generator
+`_mark_spread` uses for dust and hair. Two things had to survive it, and both
+are checked:
+
+* **The φ step still does the spreading.** `base` is drawn **once for the whole
+  list**, not per leak, so every leak is still `base + φ·k` and raising the
+  count adds leaks instead of rerolling the frame. Drawing the position from
+  each leak's own generator would look identical on any single render and quietly
+  break that.
+* **Tile independence.** The list is still a function of the count and the seed
+  alone — never of the region being rendered — so every tile builds the same one.
+
+The fix moved every existing preset's leaks, which is the point; nothing about
+their size, shape or strength changed. It also broke four `verify.py` checks
+that had been reading fixed windows of the frame and assuming a leak would be
+sitting in one — see `docs/testing.md`.
+
 **`_LEAK_CORNER_BIAS` must stay under 1/2π = 0.159.** The corner pull is
 `t - bias * sin(2πt)` applied inside a border segment, and above that threshold
 the map stops being monotonic and starts *folding*: at my first value of 0.24

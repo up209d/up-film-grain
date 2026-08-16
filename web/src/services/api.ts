@@ -60,6 +60,12 @@ export interface Schema {
   /** Values that switch every stage off. Rendering with these returns the
    *  source untouched, bit for bit. */
   neutral: Record<string, number>;
+  /** Which keys in `neutral` are the *amounts* — the ones that decide whether
+   *  a stage runs. Everything else (sizes, radii, seeds) is a shape, and may
+   *  differ from its neutral value without the picture differing at all. This
+   *  is the server's own `NEUTRAL_ZERO`; see the note beside it in
+   *  `server/params/schema.py` for why it is shipped instead of guessed. */
+  neutral_zero: string[];
   /** Fallback size for presets that do not record one. Null = no scaling. */
   default_reference_mp: number | null;
 }

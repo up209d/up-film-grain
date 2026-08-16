@@ -61,6 +61,17 @@ cp -R server "$OUT/server"
 find "$OUT/server" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 cp -R web/dist "$OUT/web/dist"
 
+# Licence text. The AGPL obliges whoever distributes a copy to convey this with
+# it (section 4), and that is whoever runs this script -- not just whoever
+# pushes the repo. A distribution without these two files is a breach, so they
+# are copied before anything optional and the build fails if they are missing
+# rather than quietly shipping unlicensed.
+for f in LICENSE NOTICE; do
+  [ -f "$f" ] || { echo "$f is missing -- refusing to build an unlicensed distribution" >&2; exit 1; }
+  cp "$f" "$OUT/$f"
+done
+say "Bundled LICENSE and NOTICE"
+
 # Presets are data the server reads at runtime, so they have to travel with it.
 # The directory is created even when empty: the server tolerates a missing one,
 # but shipping the folder is what makes it obvious where presets go.
@@ -91,6 +102,20 @@ while IFS= read -r f; do
   cp "$f" "$OUT/luts/$rel"
   lut_n=$((lut_n + 1))
 done < <(find luts -type f -name '*.cube')
+
+# The LUT tree carries third-party data: luts/gmic/ is Pat David's film
+# emulation set under CC BY-SA 4.0, and that licence requires the credit and the
+# licence link to travel WITH the data. The walk above is '-name *.cube', so it
+# skips the very file that makes the redistribution lawful. Copy the licence
+# notices separately rather than widening the filter -- lut_n has to stay a
+# count of LUTs, and `server/lut.py` selects on the .cube suffix anyway, so a
+# stray non-LUT in the tree is ignored by the picker.
+while IFS= read -r f; do
+  rel="${f#luts/}"
+  mkdir -p "$OUT/luts/$(dirname "$rel")"
+  cp "$f" "$OUT/luts/$rel"
+done < <(find luts -type f \( -name 'LICENSE' -o -name 'NOTICE' -o -name 'README.md' \))
+
 if [ "$lut_n" -gt 0 ]; then
   say "Bundled $lut_n LUT(s) in $(find "$OUT/luts" -type d | wc -l | tr -d ' ') folder(s), $(du -sh "$OUT/luts" | cut -f1)"
 else

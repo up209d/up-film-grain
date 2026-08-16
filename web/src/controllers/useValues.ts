@@ -16,15 +16,31 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { groupIndex, muteAll, startingValues } from "../models/paramState";
+import {
+  groupIndex, muteAll, neutralised, startingValues,
+} from "../models/paramState";
 import type { Snapshot, Values } from "../models/types";
 import type { Schema } from "../services/api";
 import { useHistory } from "./useHistory";
+
+/** The seeds a photo gets its own draw of, with the section each belongs to.
+ *  `global_seed` is deliberately not one of them: it is an *offset* on `seed`,
+ *  so rerolling `seed` already reshuffles the global layer, and drawing both
+ *  would throw away the one number a preset uses to say where it wants that
+ *  layer relative to the rest. */
+const SEED_KEYS: ReadonlyArray<readonly [string, string]> = [
+  ["seed", "Grain Structure"],
+  ["texture_seed", "Film Texture"],
+];
 
 export function useValues(
   schema: Schema | null,
   booted: Schema | null,
   imageId: string | null,
+  /** Whether "With random seed" is on. Read only by `applyPreset`, which is
+   *  the one action that would otherwise overwrite a freshly drawn seed with
+   *  the fixed one baked into the preset file. */
+  randomSeeds: boolean,
 ) {
   const [values, setValues] = useState<Values>({});
   const [applied, setApplied] = useState<Values>({});
@@ -123,37 +139,45 @@ export function useValues(
    *  comment documents for `commit()`. Both seeds are folded into one object
    *  here instead.
    *
-   *  And deliberately *not* `setValueNow` at all for a muted group: that
-   *  un-mutes on the reasoning that a real edit means "I want this section
-   *  live now," which does not hold for a reroll nobody asked for by name --
-   *  opening a photo silently switching a muted section back on would be a
-   *  far bigger surprise than a repeated seed. A muted group's kept snapshot
-   *  is updated in place instead. */
+   *  And deliberately *not* `setValueNow` at all: that un-mutes on the
+   *  reasoning that a real edit means "I want this section live now," which
+   *  does not hold for a reroll nobody asked for by name -- opening a photo
+   *  silently switching a muted section back on would be a far bigger surprise
+   *  than a repeated seed.
+   *
+   *  **The new seed goes into the live values *and* into a muted section's kept
+   *  snapshot** (fixed 2026-08-16). It used to go into one or the other, on the
+   *  reasoning that a muted section's live values are neutral and should stay
+   *  that way -- but a seed is not an amount. It cannot switch a stage on, and
+   *  while the section is muted it changes nothing, so there was never anything
+   *  to protect; what the split actually did was hide the draw. Every session
+   *  boots with *every* section muted, so on the first photo opened the reroll
+   *  went nowhere the panel or the renderer could see it, and then `applyPreset`
+   *  -- which drops the snapshots wholesale -- threw it away. Measured on the
+   *  shipped build: open a photo, pick a look, and the render went out with
+   *  `seed 1234` every single time, which is the whole feature not working.
+   *  Writing both keeps them in step, so `toggleGroup` restoring the snapshot
+   *  later restores the same number the panel has been showing. */
   const randomizeSeeds = () => {
-    const seedVal = Math.floor(Math.random() * 10000);
-    const textureVal = Math.floor(Math.random() * 10000);
-    const rolls: [string, string, number][] = [
-      ["seed", "Grain Structure", seedVal],
-      ["texture_seed", "Film Texture", textureVal],
-    ];
+    const rolls = SEED_KEYS.map(
+      ([key, group]) =>
+        [key, group, Math.floor(Math.random() * 10000)] as const,
+    );
 
     const liveNext: Values = {};
     let mutedNext: Record<string, Values> | null = null;
     for (const [key, group, val] of rolls) {
+      liveNext[key] = val;
       if (muted[group]) {
         const base: Record<string, Values> = mutedNext ?? muted;
         mutedNext = { ...base, [group]: { ...base[group], [key]: val } };
-      } else {
-        liveNext[key] = val;
       }
     }
 
     if (mutedNext) setMuted(mutedNext);
-    if (Object.keys(liveNext).length) {
-      const next = { ...valuesRef.current, ...liveNext };
-      setValues(next);
-      setApplied(next);
-    }
+    const next = { ...valuesRef.current, ...liveNext };
+    setValues(next);
+    setApplied(next);
   };
 
   // Presets and reset are single discrete actions, not gestures, so they go
@@ -174,6 +198,14 @@ export function useValues(
     // look's grade would keep riding under the new one.
     setLut(p.lut ?? null);
     const v = { ...values, ...p.values };
+    // The look is the preset's; *where the grain and the damage fall* is this
+    // photo's. Every shipped preset carries a fixed `seed` and `texture_seed`
+    // -- whatever number happened to be dialled in when it was saved -- so
+    // without this a preset re-pins them and "With random seed" quietly stops
+    // meaning anything the moment you choose a look, which is exactly how the
+    // feature was reported broken. Held back only while the switch is on:
+    // turned off, a preset still reproduces its own grain exactly.
+    if (randomSeeds) for (const [k] of SEED_KEYS) v[k] = values[k];
     setValues(v);
     setApplied(v);
     setMuted({});
@@ -194,11 +226,20 @@ export function useValues(
   /** Switch the whole pipeline off, so the preview is the untouched photo.
    *  Sizes, radii and seeds are left alone -- they are not what makes a stage
    *  run, and keeping them means turning a section back on returns you to what
-   *  you had rather than to the factory numbers. */
+   *  you had rather than to the factory numbers.
+   *
+   *  That is what this has always said and it is only true since 2026-08-16:
+   *  handing over `schema.neutral` wholesale put every shape back to its
+   *  *default* as well, so Original was a partial Reset wearing the wrong name
+   *  -- and once a seed is drawn per photo, a press of it silently undid the
+   *  draw. Only the amounts are zeroed now, which is the same set the server
+   *  reads to decide a render is a pass-through, so the picture is the source
+   *  either way. */
   const showOriginal = () => {
     if (!schema) return;
-    setValues(schema.neutral);
-    setApplied(schema.neutral);
+    const v = neutralised(schema, values);
+    setValues(v);
+    setApplied(v);
   };
 
   /** Switch one section off, same idea. Reaching for this is usually "is this

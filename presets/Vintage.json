@@ -2,6 +2,8 @@
   "format": "film-grain-preset",
   "version": 1,
   "name": "Vintage",
+  "author": "UP",
+  "author_link": "https://github.com/up209d",
   "reference_mp": 24,
   "lut": "UP-Vintage",
   "values": {

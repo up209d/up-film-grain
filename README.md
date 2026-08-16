@@ -173,6 +173,31 @@ luts/            3D LUTs -- drop a .cube in and it is in the menu
   gmic/          296 film-emulation LUTs, in folders (see Credits)
 ```
 
+## Licence
+
+[AGPL-3.0-or-later](LICENSE). Copyright © 2026 Duc Duong.
+
+**Your photographs are yours.** The licence covers the software, not what you
+make with it. Images you process here carry no obligation to this project —
+publish them, license them, sell them, commercially or otherwise. You owe no
+attribution for them and need no permission.
+
+**Using it** — run it for anything, including in a business, and modify it
+freely for your own use.
+
+**Forking it** — allowed, and the terms are the point: a modified version that
+you distribute, *or run as a network service*, must publish its own source under
+the AGPL and keep the existing copyright notices. That is why the top bar
+carries a `Source` link; §13 requires a network-served build to offer its source
+to the people using it, so a fork that deploys publicly must repoint
+`SOURCE_URL` in `web/src/views/panels/TopBar.tsx` at its own repository.
+
+**The name is not part of the licence.** "Film Grain Engine", the logo and the
+`UP-` LUT names are reserved. Per GPL-3.0 §7(e) no trademark rights are granted
+— fork it, but ship it under your own name and don't imply endorsement.
+
+See [NOTICE](NOTICE) for the full statement.
+
 ## Credits
 
 The `luts/gmic/` library is **Pat David's** film emulation presets for G'MIC,
@@ -186,7 +211,20 @@ folders and a search box.
 * [G'MIC](https://gmic.eu/) — the image-processing framework they were built
   for and ship with
 
-The seven LUTs at the root of `luts/` are the app's own.
+Those 296 are **not** under the AGPL: they are
+[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/), which requires
+attribution and share-alike but carries **no NonCommercial restriction** — so
+selling work graded through them is unaffected. Share-alike reaches modified
+*LUTs*, never the photographs you grade with them. Terms and the required
+credit are in [luts/gmic/LICENSE](luts/gmic/LICENSE), which lives beside the
+data so it survives a copy of the folder.
+
+Film stock and camera names in those filenames are trademarks of their owners
+and appear only to identify what each LUT approximates; no affiliation or
+endorsement is implied.
+
+The seven LUTs at the root of `luts/` are the app's own and are AGPL like the
+rest of the repository.
 
 ## Documentation
 

@@ -1,0 +1,61 @@
+Film Grain Engine
+Copyright (C) 2026 Duc Duong <up209d@gmail.com>
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See LICENSE for the full text.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+
+YOUR PHOTOGRAPHS ARE YOURS
+--------------------------
+
+This licence governs the software, not what you make with it. It places no
+condition of any kind on the images this program outputs. Photographs you
+process here are yours alone: use them, publish them, license them and sell
+them commercially, with no obligation to this project. You do not need
+permission and you owe no attribution for them.
+
+
+RUNNING IT, AND CHANGING IT
+---------------------------
+
+You may run this software for any purpose, including in a business, and you may
+modify it for your own use freely.
+
+If you distribute a modified version, or run one as a network service that other
+people use, the AGPL requires you to release your modified source under this
+same licence and to keep the existing copyright notices intact (sections 5 and
+13). The top bar carries a link to the source for that reason -- if you deploy a
+modified copy, that link must point at *your* source, not at this repository.
+
+
+NAME AND BRANDING
+-----------------
+
+The licence covers the code. It does not grant any right to the project's
+identity. The name "Film Grain Engine", the project logo and icon, and the
+"UP-" LUT names are not licensed for use by derivative works. As permitted by
+section 7(e) of the GNU GPL v3, no trademark rights are granted here. A fork is
+welcome, but it must be distributed under a different name and must not present
+itself as this project or imply endorsement by it.
+
+
+THIRD-PARTY CONTENT
+-------------------
+
+The 296 colour LUTs under luts/gmic/ are NOT covered by the AGPL. They are Pat
+David's film emulation presets for G'MIC, redistributed under the Creative
+Commons Attribution-ShareAlike 4.0 International licence. See luts/gmic/LICENSE
+for the terms and the required attribution.
+
+Note that CC BY-SA applies to the LUT data itself, not to photographs graded
+through it, and it carries no NonCommercial restriction. Selling your work is
+unaffected.
+
+The seven LUTs at the root of luts/ are this project's own and are covered by
+the AGPL like the rest of the repository.

@@ -76,7 +76,15 @@ def run(cx: Ctx) -> None:
                 1.0, supersample=1,
             )
             d = (o - leak_plate).max(2)
-            for strip, perp in ((d[0, :], d), (d[-1, :], d[::-1])):
+            # All four borders, not just the top and the bottom (2026-08-16).
+            # Where a leak lands answers to the seed now; it used to come off a
+            # constant, which put a lone leak on the right-hand border of every
+            # frame and made "read the top and bottom rows" a sample of one
+            # border's worth of the population dressed up as a sample of the
+            # frame. Reading all four is both more of the population and an
+            # unbiased slice of it.
+            for strip, perp in ((d[0, :], d), (d[-1, :], d[::-1]),
+                                (d[:, 0], d.T), (d[:, -1], d.T[::-1])):
                 on = strip > 0.02
                 k = 0
                 while k < len(on):
@@ -90,6 +98,39 @@ def run(cx: Ctx) -> None:
                     else:
                         k += 1
         return np.array(got)
+
+    # Where a leak lands has to answer to the seed, and until 2026-08-16 it did
+    # not: the run of leaks started at the constant 0.37 of the perimeter with a
+    # +-0.05 jitter on top, and 0.37 of the perimeter is on the right-hand
+    # border at *every* aspect ratio -- 16:9, 3:2, square and 2:3 all -- with
+    # nowhere near enough jitter to leave it. So `light_leak 1` put its leak on
+    # the right of the frame for every seed there is, which is what was
+    # reported. Counted over the whole seed space rather than eyeballed on one
+    # render, because a fixed placement with a small jitter is indistinguishable
+    # from a random one until you look at more than one frame.
+    borders = {
+        f"{int(fw)}x{int(fh)}": len({
+            _leak_anchor(_leak_sites(1.0, sd, 0.0)[0]["pos"], fh, fw)[0]
+            for sd in range(400)
+        })
+        for fh, fw in ((1000.0, 1500.0), (1500.0, 1000.0), (1000.0, 1000.0))
+    }
+    check(
+        "a lone leak can land on any of the four borders",
+        all(n == 4 for n in borders.values()),
+        ", ".join(f"{k}: {n} of 4 over 400 seeds" for k, n in borders.items()),
+    )
+    # ...and the seeded start must not cost what the golden step buys. Every
+    # leak sits at `base + phi*k` off a base drawn from the seed *once for the
+    # whole list*, so raising the count still adds leaks rather than rerolling
+    # the frame. Drawing the position per leak from that leak's own generator
+    # would look identical on a single render and break this.
+    check(
+        "adding a leak does not move the ones already there",
+        [s["pos"] for s in _leak_sites(3, 77, 0.5)]
+        == [s["pos"] for s in _leak_sites(9, 77, 0.5)][:3],
+        "leaks 0-2 are unmoved when the count goes 3 -> 9",
+    )
 
     # Leak sizes and the feather are lengths in pixels now, so they have to
     # deliver the pixels they claim -- and the two frame axes have to agree,
@@ -109,36 +150,68 @@ def run(cx: Ctx) -> None:
             1.0, supersample=1,
         )
 
-    def lk_depth(o: np.ndarray, side: str) -> int:
-        """Deepest pixel a leak reaches from one border, ignoring the others.
+    def lone_leaks(over: dict, seeds=range(20, 56)) -> list[tuple[int, np.ndarray]]:
+        """Every *unclipped* single leak over a seed sweep, each rotated so its
+        own border is row 0 and its length runs along the columns.
 
-        Every probe here has to be walled off from the *other* three borders,
-        which the perimeter wash never needed: leaks are discrete beams now and
-        a top-border one leans a long way sideways. Each window is chosen to
-        sit past the reach any leak on a perpendicular border could have, so
-        what it measures is only ever the border it is aimed at.
+        A sweep, and a median taken over it, rather than one leak on one seed.
+        Where a leak lands answers to `texture_seed` -- since 2026-08-16 it
+        does, at any rate; it used to come off the constant 0.37, which put a
+        lone leak on the **right-hand border of every frame at every seed and
+        every aspect ratio**, and that is what these probes were unwittingly
+        calibrated against. Two of them read a fixed window of the frame and
+        assumed a leak would be sitting in it; with the placement free they
+        measured whatever tail happened to reach the window instead, and a
+        240px leak came back as 126px deep. So the probe finds its leak now
+        rather than assuming one, which is what makes the number about the
+        geometry rather than about the arrangement.
+
+        Leaks a corner has truncated are dropped: one has no full length to
+        measure and no second edge to compare it against.
         """
-        d = np.abs(o - lk_plate).max(2)
-        strip = (d[400:600, :700].max(0) if side == "left"
-                 else d[:400, 400:1100].max(1))
-        on = np.where(strip > 0.01)[0]
-        return int(on.max()) + 1 if len(on) else 0
+        got = []
+        var = float(over.get("leak_variation", 0.0))
+        for sd in seeds:
+            border, _ = _leak_anchor(
+                _leak_sites(1.0, sd, var)[0]["pos"], 1000.0, 1500.0)
+            g = np.abs(lk_run({**over, "light_leak": 1.0,
+                               "texture_seed": float(sd)}) - lk_plate).max(2)
+            g = {0: g, 1: g[::-1], 2: g.T, 3: g.T[::-1]}[border]
+            xs = np.where(g[0] > 0.01)[0]
+            if len(xs) and xs.min() > 0 and xs.max() < g.shape[1] - 1:
+                got.append((border, g))
+        return got
 
-    grew = [lk_depth(lk_run({"leak_size_min": s, "leak_size_max": s,
-                             "leak_feather": max(2, s // 4),
-                             "leak_variation": 0.0}), "left")
-            for s in (60, 120, 240, 400)]
+    def lk_depths(size: int, feather: int) -> dict[str, list[int]]:
+        """How deep a lone leak of this size comes in, by which axis it is on."""
+        out: dict[str, list[int]] = {}
+        for border, g in lone_leaks({"leak_size_min": size, "leak_size_max": size,
+                                     "leak_feather": feather,
+                                     "leak_variation": 0.0}):
+            col = g[:, int(g[0].argmax())]
+            axis = "top/bottom" if border in (0, 1) else "left/right"
+            out.setdefault(axis, []).append(int(np.where(col > 0.01)[0].max()) + 1)
+        return out
+
+    def lk_depth(size: int) -> int:
+        d = lk_depths(size, max(2, size // 4))
+        return int(np.median([v for vs in d.values() for v in vs] or [0]))
+
+    grew = [lk_depth(s) for s in (60, 120, 240, 400)]
     check(
         "leak size is a distance in pixels",
         all(grew[k] < grew[k + 1] for k in range(len(grew) - 1)) and grew[0] < 120,
         "sizes 60/120/240/400px reach " + ", ".join(f"{g}" for g in grew) + "px",
     )
-    iso = lk_run({"leak_size_min": 240, "leak_size_max": 240, "leak_feather": 60,
-                  "leak_variation": 0.0})
-    lft, tp = lk_depth(iso, "left"), lk_depth(iso, "top")
+    axes = lk_depths(240, 60)
+    hz = [int(np.median(axes[a])) if axes.get(a) else 0
+          for a in ("top/bottom", "left/right")]
     check(
-        "both frame axes agree", abs(lft - tp) < max(lft, tp) * 0.45,
-        f"240px reaches {lft}px from the side and {tp}px from the top on a 3:2 frame",
+        "both frame axes agree",
+        min(len(axes.get(a, ())) for a in ("top/bottom", "left/right")) >= 4
+        and abs(hz[0] - hz[1]) < max(hz) * 0.45,
+        f"240px reaches {hz[1]}px from the side and {hz[0]}px from the top "
+        f"on a 3:2 frame",
     )
     # The feather is the distance to *half* strength, which is the whole claim
     # of putting it in pixels rather than on an abstract 0-1.
@@ -155,26 +228,23 @@ def run(cx: Ctx) -> None:
     # profile drawn through a frame of twelve overlapping beams keeps being
     # propped up by the next leak along and reads the falloff as longer than
     # it is -- measured, a 20px feather came back as 37px that way.
-    lone = {"light_leak": 1.0, "leak_size_min": 300, "leak_size_max": 300,
+    #
+    # The median of a sweep, not the first leak that fits. One leak is one
+    # sample of a spread: over the seeds swept here the same 20px feather
+    # measures anywhere from 22px to 55px depending on which leak is asked,
+    # so taking whichever seed happened to come first was reading the noise.
+    # See `lone_leaks`.
+    lone = {"leak_size_min": 300, "leak_size_max": 300,
             "leak_variation": 0.0, "leak_strength": 0.1}
 
-    def lone_profile(f: int) -> np.ndarray:
-        """One leak's falloff, rotated so it runs inward from row 0."""
-        for sd in range(20, 80):
-            border, _ = _leak_anchor(_leak_sites(1.0, sd, 0.0)[0]["pos"],
-                                     1000.0, 1500.0)
-            g = np.abs(lk_run({**lone, "leak_feather": f,
-                               "texture_seed": float(sd)}) - lk_plate).max(2)
-            g = {0: g, 1: g[::-1], 2: g.T, 3: g.T[::-1]}[border]
-            xs = np.where(g[0] > 0.01)[0]
-            if len(xs) and xs.min() > 0 and xs.max() < g.shape[1] - 1:
-                return g[:, int(g[0].argmax())]
-        return np.zeros(1)
-
     def half_at(f: int) -> int:
-        col = lone_profile(f)
-        below = np.where(col < col[:4].max() * 0.5)[0]
-        return int(below.min()) if len(below) else -1
+        got = []
+        for _, g in lone_leaks({**lone, "leak_feather": f}, range(20, 50)):
+            col = g[:, int(g[0].argmax())]
+            below = np.where(col < col[:4].max() * 0.5)[0]
+            if len(below):
+                got.append(int(below.min()))
+        return int(np.median(got)) if got else -1
 
     asked = (20, 80, 150, 285)
     got_half = [half_at(f) for f in asked]
@@ -262,21 +332,15 @@ def run(cx: Ctx) -> None:
     # radiate inward from all of them, and it has to have a definite edge.
     # Both are measured on one leak at a time, rotated so its own border is
     # row 0, and only on leaks a corner has not truncated -- a clipped leak
-    # has no length to measure and no second edge to compare.
+    # has no length to measure and no second edge to compare. `lone_leaks` is
+    # what supplies them, so the sweep is over leaks on all four borders rather
+    # than over the one border the old fixed placement could produce.
     aspect, hardness = [], []
-    for sd in range(20, 44):
-        st = _leak_sites(1.0, sd, 1.0)[0]
-        border, _ = _leak_anchor(st["pos"], 1000.0, 1500.0)
-        o = lk_run({"light_leak": 1.0, "leak_strength": 0.2,
-                    "leak_size_min": 240, "leak_size_max": 240,
-                    "leak_feather": 120, "leak_variation": 1.0,
-                    "texture_seed": float(sd)})
-        g = np.abs(o - lk_plate).max(2)
-        g = {0: g, 1: g[::-1], 2: g.T, 3: g.T[::-1]}[border]
+    for _, g in lone_leaks({"leak_strength": 0.2, "leak_size_min": 240,
+                            "leak_size_max": 240, "leak_feather": 120,
+                            "leak_variation": 1.0}):
         m = g > 0.01
         xs = np.where(m[0])[0]
-        if not len(xs) or xs.min() == 0 or xs.max() == m.shape[1] - 1:
-            continue
         a_, b_ = int(xs.min()), int(xs.max())
         aspect.append((b_ - a_ + 1) / max(int(m[:, a_:b_ + 1].max(1).sum()), 1))
         # Steepest step just inside each end of the run at the border. One end

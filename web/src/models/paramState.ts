@@ -102,11 +102,28 @@ export function groupIndex(s: Schema | null): Record<string, string> {
   return m;
 }
 
-/** True when nothing is switched on, so a render would return its input. */
+/** True when nothing is switched on, so a render would return its input.
+ *
+ *  The *amounts* only, mirroring `is_neutral()` on the server rather than
+ *  comparing every key. A seed, a size or a radius can differ from its neutral
+ *  value with every stage still switched off -- the picture is the source
+ *  either way -- and reading those as a change is what made a photo whose seed
+ *  had just been rerolled on open stop counting as untouched. The two sides now
+ *  answer this question from the same list. */
 export function isNeutral(s: Schema | null, values: Values): boolean {
-  return (
-    !!s && Object.keys(s.neutral).every((k) => values[k] === s.neutral[k])
-  );
+  return !!s && s.neutral_zero.every((k) => values[k] === s.neutral[k]);
+}
+
+/** Switch every stage off, leaving the shapes alone.
+ *
+ *  What "Original" applies. Only the amounts are zeroed: sizes, radii and seeds
+ *  keep whatever they are set to, so turning a section back on returns you to
+ *  what you had rather than to the factory numbers -- and so a reroll on open
+ *  is not undone by a press of Original. */
+export function neutralised(s: Schema, values: Values): Values {
+  const v = { ...values };
+  for (const k of s.neutral_zero) v[k] = s.neutral[k];
+  return v;
 }
 
 /** True when any parameter in a group differs from its neutral value. */
