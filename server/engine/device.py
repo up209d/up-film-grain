@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 import torch
 
@@ -89,6 +90,124 @@ _TILE_MIN = 768
 _TILE_MAX = 8192
 
 
+# Backends the engine knows how to drive. `FILM_GRAIN_DEVICE` is checked against
+# this rather than passed to `torch.device` directly, so a typo produces a
+# warning and the normal auto-detection instead of a crash at import time --
+# this runs before uvicorn binds, so raising here means the app never starts.
+_DEVICES = ("cpu", "mps", "cuda")
+
+# Warnings are emitted once per distinct message. `_resolve_device` is called
+# from `_render_budget_bytes`, which the Global Grain cache calls on *every*
+# insert, so an un-deduplicated warning would print thousands of times per
+# render.
+_warned: set[str] = set()
+
+
+def _warn(msg: str) -> None:
+    if msg not in _warned:
+        _warned.add(msg)
+        print(f"[device] {msg}", file=sys.stderr)
+
+
+def _system_ram_bytes() -> int:
+    """Total physical RAM, or a conservative guess.
+
+    `os.sysconf` covers macOS and Linux and **does not exist on Windows**, where
+    the old code caught the `AttributeError` and fell through to a hardcoded 4GB.
+    That did not crash, which is exactly why it was worth finding: it silently
+    told a 64GB machine it had 4GB, and since this figure drives
+    `_render_budget_bytes` -> `_tile_budget_bytes` -> `tile_for`, every tile
+    clamped to `_TILE_MIN` and both caches landed in the starved regime that
+    `_grain_cache_bytes` measured at 7.36s against 1.78s. Wrong by 16x in the
+    direction that costs performance, reported by nothing.
+
+    `GlobalMemoryStatusEx` is the Windows equivalent and needs no dependency --
+    `ctypes` is stdlib. **Unverified until the windows target is actually built**;
+    it is written now while the reasoning is fresh, and it is dead code on macOS.
+    """
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (OSError, ValueError, AttributeError):
+        pass
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            st = _MemoryStatusEx()
+            st.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            # Returns 0 on failure; ullTotalPhys would then be garbage.
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                if st.ullTotalPhys > 0:
+                    return int(st.ullTotalPhys)
+        except Exception:
+            pass
+
+    _warn("cannot read system RAM; assuming 4GB. Set FILM_GRAIN_TILE_BUDGET_GB "
+          "to override.")
+    return 4 << 30
+
+
+def _resolve_device() -> torch.device:
+    """The device the engine will actually render on.
+
+    The single source of truth for that question, and it has two callers that
+    must never disagree: `pick_device`, which the engine renders on, and
+    `_render_budget_bytes`, which sizes tiles and caches for it. They used to
+    answer independently -- and in a different order, this one testing MPS first
+    while `pick_device` tested CUDA first. Harmless only because no machine has
+    both; not harmless once `FILM_GRAIN_DEVICE` exists, because forcing CPU on a
+    Mac would still have sized the memory pool from
+    `torch.mps.recommended_max_memory()`, i.e. from a GPU nothing was using.
+
+    `FILM_GRAIN_DEVICE` (`cpu`/`mps`/`cuda`) forces the choice, in the same
+    spirit as the other `FILM_GRAIN_*` overrides: it is how the CPU path gets
+    exercised on a machine that has a GPU, and how a user works around a driver
+    that misbehaves without waiting for a new build. Asking for a backend that is
+    not present warns and falls back to auto-detection rather than failing --
+    a bundled app that refuses to start is worse than a slow one.
+
+    Read per call rather than cached, matching `FILM_GRAIN_TILE_BUDGET_GB`: the
+    probes are the same ones this function already made on every call, so this
+    costs nothing new, and a test that sets the variable gets the behaviour it
+    asked for.
+    """
+    want = (os.environ.get("FILM_GRAIN_DEVICE") or "").strip().lower()
+    if want:
+        if want not in _DEVICES:
+            _warn(f"FILM_GRAIN_DEVICE={want!r} is not one of "
+                  f"{'/'.join(_DEVICES)}; detecting automatically.")
+        elif want == "cpu":
+            # Always available, and the only forced value that cannot fail.
+            return torch.device("cpu")
+        elif want == "cuda" and torch.cuda.is_available():
+            return torch.device("cuda")
+        elif want == "mps" and torch.backends.mps.is_available():
+            return torch.device("mps")
+        else:
+            _warn(f"FILM_GRAIN_DEVICE={want} was requested but that backend is "
+                  "not available; detecting automatically.")
+
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def _render_budget_bytes() -> int:
     """Total device-memory budget for a render, in bytes.
 
@@ -112,23 +231,23 @@ def _render_budget_bytes() -> int:
         except ValueError:
             pass
     total = 0
-    if torch.backends.mps.is_available():
-        try:
-            total = int(torch.mps.recommended_max_memory())
-        except Exception:
-            total = 0
-    elif torch.cuda.is_available():
+    # Keyed off the device the engine will actually use -- see `_resolve_device`
+    # for why asking the hardware directly is the wrong question here.
+    dev = _resolve_device().type
+    if dev == "cuda":
         try:
             total = int(torch.cuda.get_device_properties(0).total_memory)
+        except Exception:
+            total = 0
+    elif dev == "mps":
+        try:
+            total = int(torch.mps.recommended_max_memory())
         except Exception:
             total = 0
     if total <= 0:
         # CPU, or a backend that will not say. Derive from system RAM, which is
         # the real constraint there too.
-        try:
-            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        except (OSError, ValueError, AttributeError):
-            total = 4 << 30
+        total = _system_ram_bytes()
     return max(1 << 30, int(total * _RENDER_BUDGET_FRACTION))
 
 
@@ -199,11 +318,14 @@ def release_cache(dev: torch.device) -> None:
 
 
 def pick_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    """The device the engine renders on.
+
+    A thin wrapper over `_resolve_device` on purpose: sharing one implementation
+    is what guarantees the renderer and the memory budget cannot pick different
+    backends. Kept as its own name because it is the public one -- `runtime.py`,
+    `GrainEngine` and the test harness all call it.
+    """
+    return _resolve_device()
 
 
 def device_name(dev: torch.device) -> str:

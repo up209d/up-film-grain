@@ -1,0 +1,52 @@
+# Packaging config for the desktop shell.
+#
+# The Python side is not built here -- `tools/bundle.py` produces build/bundle/
+# and this only wraps it. Keeping them separate is what lets the same payload be
+# verified on its own (`launch.py --selftest`) before it is ever put in a .app.
+appId: com.up209d.filmgrain
+productName: Film Grain
+copyright: Copyright (C) Duc Duong. AGPL-3.0-or-later.
+
+directories:
+  output: ../dist
+  buildResources: ../build/bundle
+
+# Only the shell. Everything else arrives through extraResources, unpacked, so
+# the Python runtime is a real directory tree on disk rather than something inside
+# an asar archive that a subprocess could not execute.
+files:
+  - main.js
+  - splash.html
+  - package.json
+
+extraResources:
+  - from: ../build/bundle/payload
+    to: payload
+  - from: ../build/bundle/runtime
+    to: runtime
+  - from: ../build/bundle/licenses
+    to: licenses
+  - from: ../build/bundle/VERSION
+    to: VERSION
+
+# No native node modules, so skip the rebuild step entirely.
+npmRebuild: false
+# The runtime is already ~730MB of mostly-incompressible dylibs; asar-packing the
+# two files that remain buys nothing and makes them harder to inspect.
+asar: false
+
+mac:
+  category: public.app-category.photography
+  icon: ../build/bundle/icon.icns
+  target:
+    # tar.gz rather than zip, on purpose. Finder's Archive Utility stamps
+    # com.apple.quarantine onto everything it unpacks from a downloaded .zip, and
+    # Gatekeeper then refuses an unsigned app with "is damaged and can't be
+    # opened". `tar -xzf` does not, so most people never meet that wall.
+    - target: tar.gz
+      arch: [arm64]
+  # Unsigned for now. Signing here would try to sign every binary under
+  # Resources -- ~600MB of torch dylibs -- which is slow and can break torch;
+  # doing it properly needs a Developer ID, hardened-runtime entitlements for an
+  # embedded interpreter, and notarization.
+  identity: null

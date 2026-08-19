@@ -23,3 +23,16 @@ __pycache__/
 
 # CodeGraph index (local, regenerable with `codegraph init`)
 .codegraph/
+
+# Packaged desktop app. Produced by ./build.sh; carries a whole Python
+# runtime, so it is far too large to commit.
+dist/
+
+# Downloaded, hash-verified Python runtime archives. Regenerable, and large.
+.cache/
+
+# Electron's own dependencies.
+electron/node_modules/
+
+# Build mutex (see build.sh).
+.build.lock

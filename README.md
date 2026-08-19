@@ -9,7 +9,11 @@ Python/PyTorch image service behind a React UI, served as one process.
 
 ## Requirements
 
-* Python 3.13 (via `pipenv`) — PyTorch has no 3.14 wheels yet
+These are for *developing* it. A built app needs none of them — it carries its
+own Python, torch included.
+
+* Python 3.13 (via `pipenv`) — the version `Pipfile.lock` is resolved against,
+  and the version the shipped runtime uses
 * Node 24 (via `nvm`, pinned in `.nvmrc`)
 
 ## Setup
@@ -39,28 +43,80 @@ All accept `PORT=8001` and refuse to start with a clear message if the port is
 already held. `HOST=0.0.0.0 ./run.sh` exposes it on the network — there is no
 auth and no rate limiting, so only on a network you trust.
 
-## Build a distribution
+## Build the desktop app
 
 ```bash
-./build.sh                # compile into build/
-./build.sh --venv         # ...and install its dependencies (slow -- torch)
-./build.sh --clean        # wipe build/ first
-./build/run.sh            # run it
+./build.sh                  # -> dist/mac-arm64/Film Grain.app  (+ a .tar.gz)
+./build.sh --no-electron    # just the server bundle, in build/bundle/
+./build.sh --skip-runtime    # reuse the downloaded Python runtime (fast)
+./build.sh --skip-client     # reuse the existing web/dist
 ```
 
-`build/` is self-contained apart from the Python environment: the compiled
-client, the server package, a `requirements.txt` frozen from `Pipfile.lock`, a
-`VERSION` stamp, and its own launcher. Copy it anywhere.
+The result **needs nothing installed on the machine it runs on** — no Python, no
+pipenv, no node. Unpack it, double-click it, and it opens a window. Three stages,
+each runnable on its own:
 
-The launcher looks for an interpreter in this order: `$FILM_GRAIN_PYTHON`, then
-`build/.venv`, then `python3` on `PATH`. To reuse this project's environment
-instead of installing a second copy of torch:
+| stage | what it does | script |
+|---|---|---|
+| client | `web/` → `web/dist` | `npm run build` |
+| payload | server + client + presets + LUTs, plus a relocatable CPython 3.13 with torch installed into it | `tools/bundle.py` |
+| shell | wraps the payload in an Electron app that starts and stops it | `electron-builder` |
+
+The Electron window is pointed at `http://127.0.0.1:<port>` and the same FastAPI
+process serves the client, exactly as in the browser — so there is one client
+build, not two. The port is chosen by the OS at launch, so two copies never
+collide.
+
+Stage 2 verifies itself before stage 3 runs: it renders a frame through the real
+engine inside the bundle, and checks the preset and LUT counts against the source
+tree. To run that by hand:
 
 ```bash
-FILM_GRAIN_PYTHON=../.venv/bin/python ./build/run.sh
+build/bundle/runtime/bin/python3 build/bundle/payload/launch.py --selftest
 ```
 
-`./run-prod.sh` does that automatically.
+`launch.py` is also the plain server entrypoint, so the bundle is usable headless:
+
+```bash
+build/bundle/runtime/bin/python3 build/bundle/payload/launch.py --port 8000
+```
+
+### Targets
+
+`--target mac` is the only one that builds today. `windows` and `linux` print
+what they need and exit.
+
+| target | status | compute |
+|---|---|---|
+| `mac` | **builds** | Apple GPU (MPS), falling back to CPU at run time |
+| `windows` | not yet — needs building on Windows | one artifact for CPU *and* NVIDIA |
+| `linux` | not yet — needs building on Linux | same |
+
+The compute backend is decided **at run time, not at build time**: `pick_device()`
+takes CUDA if it is there, else MPS, else CPU, and the top bar shows which. That
+is why one Windows artifact can serve both CPU and NVIDIA machines — a CUDA build
+of torch runs fine with no NVIDIA GPU present.
+
+**AMD and Intel GPUs are not accelerated, and will not be.** PyTorch's ROCm wheels
+are Linux-only, and the only Windows route is a long-unmaintained DirectML build
+pinned to an old torch. Those machines take the ordinary Windows download and run
+on CPU. **Intel Macs** cannot be supported either: torch 2.2.2 was the last
+release to publish a macOS x86_64 wheel.
+
+### Opening it on another Mac
+
+The app is not code-signed, so macOS may refuse it with *"Film Grain is damaged
+and can't be opened"*. That is Gatekeeper reacting to the `com.apple.quarantine`
+attribute it stamps on anything downloaded, not a corrupt file. Any one of these
+clears it:
+
+* **Unpack with `tar`** rather than double-clicking the archive in Finder —
+  `tar -xzf 'Film Grain-0.1.0-arm64-mac.tar.gz'`. Finder's Archive Utility
+  propagates quarantine to everything it extracts; `tar` does not. This is why the
+  app ships as `.tar.gz`.
+* `xattr -dr com.apple.quarantine "/Applications/Film Grain.app"`
+* **System Settings → Privacy & Security → Open Anyway**, after the first refusal.
+
 
 ## Environment
 
@@ -71,10 +127,11 @@ FILM_GRAIN_PYTHON=../.venv/bin/python ./build/run.sh
 | `FILM_GRAIN_DEFAULT_PRESET` | `Stock` | preset the client opens on, and what Reset returns to |
 | `FILM_GRAIN_PRESETS` | `presets/` | read the preset library from elsewhere |
 | `FILM_GRAIN_DEFAULT_REFERENCE_MP` | unset | treat unstamped presets as authored at this size |
+| `FILM_GRAIN_LUTS` | `luts/` | read the LUT tree from elsewhere |
+| `FILM_GRAIN_DEVICE` | unset (auto) | force `cpu`, `mps` or `cuda`; an unavailable one warns and falls back to auto |
 | `FILM_GRAIN_TILE_BUDGET_GB` | half the device's recommended max | render memory pool; lower it to reproduce a smaller machine |
-| `FILM_GRAIN_GRAIN_CACHE_GB` | 25% of the pool | Global Grain texture cache cap |
+| `FILM_GRAIN_GRAIN_CACHE_GB` | 15% of the pool | Global Grain texture cache cap |
 | `FILM_GRAIN_CHECKPOINT_GB` | 15% of the pool | pipeline checkpoint cache; 0 disables it |
-| `FILM_GRAIN_PYTHON` | unset | interpreter for `build/run.sh` |
 
 **Production is the default**, because dev is the mode that needs holes in it:
 

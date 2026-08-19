@@ -140,8 +140,15 @@ luts/                 3D LUTs -- files, not code; same idea as presets/, but a
                         *tree* since 2026-08-09: an id is the path relative to
                         luts/ without the extension, and subfolders become
                         collapsed groups in the picker
+launch.py             the server entrypoint -- uvicorn programmatically, port
+                        binding, the parent watchdog and `--selftest`. The only
+                        way to start the server without a shell.
+electron/             the desktop shell: main.js owns the Python process
+tools/bundle.py       assembles build/bundle/ -- payload + a relocatable CPython
+tools/freeze.py       Pipfile.lock -> requirements/ (restores dropped markers)
 run.sh / dev.sh       production from source / hot-reload dev
-build.sh              compiles a distribution into build/
+run-prod.sh           rebuild the bundle and run it (uses its own interpreter)
+build.sh              client -> payload -> Electron app in dist/
 ```
 
 There are **no presets in the source any more.** `params.PRESETS` is gone;
@@ -177,6 +184,84 @@ client for free (`schema.py` uses `asdict`), but the client's own `Param` in
 `web/src/services/api.ts` is a **hand-written mirror**, so a field left out
 there is simply invisible — `spatial` has been shipping unread for exactly that
 reason.
+
+## It is a desktop app now (2026-08-19)
+
+`build.sh` produces `dist/mac-arm64/Film Grain.app`: Electron plus a **relocatable
+CPython 3.13 with torch inside it**, so the machine it lands on needs nothing
+installed. The old distribution was self-contained apart from Python, which is the
+part that mattered — `build/run.sh` hunted for an interpreter and, failing, told
+the recipient to pip-install ~700MB of torch.
+
+Four things worth knowing before touching any of it:
+
+* **Electron loads `http://127.0.0.1:<port>`, never `file://`.** Every call in
+  `services/api.ts` is a same-origin relative path, so serving the client off disk
+  would break all of them and need `base: "./"` in the Vite config. There is one
+  client build, not two, and **no Electron-aware code in `web/src` at all** — the
+  downloads, the navigation guards and the quit guard all live in
+  `electron/main.js`.
+* **A portable interpreter, not a frozen binary.** `client.py:18` resolves the
+  client from `__file__` and *raises at import* without it, and nothing here knows
+  about `sys._MEIPASS`. PyInstaller `--onefile` would die on that line. Keeping a
+  real directory tree is why all three data roots resolve unchanged and no
+  path-handling code moved.
+* **The compute backend is a run-time decision, not a build-time one.**
+  `pick_device()` already did this and `/api/health` already reported it; one
+  artifact adapts to the hardware. That is why a future Windows build ships CUDA
+  wheels and still works on machines with no NVIDIA GPU. AMD/Intel GPUs are CPU
+  only, permanently: ROCm is Linux-only and the Windows DirectML route is an
+  unmaintained build pinned to an old torch. Intel Macs cannot be supported —
+  torch 2.2.2 was the last macOS x86_64 wheel.
+* **`tools/bundle.py` fails the build if a shipped file contains the build
+  machine's path.** Keep that check. It caught two real leaks that nothing else
+  would have: pip's console-script wrappers (absolute shebangs, broken on arrival)
+  and stdlib `.pyc` written by the import machinery during `compileall`, which
+  ignores `-s`.
+
+`build/` still holds the *previous* build system's output and is deliberately left
+alone; everything new is under `build/bundle/` and `dist/`.
+
+**The window has no title bar** (`titleBarStyle: "hidden"`), so the app's own
+`.bar` *is* the title bar and there is no strip of system grey above it. Three
+numbers are coupled by that and they are in two different files, so changing one
+alone is a visible bug rather than a subtle one:
+
+1. `SEAMLESS_CSS` in `electron/main.js` pads `.bar` to clear the traffic lights.
+2. `trafficLightPosition` in the same file centres the lights **in the bar's
+   measured height** — which changes the moment that padding does.
+3. `.bar-stand-in` in `electron/splash.html` reproduces the bar at the same
+   height, so the top strip does not change shade when the app replaces the
+   splash.
+
+The heights are *measured in the running window*, not derived from the CSS: the
+controls set the line box, so `.bar` is 45.84px with the injected padding where
+reading `bar.css` suggests less. Two of those numbers were wrong first time round
+for exactly that reason. `SEAMLESS_CSS` also needs `!important` — `bar.css` sets
+the `padding` shorthand at the same specificity, and an injected stylesheet does
+not reliably win that tie; measured, the drag region applied while the padding was
+silently overridden back to 14px.
+
+It is injected from the main process rather than written into `web/src` on
+purpose: 90px of padding and a drag region are *wrong* in a browser, and one
+client build serving both is the property that keeps the browser and desktop
+versions honest. It is also scoped to `http(s)` URLs, because the splash is a
+second document that had used the same `.bar` class name and the injection
+stretched its progress bar to 250x17px.
+
+**`backgroundColor` can never match the page on a P3 display, so the window is
+not shown until it has painted.** The window background is filled in by AppKit
+and the page by Chromium, and the two do not render the same hex the same way:
+`--bg` #0d0e10 comes out **#111215 from AppKit and #151617 from the renderer**.
+Any frame where the web contents does not yet cover the window therefore shows
+bands of slightly-wrong dark at the top and bottom -- which is exactly what a
+screenshot showed, while `capturePage()` of the same splash was provably uniform,
+because the page was never the problem. `show: false` plus
+`win.once("ready-to-show", …)` removes the exposure instead of trying to
+colour-match two different painters. Do not "simplify" that back to `show: true`.
+
+The corollary is worth remembering for any future window work: an on-screen
+colour problem that does not reproduce in `capturePage()` is not in the page.
 
 ## Pipeline order (a section added at the top 2026-08-16)
 

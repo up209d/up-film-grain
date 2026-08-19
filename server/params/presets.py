@@ -68,7 +68,13 @@ def load_presets() -> list[dict]:
 
     for f in files:
         try:
-            raw = json.loads(f.read_text())
+            # Explicit encoding rather than the locale's. A preset whose name
+            # or author credit carries an accent would otherwise raise
+            # UnicodeDecodeError under a cp1252 default -- and that is a
+            # ValueError, so the handler below catches it and the preset
+            # quietly ceases to exist on one platform and not another.
+            # `lut.add_upload` already pins utf-8; this is the same decision.
+            raw = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError) as e:
             # Say so rather than silently omitting it -- a typo in one file
             # should not make a preset quietly cease to exist.

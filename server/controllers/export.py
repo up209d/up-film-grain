@@ -85,6 +85,41 @@ def export(body: dict = Body(...)) -> dict:
     return {"job": job_id}
 
 
+@router.get("/exports")
+def exports_active() -> dict:
+    """The exports that have not finished yet.
+
+    Added for the desktop shell's quit guard, which needs to answer "is anything
+    still rendering?" before letting the window close. Nothing else could answer
+    it: `/api/export/{job_id}` needs an id the shell never sees, since the
+    renderer is the one that starts the job.
+
+    That guard matters more than it looks. The worker is a `daemon=True` thread
+    (see `export` above), so process exit kills an in-flight export with no drain
+    and no error. In a browser tab that is a shrug -- the tab is still there. As a
+    desktop app with a close button it is silent data loss, and the user's only
+    clue is a file that never appears.
+
+    Read-only and cheap, so it is safe to poll. `list()` first rather than
+    iterating `JOBS` live: a concurrent POST can insert while this runs, and
+    `dict` iteration would raise rather than merely race.
+    """
+    live = [j for j in list(JOBS.values())
+            if j.get("status") in ("queued", "rendering")]
+    return {
+        "active": len(live),
+        "jobs": [
+            {
+                "id": j.get("id"),
+                "status": j.get("status"),
+                "progress": j.get("progress", 0.0),
+                "filename": j.get("filename"),
+            }
+            for j in live
+        ],
+    }
+
+
 @router.get("/export/{job_id}")
 def export_status(job_id: str) -> dict:
     job = JOBS.get(job_id)

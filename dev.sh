@@ -22,9 +22,16 @@ export PIPENV_VENV_IN_PROJECT=1
 # This is what opens CORS for Vite's origin and enables /docs.
 export APP_ENV=development
 # Homebrew and Laravel Herd sit ahead of nvm in PATH on this machine, so
-# `nvm use` alone does not switch node. Prepend the pinned version explicitly.
-NVM_BIN="$HOME/.nvm/versions/node/v24.15.0/bin"
-[ -d "$NVM_BIN" ] && export PATH="$NVM_BIN:$PATH"
+# `nvm use` alone does not switch node. Prepend the right version explicitly --
+# chosen from .nvmrc rather than hardcoded, because a pinned patch version ties
+# the script to one machine and then silently falls through to whatever node
+# happens to be on PATH everywhere else, which here is a different major.
+NVM_WANT="$(tr -d '[:space:]' < .nvmrc 2>/dev/null || true)"
+if [ -n "$NVM_WANT" ] && [ -d "$HOME/.nvm/versions/node" ]; then
+  NVM_DIR_MATCH="$(ls -1d "$HOME/.nvm/versions/node/v$NVM_WANT" 2>/dev/null | tail -1 || true)"
+  [ -n "$NVM_DIR_MATCH" ] || NVM_DIR_MATCH="$(ls -1d "$HOME/.nvm/versions/node/v$NVM_WANT."* 2>/dev/null | sort -V | tail -1 || true)"
+  [ -n "$NVM_DIR_MATCH" ] && export PATH="$NVM_DIR_MATCH/bin:$PATH"
+fi
 
 pipenv run uvicorn server.main:app --host 127.0.0.1 --port "$PORT" --reload &
 BACK=$!

@@ -1,0 +1,48 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Film Grain</title>
+<style>
+  /* Deliberately self-contained and tiny: this has to render before anything
+     else exists, so it cannot depend on the app's stylesheet or the server. */
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    /* Exactly base.css's --bg and --text. The splash is on screen for a second or
+       two before the app loads, so any difference reads as a flash. */
+    display: grid; place-items: center;
+    background: #1d1e22; color: #e6e8ec;
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  .wrap { text-align: center; }
+  h1 { font-size: 15px; font-weight: 600; margin: 0 0 6px; letter-spacing: .01em; }
+  p { margin: 0; opacity: .6; }
+  /* Named `progress`, not `bar`. The app's top bar is `.bar`, and the shell
+     injects rules for it -- which landed here too and stretched this 160x2px line
+     into a 250x17px block. Two documents, one class name, one of them styled from
+     outside: worth not repeating. */
+  .progress {
+    width: 160px; height: 2px; margin: 18px auto 0; border-radius: 2px;
+    background: color-mix(in srgb, currentColor 15%, transparent);
+    overflow: hidden;
+  }
+  .progress i {
+    display: block; width: 40%; height: 100%; border-radius: 2px;
+    background: #d8a05a; opacity: .9;   /* --accent */
+    animation: slide 1.1s ease-in-out infinite;
+  }
+  @keyframes slide {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(250%); }
+  }
+  @media (prefers-reduced-motion: reduce) { .progress i { animation: none; opacity: .3; width: 100%; } }
+</style>
+<!-- The app's own top bar, stood in for. Without it the top 46px of the window is
+     --bg while loading and --panel once the app appears, so the strip under the
+     traffic lights visibly changes shade at the handover -- which is the one place
+     a seamless title bar makes such a change obvious. -->
+<div class="wrap">
+  <h1>Film Grain</h1>
+  <p id="status">Starting the render engine…</p>
+  <div class="progress"><i></i></div>
+</div>

@@ -1,216 +1,140 @@
 #!/usr/bin/env bash
-# Compile a production distribution into build/.
+# Build the Film Grain desktop app: a single self-contained artifact.
 #
-# The output is self-contained apart from the Python environment: server code,
-# the compiled client, a frozen requirements.txt and a launcher. Copy build/
-# anywhere and run its own ./run.sh.
+# Three stages, and each is a separate script so the middle one can be run and
+# verified on its own:
 #
-#   ./build.sh            assemble the distribution
-#   ./build.sh --venv     also create build/.venv and install into it (slow --
-#                         torch is a large download)
-#   ./build.sh --clean    remove build/ first
+#   1. the client        web/  ->  web/dist         (npm run build)
+#   2. the payload       everything the server needs, plus its own Python
+#                        runtime with torch inside it   (tools/bundle.py)
+#   3. the shell         an Electron app wrapping stage 2  (electron-builder)
+#
+# The result needs nothing installed on the machine it lands on -- no Python, no
+# pipenv, no node.
+#
+#   ./build.sh                        build for this platform (mac)
+#   ./build.sh --target mac           the same, said explicitly
+#   ./build.sh --no-electron          stages 1-2 only: the server bundle
+#   ./build.sh --skip-client          reuse the existing web/dist
+#   ./build.sh --skip-runtime         reuse build/bundle/runtime (fast iteration)
+#
+# Windows and Linux are not supported yet and say so; tools/bundle.py records
+# what they will need.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-OUT="build"
-WITH_VENV=0
-CLEAN=1
+TARGET="mac"
+WITH_ELECTRON=1
+SKIP_CLIENT=0
+SKIP_RUNTIME=0
+
 for arg in "$@"; do
   case "$arg" in
-    --venv)  WITH_VENV=1 ;;
-    --clean) CLEAN=1 ;;
-    --out=*) OUT="${arg#--out=}" ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    --target=*)    TARGET="${arg#--target=}" ;;
+    --target)      echo "use --target=NAME" >&2; exit 2 ;;
+    mac|windows|linux) TARGET="$arg" ;;
+    --no-electron) WITH_ELECTRON=0 ;;
+    --skip-client) SKIP_CLIENT=1 ;;
+    --skip-runtime) SKIP_RUNTIME=1 ;;
+    -h|--help)     sed -n '2,25p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 2 ;;
   esac
 done
 
-say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
+say()  { printf '\033[1m==>\033[0m %s\n' "$*"; }
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-[ "$CLEAN" = 1 ] && { say "Removing $OUT/"; rm -rf "${OUT:?}"; }
+# One build at a time. Two concurrent runs share build/bundle/ and dist/, and the
+# failure is not obvious when it happens: one process removes the output directory
+# while the other is copying into it, and electron-builder reports it as
+# `ENOENT ... copyfile` naming a *source* file that is present and fine. mkdir is
+# atomic, which is why it is the lock rather than a -f test.
+LOCK=".build.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  die "another build is already running (delete $LOCK if it is stale)"
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
 
-# ---------------------------------------------------------------- client --
-# Homebrew and Laravel Herd sit ahead of nvm in PATH on this machine, so
-# `nvm use` alone does not switch node. Prepend the pinned version explicitly.
-NVM_BIN="$HOME/.nvm/versions/node/v24.15.0/bin"
-[ -d "$NVM_BIN" ] && export PATH="$NVM_BIN:$PATH"
+# Gate unsupported targets before doing any work. The message lives in exactly one
+# place -- tools/bundle.py -- so both entry points say the same thing; it exits 2.
+case "$TARGET" in
+  mac) ;;
+  windows|linux) python3 tools/bundle.py --target "$TARGET" || exit $? ;;
+  *) die "unknown target: $TARGET (mac, windows, linux)" ;;
+esac
 
-command -v node >/dev/null || { echo "node not found on PATH" >&2; exit 1; }
-say "Building client with node $(node --version)"
-
-cd web
-[ -d node_modules ] || {
-  say "Installing client dependencies"
-  # npm blocks postinstall scripts by default here, and vite will not build
-  # without esbuild's.
-  npm install
-  npm approve-scripts esbuild 2>/dev/null || true
+# ---------------------------------------------------------------- 1. client --
+# node from nvm, chosen by .nvmrc rather than a hardcoded patch version. The old
+# script pinned v24.15.0 by absolute path, which tied the build to one machine and
+# silently fell through to whatever node was on PATH anywhere else -- here that is
+# v26, a different major than the project pins.
+setup_node() {
+  local want best
+  want="$(tr -d '[:space:]' < .nvmrc 2>/dev/null || true)"
+  if [ -n "$want" ] && [ -d "$HOME/.nvm/versions/node" ]; then
+    # Exact version first, then the newest matching that major/minor prefix.
+    best="$(ls -1d "$HOME/.nvm/versions/node/v$want" 2>/dev/null | tail -1 || true)"
+    [ -n "$best" ] || best="$(ls -1d "$HOME/.nvm/versions/node/v$want."* 2>/dev/null | sort -V | tail -1 || true)"
+    [ -n "$best" ] && export PATH="$best/bin:$PATH"
+  fi
+  command -v node >/dev/null || die "node not found on PATH (and none in ~/.nvm matching .nvmrc)"
+  local have
+  have="$(node --version)"
+  if [ -n "$want" ] && [ "${have#v}" != "${want}" ] && [ "${have%%.*}" != "v$want" ]; then
+    printf '\033[33mwarning:\033[0m .nvmrc asks for node %s, using %s\n' "$want" "$have" >&2
+  fi
+  say "node $have"
 }
-npm run build
-cd ..
 
-[ -f web/dist/index.html ] || { echo "Client build produced no index.html" >&2; exit 1; }
-
-# ---------------------------------------------------------------- assemble --
-say "Assembling $OUT/"
-rm -rf "${OUT:?}/server" "${OUT:?}/web" "${OUT:?}/presets" "${OUT:?}/luts"
-mkdir -p "$OUT/web"
-
-# Server package only -- no tests, no dev scripts, no client sources.
-cp -R server "$OUT/server"
-find "$OUT/server" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
-cp -R web/dist "$OUT/web/dist"
-
-# Licence text. The AGPL obliges whoever distributes a copy to convey this with
-# it (section 4), and that is whoever runs this script -- not just whoever
-# pushes the repo. A distribution without these two files is a breach, so they
-# are copied before anything optional and the build fails if they are missing
-# rather than quietly shipping unlicensed.
-for f in LICENSE NOTICE; do
-  [ -f "$f" ] || { echo "$f is missing -- refusing to build an unlicensed distribution" >&2; exit 1; }
-  cp "$f" "$OUT/$f"
-done
-say "Bundled LICENSE and NOTICE"
-
-# Presets are data the server reads at runtime, so they have to travel with it.
-# The directory is created even when empty: the server tolerates a missing one,
-# but shipping the folder is what makes it obvious where presets go.
-mkdir -p "$OUT/presets"
-if compgen -G "presets/*.json" > /dev/null; then
-  cp presets/*.json "$OUT/presets/"
-  say "Bundled $(ls -1 presets/*.json | wc -l | tr -d ' ') preset(s)"
+if [ "$SKIP_CLIENT" = 1 ]; then
+  [ -f web/dist/index.html ] || die "--skip-client but web/dist/index.html is missing"
+  say "client: reusing web/dist"
 else
-  say "No presets to bundle (presets/ is empty)"
+  setup_node
+  cd web
+  [ -d node_modules ] || {
+    say "client: installing dependencies"
+    npm install
+    # npm blocks postinstall scripts here and vite will not build without
+    # esbuild's.
+    npm approve-scripts esbuild 2>/dev/null || true
+  }
+  say "client: building"
+  npm run build
+  cd ..
+  [ -f web/dist/index.html ] || die "the client build produced no index.html"
 fi
 
-# 3D LUTs, same reasoning: runtime data the server reads by name, so a
-# distribution without the folder has an empty LUT menu and a preset that names
-# a .cube quietly grades nothing. The folder is created either way so it is
-# obvious where LUTs go. These are large -- a 64-cube is ~7MB of text -- so the
-# count and total are reported rather than left to surprise you.
-#
-# Walked, not globbed. `luts/` became a tree on 2026-08-09 and `cp luts/*.cube`
-# silently dropped every subfolder -- the distribution shipped 7 of 303 LUTs,
-# the menu showed the seven at the root and none of the folders, and nothing
-# anywhere said so. A LUT's id *is* its path relative to `luts/`, so the layout
-# has to survive the copy or every nested id in a preset stops resolving.
-mkdir -p "$OUT/luts"
-lut_n=0
-while IFS= read -r f; do
-  rel="${f#luts/}"
-  mkdir -p "$OUT/luts/$(dirname "$rel")"
-  cp "$f" "$OUT/luts/$rel"
-  lut_n=$((lut_n + 1))
-done < <(find luts -type f -name '*.cube')
+# --------------------------------------------------------------- 2. payload --
+say "payload: assembling (this downloads a Python runtime the first time)"
+BUNDLE_ARGS=(--target "$TARGET")
+[ "$SKIP_RUNTIME" = 1 ] && BUNDLE_ARGS+=(--skip-runtime)
+python3 tools/bundle.py "${BUNDLE_ARGS[@]}"
 
-# The LUT tree carries third-party data: luts/gmic/ is Pat David's film
-# emulation set under CC BY-SA 4.0, and that licence requires the credit and the
-# licence link to travel WITH the data. The walk above is '-name *.cube', so it
-# skips the very file that makes the redistribution lawful. Copy the licence
-# notices separately rather than widening the filter -- lut_n has to stay a
-# count of LUTs, and `server/lut.py` selects on the .cube suffix anyway, so a
-# stray non-LUT in the tree is ignored by the picker.
-while IFS= read -r f; do
-  rel="${f#luts/}"
-  mkdir -p "$OUT/luts/$(dirname "$rel")"
-  cp "$f" "$OUT/luts/$rel"
-done < <(find luts -type f \( -name 'LICENSE' -o -name 'NOTICE' -o -name 'README.md' \))
-
-if [ "$lut_n" -gt 0 ]; then
-  say "Bundled $lut_n LUT(s) in $(find "$OUT/luts" -type d | wc -l | tr -d ' ') folder(s), $(du -sh "$OUT/luts" | cut -f1)"
-else
-  say "No LUTs to bundle (luts/ is empty)"
+if [ "$WITH_ELECTRON" = 0 ]; then
+  say "done: build/bundle (--no-electron)"
+  echo
+  echo "  Run the server directly:"
+  echo "    build/bundle/runtime/bin/python3 build/bundle/payload/launch.py"
+  exit 0
 fi
 
-# Freeze dependencies from the lock file so the distribution pins exactly what
-# was tested, rather than re-resolving on the target.
-say "Freezing dependencies"
-export PIPENV_VENV_IN_PROJECT=1
-if pipenv requirements > "$OUT/requirements.txt" 2>/dev/null; then
-  :
-else
-  # Older pipenv spells it differently; fall back rather than shipping nothing.
-  pipenv lock -r > "$OUT/requirements.txt"
-fi
+# ----------------------------------------------------------------- 3. shell --
+[ -d electron/node_modules ] || {
+  setup_node
+  say "shell: installing Electron"
+  (cd electron && npm install --no-audit --no-fund)
+}
+setup_node
+say "shell: packaging"
+(cd electron && npx --no-install electron-builder \
+    --config electron-builder.yml --publish never)
 
-python3 - "$OUT" <<'PY'
-import json, pathlib, sys, datetime
-out = pathlib.Path(sys.argv[1])
-pkg = json.loads(pathlib.Path("web/package.json").read_text())
-(out / "VERSION").write_text(
-    f"film-grain {pkg.get('version', '0.0.0')}\n"
-    f"built {datetime.datetime.now().isoformat(timespec='seconds')}\n"
-)
-PY
+say "done"
+ls -1 dist/*.tar.gz 2>/dev/null | sed 's/^/    /' || true
+du -sh dist/*.app dist/mac*/*.app 2>/dev/null | sed 's/^/    /' || true
 
-cat > "$OUT/run.sh" <<'LAUNCH'
-#!/usr/bin/env bash
-# Production launcher for a built distribution.
-#
-#   ./run.sh              serve on 127.0.0.1:8000
-#   PORT=9000 ./run.sh    another port
-#   HOST=0.0.0.0 ./run.sh expose on the network (no auth -- see README)
-set -euo pipefail
-cd "$(dirname "$0")"
-
-PORT="${PORT:-8000}"
-HOST="${HOST:-127.0.0.1}"
-
-if holder=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null) && [ -n "$holder" ]; then
-  echo "Port $PORT is already in use by PID(s): $(echo "$holder" | tr '\n' ' ')" >&2
-  ps -o pid=,command= -p $holder 2>/dev/null >&2 || true
-  echo "Free it with:  kill $(echo "$holder" | tr '\n' ' ')" >&2
-  echo "Or use another port:  PORT=8001 ./run.sh" >&2
-  exit 1
-fi
-
-# Interpreter: an explicit one, else a venv beside this script, else whatever
-# python3 is on PATH -- which only works if the deps are installed there.
-if [ -n "${FILM_GRAIN_PYTHON:-}" ]; then
-  PY="$FILM_GRAIN_PYTHON"
-elif [ -x ".venv/bin/python" ]; then
-  PY=".venv/bin/python"
-else
-  PY="$(command -v python3 || true)"
-fi
-
-[ -n "$PY" ] || { echo "No python3 found." >&2; exit 1; }
-
-if ! "$PY" -c "import fastapi, torch, uvicorn" 2>/dev/null; then
-  cat >&2 <<MSG
-Dependencies are missing from: $PY
-
-Create an environment for this distribution:
-  python3 -m venv .venv
-  .venv/bin/pip install -r requirements.txt
-
-Or point at an existing one:
-  FILM_GRAIN_PYTHON=/path/to/python ./run.sh
-MSG
-  exit 1
-fi
-
-export APP_ENV=production
-echo "film-grain -> http://${HOST}:${PORT}   ($(cat VERSION | head -1))"
-exec "$PY" -m uvicorn server.main:app --host "$HOST" --port "$PORT" "$@"
-LAUNCH
-chmod +x "$OUT/run.sh"
-
-# ------------------------------------------------------------------- venv --
-if [ "$WITH_VENV" = 1 ]; then
-  say "Creating $OUT/.venv (torch is a large download)"
-  python3 -m venv "$OUT/.venv"
-  "$OUT/.venv/bin/pip" install --upgrade pip >/dev/null
-  "$OUT/.venv/bin/pip" install -r "$OUT/requirements.txt"
-fi
-
-say "Done: $OUT/"
-du -sh "$OUT" 2>/dev/null | sed 's/^/    /'
-echo
-echo "  Run it:   ./$OUT/run.sh   (or: cd $OUT && ./run.sh)"
-[ "$WITH_VENV" = 1 ] || cat <<NEXT
-  First run needs an environment:
-      cd $OUT && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-  or reuse this project's:
-      FILM_GRAIN_PYTHON=../.venv/bin/python ./$OUT/run.sh
-NEXT
+# Note: build/ still holds the previous build system's output (build/server,
+# build/run.sh and friends). It is left alone deliberately -- it is what the
+# current production process serves -- and can be deleted once this app is
+# confirmed working. The new artifacts are entirely under build/bundle/ and dist/.

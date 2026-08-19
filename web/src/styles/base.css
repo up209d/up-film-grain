@@ -1,7 +1,12 @@
 /* Custom properties, the reset, and the page itself. */
 
 :root {
-  --bg: #0d0e10;
+  /* Raised from #0d0e10 on 2026-08-20. At near-black this display showed
+     horizontal banding across a flat fill -- see docs/environment.md; it is a
+     compositor/display artifact, not markup, and a slightly lighter value
+     does not sit on it. Kept in step with the desktop shell's window
+     background and splash, which must match this exactly. */
+  --bg: #111215;
   --panel: #16181c;
   --panel2: #1d2026;
   --line: #2a2e36;

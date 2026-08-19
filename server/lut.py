@@ -369,7 +369,15 @@ def get(lut_id: str | None) -> Lut | None:
     if st.st_size > MAX_LUT_BYTES:
         return None
     try:
-        text = path.read_text(errors="replace")
+        # utf-8 explicitly, matching `add_upload`: the same .cube must decode
+        # identically whether it was dropped in `luts/` or uploaded through the
+        # API, and the locale default (cp1252 on Windows) would mangle a
+        # non-ASCII TITLE in one path but not the other. `errors="replace"`
+        # stays -- a cube body is numeric, so a stray byte should cost a
+        # character rather than the whole LUT. Text mode also keeps universal
+        # newlines, which `luts/ClassicNegative.cube` (CRLF) relies on: do not
+        # "tidy" this into read_bytes().decode().
+        text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     try:
