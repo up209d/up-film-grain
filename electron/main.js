@@ -67,12 +67,53 @@ const SEAMLESS_CSS = `
        asked for after seeing it. padding-top needs the same treatment for the
        same reason -- it is the other half of that shorthand. */
     padding-left: 90px !important;
-    /* padding-top: 10px !important; */
+    padding-top: 8px !important;
     -webkit-app-region: drag;
   }
   .bar button, .bar a, .bar input, .bar select, .bar label,
   .bar [role="button"], .bar [tabindex] {
     -webkit-app-region: no-drag;
+  }
+
+  /* Pad the right panel */
+  .panel {
+    margin-right: 6px !important;
+    padding-right: 12px !important;
+  }
+  .panel::after {
+    content: '';
+    display: block;
+    position: absolute;
+    width: 6px;
+    height: 100%;
+    top: 0;
+    right: 0;
+    background: var(--panel);
+    pointer-events: none;
+    z-index: -1;
+  }
+
+  /* 1. Target the entire page or specific scrollable containers */
+  ::-webkit-scrollbar {
+    width: 6px;  /* Very thin vertical bar */
+    height: 6px; /* Very thin horizontal bar */
+  }
+
+  /* 2. Make the track completely transparent so it's seamless */
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  /* 3. Style the handle with a subtle color that matches dark themes */
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.15); /* Semi-transparent white */
+    border-radius: 10px;
+    transition: background 0.2s ease;
+  }
+
+  /* 4. Make it slightly more visible when hovered */
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.35);
   }
 `;
 
