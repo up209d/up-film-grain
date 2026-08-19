@@ -84,6 +84,8 @@ def load_presets() -> list[dict]:
             values = raw
         ref = raw.get("reference_mp") or DEFAULT_REFERENCE_MP
         lut = raw.get("lut")
+        author = raw.get("author")
+        author_link = raw.get("author_link")
         out.append({
             "name": f.stem,
             "values": sanitize(values),
@@ -96,5 +98,17 @@ def load_presets() -> list[dict]:
             # different photo. Absent in older files -> no scaling, which is
             # the pre-existing behaviour rather than a guess.
             "reference_mp": float(ref) if isinstance(ref, (int, float)) and ref else None,
+            # Who made the look, and where to find them. Carried through rather
+            # than dropped because the client writes them back out when the
+            # preset is saved to a file again -- every shipped preset has
+            # carried these two keys since the library was written, and a
+            # round trip through "Save to file..." used to strip them, so the
+            # attribution survived exactly until someone tweaked one slider.
+            # Not sanitised beyond the type check: they are free text, and the
+            # only thing the app does with them is put them back.
+            "author": author if isinstance(author, str) and author else None,
+            "author_link": (
+                author_link if isinstance(author_link, str) and author_link else None
+            ),
         })
     return out

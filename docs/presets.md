@@ -120,3 +120,40 @@ Two things about how it is plumbed:
 It also makes the on/off switch live for a preset that records no size at all --
 a hand-set factor needs no reference to scale against, so the "n/a" state now
 only applies when both are absent.
+
+## Attribution survives a re-save (2026-08-19)
+
+Every file in `presets/` has carried `author` and `author_link` since the
+library was written, and until now nothing read them. `load_presets()` builds
+its own dict rather than passing the parsed file through, so the two keys were
+dropped at the door; "Save to file…" then wrote a fresh object from the client's
+state, which had never been told about them. The result is that the credit on a
+shipped preset survived exactly until someone nudged one slider and saved — the
+new file was the same look with nobody's name on it.
+
+They are carried now, along the same path `lut` takes and for the same reason:
+a credit is not a quantity, so it cannot be a value in the schema.
+`load_presets` → `Preset` (the hand-written mirror in `api.ts`, where a field
+left out is simply invisible) → `useValues.author` → `usePresetFile.savePreset`.
+
+Three details worth knowing:
+
+* **It is one `Author` object, not two loose strings.** A link with nobody's
+  name on it is not attribution, so `presetAuthor()` drops a lone `author_link`
+  and the whole credit is null or complete. Loading a file is the other
+  direction of the same rule: a name with no link is still a name.
+* **A look with no author writes no author keys**, rather than `"author": null`
+  — the file shape a preset saved from scratch produces is the one the format
+  had before this existed. It is spread into the object rather than assigned,
+  and it sits directly after `name`, so a re-saved shipped preset diffs against
+  the original on the values alone.
+* **It is in the undo `Snapshot`.** `applyPreset` sets it *including its
+  absence*, the way it already did for the LUT, so picking an unattributed
+  preset clears the previous one's name instead of leaving it to be written out
+  over someone else's look. Undo has to put that back or a step backwards lands
+  on a state the user never had.
+
+`tests/checks/presets.py` asserts the server half — every file that names an
+author reports one, and the link comes with it. The client's write-back has no
+automated check; it is a hand test (pick a preset, Save to file…, look at the
+first four keys).

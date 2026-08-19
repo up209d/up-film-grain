@@ -6,6 +6,8 @@ the same code, in the same order -- see `docs/testing.md`.
 
 from __future__ import annotations
 
+import json
+
 from server import params as P
 from tests.harness import Ctx, check, suite
 
@@ -77,4 +79,32 @@ def run(cx: Ctx) -> None:
         "no count between 0 and 1", not dead,
         "all counts are 0 or a real number of marks" if not dead
         else ", ".join(f"{n}.{k}={x}" for n, k, x in dead),
+    )
+
+    # -- 3e. attribution survives the trip to the client --------------------
+    # Every shipped preset file names an author, and the client writes those
+    # names back out when a look is saved to a file again. It can only write
+    # what it was sent, and `load_presets` builds its own dict rather than
+    # passing the parsed file through -- so a key it forgets is a credit that
+    # disappears the moment someone nudges a slider and re-saves. That is
+    # invisible from the render, which is why it is asserted here.
+    print("\npreset attribution (the credit has to reach the client)")
+    on_disk = 0
+    for f in P.PRESET_DIR.glob("*.json"):
+        try:
+            on_disk += bool(json.loads(f.read_text()).get("author"))
+        except (OSError, ValueError):
+            pass
+    loaded = P.load_presets()
+    named = [q for q in loaded if q["author"]]
+    check(
+        "author reaches the schema", len(named) == on_disk and on_disk > 0,
+        f"{len(named)} of {len(loaded)} presets report an author, "
+        f"{on_disk} name one on disk",
+    )
+    check(
+        "the link comes with it",
+        all(q["author_link"] for q in named),
+        f"{sum(1 for q in named if q['author_link'])} of {len(named)} "
+        "attributed presets carry author_link",
     )

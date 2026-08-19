@@ -30,6 +30,12 @@ export interface Preset {
    *  them: a LUT is a resource identified by name, not a quantity, so it cannot
    *  be a number in the schema — see server/lut.py. */
   lut: string | null;
+  /** Who dialled the look in, and where to find them. Free text, both null
+   *  when the file does not say. Declared here for the reason `toggle` is: this
+   *  interface is a hand-written mirror of what the server sends, so a field
+   *  left out is invisible no matter what arrives. */
+  author: string | null;
+  author_link: string | null;
 }
 
 /** A 3D LUT the server can apply: either a `.cube` under `luts/` or one

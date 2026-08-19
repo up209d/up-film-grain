@@ -51,12 +51,18 @@ const PREVIEW_QUALITY = [
   { value: "3", label: "3× supersampled (slowest)" },
 ];
 
+/** Where the Quality menu opens. 1x on request 2026-08-19 -- the preview is
+ *  the frame you dial the look on, and a 1:1 render of it is both the cheapest
+ *  and the closest to what a Full size export puts in the file. Anyone who
+ *  wants the supersampled screen still has the menu; this is only the start. */
+const PREVIEW_QUALITY_DEFAULT = 1;
+
 export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [meta, setMeta] = useState<ImageMeta | null>(null);
 
-  const [supersample, setSupersample] = useState(2);
+  const [supersample, setSupersample] = useState(PREVIEW_QUALITY_DEFAULT);
   const [compare, setCompare] = useState<Compare>("overlay");
   const [split, setSplit] = useState(1); // 1 = fully processed
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
@@ -145,8 +151,10 @@ export default function App() {
     meta,
     referenceMp: v.referenceMp,
     lut: v.lut,
+    author: v.author,
     setReferenceMp: v.setReferenceMp,
     setLut: v.setLut,
+    setAuthor: v.setAuthor,
     applyValues: v.applyValues,
     onError: setError,
     onNotice: setNotice,

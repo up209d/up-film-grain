@@ -48,10 +48,10 @@
     "highlight_falloff": 0.3,
     "highlight_drop": 0.9,
     "shadow_drop": 0.4,
-    "seed": 6810,
+    "seed": 3352,
     "edge_bias": 0.5,
     "smooth_guard": 0.7,
-    "highpass_radius": 1,
+    "highpass_radius": 0.5,
     "edge_sensitivity": 1,
     "edge_chroma_sense": 1,
     "edge_soften": 0.5,
@@ -81,7 +81,7 @@
     "halation_blue_falloff": 0.25,
     "halation_blue_shift": 0,
     "halation_sat": 0.39,
-    "aa_strength": 0.25,
+    "aa_strength": 0.75,
     "aa_radius": 2.55,
     "aa_edge_only": 0,
     "global_blend": 0,
@@ -121,7 +121,7 @@
     "leak_feather": 96,
     "leak_variation": 0.33,
     "leak_hue": 0.5,
-    "texture_seed": 4843,
+    "texture_seed": 3421,
     "master_opacity": 1
   }
 }

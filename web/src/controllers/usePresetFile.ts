@@ -9,7 +9,7 @@ import { useRef } from "react";
 
 import { PRESET_FORMAT } from "../models/constants";
 import { coerceValues } from "../models/paramState";
-import type { Values } from "../models/types";
+import type { Author, Values } from "../models/types";
 import type { ImageMeta, Schema } from "../services/api";
 
 export function usePresetFile(opts: {
@@ -18,8 +18,10 @@ export function usePresetFile(opts: {
   meta: ImageMeta | null;
   referenceMp: number | null;
   lut: string | null;
+  author: Author | null;
   setReferenceMp: (v: number | null) => void;
   setLut: (v: string | null) => void;
+  setAuthor: (v: Author | null) => void;
   applyValues: (v: Values) => void;
   onError: (msg: string | null) => void;
   onNotice: (msg: string | null) => void;
@@ -27,7 +29,7 @@ export function usePresetFile(opts: {
   const fileRef = useRef<HTMLInputElement | null>(null);
 
   const savePreset = () => {
-    const { schema, values, meta, referenceMp, lut } = opts;
+    const { schema, values, meta, referenceMp, lut, author } = opts;
     if (!schema) return;
     const name = window.prompt("Preset name", "my-look")?.trim();
     if (!name) return;
@@ -35,6 +37,16 @@ export function usePresetFile(opts: {
       format: PRESET_FORMAT,
       version: 1,
       name,
+      // Credit travels with the look, and sits here rather than at the end so a
+      // re-saved file lands key-for-key on the shipped ones and diffs cleanly.
+      // Spread rather than written as two `null` keys: a look with nobody's
+      // name on it produces a file with no author keys at all, which is the
+      // shape the format had before this existed. Every preset in `presets/`
+      // carries both, and a round trip through here used to strip them -- so
+      // the attribution survived exactly until someone nudged one slider.
+      ...(author
+        ? { author: author.name, author_link: author.link ?? null }
+        : {}),
       // Stamped so the preset can be rescaled onto a different-sized photo.
       // Falls back to whatever it was loaded with, so re-saving a preset you
       // did not author here does not silently re-base it onto this image.
@@ -80,6 +92,19 @@ export function usePresetFile(opts: {
       // look that has none, and leaving the previous selection in place would
       // silently blend two grades.
       opts.setLut(typeof raw?.lut === "string" && raw.lut ? raw.lut : null);
+      // Unconditional for the same reason, and a name with no link is still a
+      // name: only the missing name drops the credit entirely.
+      opts.setAuthor(
+        typeof raw?.author === "string" && raw.author
+          ? {
+              name: raw.author,
+              link:
+                typeof raw?.author_link === "string" && raw.author_link
+                  ? raw.author_link
+                  : null,
+            }
+          : null,
+      );
       opts.applyValues(v);
       opts.onError(null);
       opts.onNotice(

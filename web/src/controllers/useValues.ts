@@ -17,9 +17,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
-  groupIndex, muteAll, neutralised, startingValues,
+  groupIndex, muteAll, neutralised, presetAuthor, startingValues,
 } from "../models/paramState";
-import type { Snapshot, Values } from "../models/types";
+import type { Author, Snapshot, Values } from "../models/types";
 import type { Schema } from "../services/api";
 import { useHistory } from "./useHistory";
 
@@ -47,6 +47,10 @@ export function useValues(
   const [muted, setMuted] = useState<Record<string, Values>>({});
   const [referenceMp, setReferenceMp] = useState<number | null>(null);
   const [lut, setLut] = useState<string | null>(null);
+  /** Whose look this is, when it came from a preset that says. Nothing in the
+   *  app renders it -- it is carried so that saving the look back out to a file
+   *  writes the credit that came in with it instead of quietly dropping it. */
+  const [author, setAuthor] = useState<Author | null>(null);
 
   const valuesRef = useRef<Values>(values);
   valuesRef.current = values;
@@ -61,6 +65,7 @@ export function useValues(
     setApplied(booted.neutral);
     setReferenceMp(start.referenceMp);
     setLut(start.lut);
+    setAuthor(start.author);
     setMuted(muteAll(booted, start.values));
   }, [booted]);
 
@@ -197,6 +202,9 @@ export function useValues(
     // A preset with no LUT has to *clear* one that is selected, or the last
     // look's grade would keep riding under the new one.
     setLut(p.lut ?? null);
+    // Same rule as the LUT, absence included: saving after picking an unattributed
+    // preset must not leave the last one's author on the file.
+    setAuthor(presetAuthor(p));
     const v = { ...values, ...p.values };
     // The look is the preset's; *where the grain and the damage fall* is this
     // photo's. Every shipped preset carries a fixed `seed` and `texture_seed`
@@ -220,6 +228,7 @@ export function useValues(
     setApplied(schema.neutral);
     setReferenceMp(start.referenceMp);
     setLut(start.lut);
+    setAuthor(start.author);
     setMuted(muteAll(schema, start.values));
   };
 
@@ -308,19 +317,20 @@ export function useValues(
     setMuted(s.muted);
     setReferenceMp(s.referenceMp);
     setLut(s.lut);
+    setAuthor(s.author);
   }, []);
 
   // Placed after every mutator on purpose: it observes rather than being
   // called, so nothing above it has to know the history exists.
   const history = useHistory(
-    { values: applied, muted, referenceMp, lut },
+    { values: applied, muted, referenceMp, lut, author },
     restore,
     imageId,
   );
 
   return {
-    values, applied, muted, referenceMp, lut, valuesRef,
-    setReferenceMp, setLut, setValue, setValueNow, commit,
+    values, applied, muted, referenceMp, lut, author, valuesRef,
+    setReferenceMp, setLut, setAuthor, setValue, setValueNow, commit,
     liveFor, randomizeSeeds, applyPreset, resetAll, showOriginal,
     toggleGroup, resetGroup, applyValues,
     undo: history.undo, redo: history.redo,

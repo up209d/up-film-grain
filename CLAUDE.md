@@ -288,10 +288,10 @@ borders rather than always the right-hand one, and Normalize — that its meteri
 *direction* on a known-wrong frame, that its white balance is luma-neutral to
 0.00e+00 and backs off to exactly identity on a scene that is legitimately one
 colour, and that its highlight roll keeps 250 of 256 8-bit levels in a real
-photograph's bright region where the version it replaced kept 153, and that Highlight Priority hands that band back at 21 levels against 79 — 418 checks. It exits
+photograph's bright region where the version it replaced kept 153, and that Highlight Priority hands that band back at 21 levels against 79, and that a shipped preset's author credit reaches the client instead of being dropped at the door — 420 checks. It exits
 non-zero on failure.
 
-Those 418 live in `tests/checks/`, one module per area, since 2026-08-08 — it
+Those 420 live in `tests/checks/`, one module per area, since 2026-08-08 — it
 was a single 3900-line function taking 4m24s, and it is 18 modules taking ~72s
 (39s until `luts/` grew to 303 files, every one of which the `grading` module
 parses on purpose).
@@ -372,7 +372,7 @@ optional reading before touching the area it covers.
 | [docs/edge-destruction.md](docs/edge-destruction.md) | Scatter (diffusion without the average) and anti-aliasing (filter along the contour) |
 | [docs/global-grain.md](docs/global-grain.md) | Why value noise quilts, the two superseded constructions, the tilted point field, the chroma slider, the five layers (hue mask vs channel value, mask vs seed) and the blend modes |
 | [docs/film-texture.md](docs/film-texture.md) | Dust and hair as drawn marks with exact counts, scratches as a field, light leaks as beams |
-| [docs/presets.md](docs/presets.md) | The mark-count dead zone, and `reference_mp` rescaling across image sizes |
+| [docs/presets.md](docs/presets.md) | The mark-count dead zone, `reference_mp` rescaling across image sizes, and the author credit a re-save used to strip |
 | [docs/panel-layout.md](docs/panel-layout.md) | `GROUPS` reorgs and where each parameter's section went, including why Luminance Response stopped being a section |
 | [docs/client-ui.md](docs/client-ui.md) | Wheel zoom, the mount, muted-on-boot, and two React traps |
 | [docs/tuning-constants.md](docs/tuning-constants.md) | Every calibrated constant in `engine/constants/`, with the measurement behind it |

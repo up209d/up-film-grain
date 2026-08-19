@@ -7,7 +7,7 @@
  */
 
 import type { Schema } from "../services/api";
-import type { Values } from "./types";
+import type { Author, Values } from "./types";
 
 /** The starting point: the server's nominated default preset if that file
  *  exists, otherwise the raw parameter defaults. Shared by boot and Reset so
@@ -15,7 +15,12 @@ import type { Values } from "./types";
  *  opened" is its own small bug. */
 export function startingValues(
   s: Schema,
-): { values: Values; referenceMp: number | null; lut: string | null } {
+): {
+  values: Values;
+  referenceMp: number | null;
+  lut: string | null;
+  author: Author | null;
+} {
   const v: Values = {};
   for (const p of s.params) v[p.key] = p.default;
   const preset = s.presets.find((x) => x.name === s.default_preset);
@@ -29,8 +34,21 @@ export function startingValues(
         values: { ...v, ...preset.values },
         referenceMp: preset.reference_mp,
         lut: preset.lut ?? null,
+        author: presetAuthor(preset),
       }
-    : { values: v, referenceMp: null, lut: null };
+    : { values: v, referenceMp: null, lut: null, author: null };
+}
+
+/** The credit a preset carries, or null when it names nobody.
+ *
+ *  A link with no name is dropped rather than kept as an anonymous URL: the
+ *  pair is the attribution, and half of it written back into a file would
+ *  claim less than the original did. */
+export function presetAuthor(p: {
+  author: string | null;
+  author_link: string | null;
+}): Author | null {
+  return p.author ? { name: p.author, link: p.author_link ?? null } : null;
 }
 
 /** Mute every section at once, the way pressing every section's own mute

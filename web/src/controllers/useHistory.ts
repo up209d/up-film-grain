@@ -39,7 +39,8 @@ function same(a: Snapshot, b: Snapshot): boolean {
     a.values === b.values &&
     a.muted === b.muted &&
     a.referenceMp === b.referenceMp &&
-    a.lut === b.lut
+    a.lut === b.lut &&
+    a.author === b.author
   );
 }
 
