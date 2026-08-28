@@ -43,6 +43,32 @@ All accept `PORT=8001` and refuse to start with a clear message if the port is
 already held. `HOST=0.0.0.0 ./run.sh` exposes it on the network — there is no
 auth and no rate limiting, so only on a network you trust.
 
+## Command line
+
+No server, no browser — one photograph in, one file out:
+
+```bash
+./export.sh photo.jpg -p KodakPortra
+./export.sh photo.jpg -p Stock -m full -o out.png
+./export.sh --list-presets              # the library: names, authors, LUTs
+./export.sh --describe-preset Vintage  # one preset, value by value
+```
+
+Four things to say and no more: the **input**, the **preset** (`-p`, omit for
+the parameter defaults), the **output** (`-o`, defaults to the app's own name
+beside the input) and the **output mode** (`-m`: `ss0.5`, `ss1`, `ss1.5`, `ss2`
+— the default — `ss3`, or `full` for a real 1:1 render). The encoder follows the
+output name (`.png` is 16-bit; `-f` overrides, `-q` sets JPEG quality).
+
+An export made with `-p` records the preset in the file — EXIF
+`ImageDescription` for JPEG, a `tEXt` chunk for PNG — naming the preset, its
+author and the LUT it uses. Without `-p` nothing is written at all.
+
+It calls the same `POST /api/export` code the app does, so a preset renders
+byte-for-byte what the app would give you from it — including the working
+resolution `Prescaling Source` asks for, which is why the file can come out
+larger than the input.
+
 ## Build the desktop app
 
 ```bash

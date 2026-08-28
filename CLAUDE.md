@@ -151,6 +151,10 @@ server/services/      render_tier -- the one path both preview tiers take
 server/controllers/   FastAPI routers, one per area
 server/runtime.py     IS_DEV, DEVICE, ENGINE, the render lock and ticket
 server/main.py        app assembly only
+server/cli.py         `./export.sh in.jpg -p Preset -m ss2 -o out.png`
+                        -- input/preset/output/mode and nothing else. It *calls*
+                        the export controller instead of rendering its own way,
+                        so a preset gives the same file the app would
 server/imageio.py     decode/encode, incl. a hand-written 16-bit RGB PNG encoder
 server/lut.py         .cube 3D LUT parsing + registry (the tree and uploads)
 web/src/models/       Values/Compare, view constants, pure value-set rules
@@ -176,6 +180,7 @@ electron/             the desktop shell: main.js owns the Python process
 tools/bundle.py       assembles build/bundle/ -- payload + a relocatable CPython
 tools/freeze.py       Pipfile.lock -> requirements/ (restores dropped markers)
 run.sh / dev.sh       production from source / hot-reload dev
+export.sh             the CLI, one line over `python -m server.cli`
 run-prod.sh           rebuild the bundle and run it (uses its own interpreter)
 build.sh              client -> payload -> Electron app in dist/
 ```

@@ -84,8 +84,13 @@ def _reap_finished() -> None:
 
 def run_export(job_id: str, fr: Upload | Frame, p: dict, fmt: str, ss: float,
                quality: int, full: bool = False,
-               out_hw: tuple[int, int] | None = None) -> None:
+               out_hw: tuple[int, int] | None = None,
+               preset: dict | None = None) -> None:
     """Render, resize to the requested output size, encode.
+
+    ``preset`` is the `load_presets` record the look came from, or ``None``.
+    It reaches the file as EXIF (JPEG) or a text chunk (PNG) and nothing else
+    uses it.
 
     ``fr`` is the photograph at its working resolution and ``out_hw`` is the
     size the *file* is written at -- the same numbers unless Prescaling Source is
@@ -127,7 +132,10 @@ def run_export(job_id: str, fr: Upload | Frame, p: dict, fmt: str, ss: float,
             th, tw = out_hw if out_hw is not None else (fr.h, fr.w)
             out = iio.resize_to(out, th, tw, DEVICE)
             job["status"] = "encoding"
-            data = iio.encode(out, fmt, quality)
+            # Stamped with the preset that made it, when the caller named
+            # one. A hand-dialled export writes no metadata at all -- see
+            # `imageio._description`.
+            data = iio.encode(out, fmt, quality, preset)
 
         # Straight to the SSD. The download route serves the file with
         # `FileResponse`, so these bytes never come back through Python's heap

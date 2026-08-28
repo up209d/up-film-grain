@@ -14,6 +14,7 @@ from .. import imageio as iio
 from ..models import upload as up_model
 from ..models.upload import _clamp_ss
 from ..models.export_job import JOBS, run_export
+from ..params import load_presets
 
 router = APIRouter(prefix="/api")
 
@@ -62,6 +63,17 @@ def export(body: dict = Body(...)) -> dict:
     ss = _clamp_ss(body.get("supersample", 2))
     full = bool(body.get("full", False))
     quality = max(60, min(100, int(body.get("quality", 95))))
+    # The preset the look came from, by name, purely so the written file can say
+    # so. Optional and unvalidated beyond "is there a file called that": a
+    # caller that does not name one -- which the web client never does, because
+    # it stops tracking the name the moment a slider moves -- gets a file with
+    # no metadata, which is the requested behaviour rather than a degraded one.
+    want = body.get("preset")
+    preset = next(
+        (pre for pre in load_presets()
+         if isinstance(want, str) and pre["name"].lower() == want.lower()),
+        None,
+    )
     # Which dimensions the file is written at, and it is the one question the
     # supersample menu deliberately does *not* answer. `prescale_output` picks:
     # 0 writes the frame that was rendered, 1 resamples it back to the file's
@@ -103,7 +115,7 @@ def export(body: dict = Body(...)) -> dict:
     }
     threading.Thread(
         target=run_export,
-        args=(job_id, fr, p, fmt, ss, quality, full, (int(h), int(w))),
+        args=(job_id, fr, p, fmt, ss, quality, full, (int(h), int(w)), preset),
         daemon=True,
     ).start()
     return {"job": job_id}

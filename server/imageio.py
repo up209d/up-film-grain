@@ -9,7 +9,7 @@ import zlib
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, PngImagePlugin
 
 from .engine.device import device_work
 
@@ -112,7 +112,55 @@ def load_image(data: bytes) -> np.ndarray:
     return np.ascontiguousarray(np.clip(f, 0.0, 1.0))
 
 
-def _png16_rgb(u: np.ndarray) -> bytes:
+#: What every written file says made it. A constant rather than a literal at
+#: three encode sites, and deliberately *not* versioned: the tag is there to say
+#: which tool to open a question about, and a build number in it would only
+#: promise a provenance trail this does not actually keep.
+SOFTWARE = "UP Film Grain"
+
+
+def _description(preset: dict | None) -> str | None:
+    """The one line a file records about the look it was rendered with.
+
+    `None` when no preset was used, and that is a *behaviour* rather than a
+    fallback: an export dialled in by hand has no name to record, and inventing
+    one ("custom") would put a fact in the file that is not true of it. Nothing
+    is written in that case -- no EXIF block, no text chunk.
+
+    The author travels with the name because a preset is someone's work and this
+    is the only place the credit survives leaving the app; the file is what gets
+    passed around, not the preset it came from.
+    """
+    if not preset or not preset.get("name"):
+        return None
+    out = f"Preset: {preset['name']}"
+    if preset.get("author"):
+        out += f" by {preset['author']}"
+        if preset.get("author_link"):
+            out += f" ({preset['author_link']})"
+    if preset.get("lut"):
+        out += f"; LUT: {preset['lut']}"
+    return out
+
+
+def _exif_bytes(desc: str) -> bytes:
+    """An EXIF block carrying the description and the software tag.
+
+    Built through Pillow's own `Image.Exif` rather than by hand: the IFD layout
+    is offsets-into-a-blob and a hand-rolled one that is subtly wrong reads as a
+    corrupt file to some viewers rather than as a missing tag.
+
+    ASCII tags only. `UserComment` (0x9286) is the more usual home for free
+    text, but it carries an encoding prefix that half of the tools that read it
+    get wrong; `ImageDescription` is plain and every viewer shows it.
+    """
+    exif = Image.Exif()
+    exif[0x010E] = desc      # ImageDescription
+    exif[0x0131] = SOFTWARE  # Software
+    return exif.tobytes()
+
+
+def _png16_rgb(u: np.ndarray, desc: str | None = None) -> bytes:
     """Write a 16-bit RGB PNG.
 
     Pillow cannot do this -- it only writes 16-bit as single-band I;16 -- and
@@ -131,29 +179,59 @@ def _png16_rgb(u: np.ndarray) -> bytes:
             + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
         )
 
+    def text(key: str, value: str) -> bytes:
+        """A `tEXt` chunk. PNG has no EXIF of its own that anything reads.
+
+        Latin-1, which is what the spec allows in `tEXt`; a name or a link
+        outside it degrades to `iTXt`-less ASCII rather than writing bytes no
+        reader can decode.
+        """
+        payload = (key.encode("latin-1", "replace") + b"\x00"
+                   + value.encode("latin-1", "replace"))
+        return chunk(b"tEXt", payload)
+
     ihdr = struct.pack(">IIBBBBB", w, h, 16, 2, 0, 0, 0)  # 16bpc, colour type 2
+    # Before IDAT: the spec allows text chunks either side, and a reader that
+    # streams stops caring once it has the pixels.
+    meta = (text("Description", desc) + text("Software", SOFTWARE)) if desc else b""
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", ihdr)
+        + meta
         + chunk(b"IDAT", zlib.compress(raw, 6))
         + chunk(b"IEND", b"")
     )
 
 
-def encode(arr: np.ndarray, fmt: str = "png16", quality: int = 95) -> bytes:
+def encode(arr: np.ndarray, fmt: str = "png16", quality: int = 95,
+           preset: dict | None = None) -> bytes:
+    """Encode a finished render, optionally stamped with the preset that made it.
+
+    `preset` is the `load_presets` record -- name, author, author_link, lut --
+    or `None`, which writes a file with no metadata at all. Nothing else about
+    the render is recorded: the parameter values are the look and they belong in
+    a preset file, not in half a kilobyte of EXIF nobody can load back.
+    """
     a = np.clip(arr, 0.0, 1.0)
+    desc = _description(preset)
     if fmt == "png16":
-        return _png16_rgb((a * 65535.0 + 0.5).astype(np.uint16))
+        return _png16_rgb((a * 65535.0 + 0.5).astype(np.uint16), desc)
 
     u = (a * 255.0 + 0.5).astype(np.uint8)
     buf = io.BytesIO()
     if fmt == "jpeg":
         # 4:4:4 -- chroma subsampling would smear the chroma grain away.
+        extra = {"exif": _exif_bytes(desc)} if desc else {}
         Image.fromarray(u, "RGB").save(
-            buf, format="JPEG", quality=int(quality), subsampling=0
+            buf, format="JPEG", quality=int(quality), subsampling=0, **extra
         )
     else:
-        Image.fromarray(u, "RGB").save(buf, format="PNG")
+        info = None
+        if desc:
+            info = PngImagePlugin.PngInfo()
+            info.add_text("Description", desc)
+            info.add_text("Software", SOFTWARE)
+        Image.fromarray(u, "RGB").save(buf, format="PNG", pnginfo=info)
     return buf.getvalue()
 
 
