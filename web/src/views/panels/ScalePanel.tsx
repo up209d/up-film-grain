@@ -20,11 +20,19 @@ import {
   SCALE_MANUAL_MIN,
   SCALE_MANUAL_STEP,
 } from "../../models/constants";
+import type { Geom } from "../../models/prescale";
 import type { ImageMeta } from "../../services/api";
 import Field from "../controls/Field";
 
 export default function ScalePanel(props: {
   meta: ImageMeta | null;
+  /** The frame the pipeline renders. Every megapixel figure in here is this
+   *  one, not the file's: the server rescales against the size it is actually
+   *  rendering (`models/upload.py:params_for`), so quoting the file's size
+   *  would print a factor the render does not use. With Prescaling Source on at
+   *  the size a preset was authored at, this reads 1.000x -- which is the whole
+   *  point of the section above. */
+  geom: Geom | null;
   referenceMp: number | null;
   scaleToRef: boolean;
   /** Hand-set linear factor, or null to compute it from the sizes. */
@@ -33,10 +41,11 @@ export default function ScalePanel(props: {
   onSetFromPhoto: () => void;
   onScaleOverride: (v: number | null) => void;
 }) {
-  const { meta, referenceMp, scaleToRef, scaleOverride } = props;
-  if (!meta) return null;
+  const { meta, geom, referenceMp, scaleToRef, scaleOverride } = props;
+  if (!meta || !geom) return null;
 
-  const auto = referenceMp ? Math.sqrt(meta.megapixels / referenceMp) : 1;
+  const mp = geom.megapixels;
+  const auto = referenceMp ? Math.sqrt(mp / referenceMp) : 1;
   const manual = scaleOverride !== null;
   // What the render will actually use. The switch still wins over both: off
   // means nothing is scaled, however the factor was arrived at.
@@ -62,7 +71,7 @@ export default function ScalePanel(props: {
         <button
           className="seg"
           onClick={props.onSetFromPhoto}
-          disabled={referenceMp === meta.megapixels}
+          disabled={referenceMp === mp}
           title="Record this photo's size as the size these settings were dialled in on"
         >
           Set from photo
@@ -115,6 +124,17 @@ export default function ScalePanel(props: {
         </div>
       )}
 
+      {geom.prescaled && (
+        <p className="hint">
+          Measured against the <strong>prescaled</strong> frame —{" "}
+          {geom.width}×{geom.height}, {mp}MP — not the {meta.megapixels}MP file,
+          because that is the photograph the pipeline is rendering. Prescaling to
+          the size a preset records is what makes this factor 1.00×; the two
+          controls are the same correction from opposite ends, so you want one of
+          them doing the work, not both.
+        </p>
+      )}
+
       <p className="hint scalebox">
         <span>
           {manual ? (
@@ -130,7 +150,8 @@ export default function ScalePanel(props: {
         </span>
         <span>→</span>
         <span>
-          photo&nbsp;<strong>{meta.megapixels}MP</strong>
+          {geom.prescaled ? "frame" : "photo"}&nbsp;
+          <strong>{mp}MP</strong>
         </span>
         <span>=</span>
         <span>
@@ -143,7 +164,7 @@ export default function ScalePanel(props: {
           This preset does not record what size it was dialled in on, so nothing
           is scaled — it behaves exactly as it did before. If this photo is the
           size you dialled it in on, press <strong>Set from photo</strong> then{" "}
-          <strong>Save to file…</strong> to stamp it at {meta.megapixels}MP. To
+          <strong>Save to file…</strong> to stamp it at {mp}MP. To
           retrofit every old preset at once, start the server with{" "}
           <code>FILM_GRAIN_DEFAULT_REFERENCE_MP=24</code>. Or press{" "}
           <strong>Manual</strong> above and set the factor yourself.
@@ -164,8 +185,8 @@ export default function ScalePanel(props: {
           Lengths — clump size, every radius, jitter, speck and scratch size —
           are multiplied by the <strong>linear</strong> ratio{" "}
           {auto.toFixed(3)}×, not the megapixel ratio{" "}
-          {(meta.megapixels / referenceMp).toFixed(2)}×: a photo with{" "}
-          {(meta.megapixels / referenceMp).toFixed(2)}× the pixels is only{" "}
+          {(mp / referenceMp).toFixed(2)}×: a photo with{" "}
+          {(mp / referenceMp).toFixed(2)}× the pixels is only{" "}
           {auto.toFixed(2)}× as wide. Amounts and mark counts are not scaled —
           they already mean the same thing at any size.
         </p>

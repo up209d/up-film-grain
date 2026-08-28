@@ -1,5 +1,16 @@
 # Preview and export
 
+**"The source" means the working frame, not the file (2026-08-29).** Prescaling
+Source resamples the photograph to a fixed megapixel count before either tier
+is derived, so every "the source's own dimensions" below is the *prescaled
+frame's* dimensions whenever it is on -- both tiers come from the same frame, so
+they still agree with each other exactly as described here. Its own
+`prescale_output` control is the one opt-out, resampling the finished render
+back to the file's dimensions. The `_MIN_CELL` divergence documented under "The
+preview is client-scaled" becomes constant across photographs with it on,
+because `proxy_scale` stops being a function of the file's size. See
+`docs/prescale.md`.
+
 ## Every export is the preview's look, at full size (2026-08-09, on request)
 
 The menu below is unchanged -- same five entries, same labels, same output

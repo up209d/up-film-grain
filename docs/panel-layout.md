@@ -257,3 +257,25 @@ Requested outright. The damage layer is no longer the bottom of the panel, so
 the print grain and the output sharpening are read — and applied — after the
 film got dusty. The look consequences are real and are filed with the stage that
 gave up its position: `docs/film-texture/placement.md`.
+
+## One section is rendered out of `GROUPS` order (2026-08-29)
+
+`Prescaling Source` is `GROUPS[0]` and the panel does **not** render it there.
+`App` splits the grouped list and hands that one section to a second
+`SliderPanel` above Size Scaling, which is a hand-written sidebar block sitting
+above the preset picker.
+
+The reason is the one this file already argues for `Blend Mode` sitting at the
+top of its group, a panel apart: a control that changes what everything below it
+means reads wrong away from the thing it changes. Prescaling moves the
+photograph to fit the parameters and Size Scaling moves the parameters to fit the
+photograph -- the same correction from opposite ends, where using both is wrong
+-- and with them adjacent the second one reading `1.000x` is the clearest
+statement of that there is.
+
+It is still generated from the schema, by the same `SliderPanel` component fed
+one section, so the rule that no view defines a control holds and everything
+keyed on the group name -- mute, reset, the jump menu, `sectionDomId`,
+collapse-all, preset save/load, undo -- needed no special case. Both instances
+take one shared `panelProps` object; a second copy of that wiring is how the two
+would quietly stop behaving the same way. See `docs/prescale.md`.

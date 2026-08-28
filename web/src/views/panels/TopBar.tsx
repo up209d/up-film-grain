@@ -1,6 +1,7 @@
 /** The app bar: open a photo, the seed-on-open switch, and the render readout. */
 
 import filmGrain1x1 from "../../assets/film-grain-1x1.jpg";
+import type { Geom } from "../../models/prescale";
 import type { ImageMeta } from "../../services/api";
 
 /** How long a preview may take before the bar says the config is heavy, in ms.
@@ -26,6 +27,12 @@ const SS_STEPS = [0.5, 1, 1.5, 2, 3];
 
 export default function TopBar(props: {
   meta: ImageMeta | null;
+  /** The frame being rendered, when it is not the file. Shown after the file's
+   *  own dimensions rather than instead of them: the file's size is a fact
+   *  about the photograph and this readout is where you look for it, while the
+   *  frame's is what everything else in the app is now quoting, so a session
+   *  with prescaling on needs both visible in one place. */
+  geom?: Geom | null;
   device: string;
   rendering: boolean;
   renderMs: number;
@@ -124,6 +131,9 @@ export default function TopBar(props: {
       {meta && (
         <span className="meta">
           {meta.name} · {meta.width}×{meta.height} · {meta.megapixels}MP
+          {props.geom?.prescaled && (
+            <> → {props.geom.width}×{props.geom.height} · {props.geom.megapixels}MP</>
+          )}
         </span>
       )}
       {/* The same reroll the checkbox above does on open, on demand: a seed is

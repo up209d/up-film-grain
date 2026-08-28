@@ -84,6 +84,11 @@ export interface ImageMeta {
   megapixels: number;
   proxy_width: number;
   proxy_height: number;
+  /** `PROXY_LONG_EDGE` itself, so the client can work out the proxy of a
+   *  *prescaled* frame. `proxy_width` cannot give it: on a photograph smaller
+   *  than the ceiling it is the photograph's own width. See
+   *  `models/prescale.ts`. */
+  proxy_long_edge: number;
 }
 
 /** No view geometry: the server renders the whole frame and the browser does

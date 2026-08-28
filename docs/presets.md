@@ -94,6 +94,26 @@ Two ways to populate it instead:
   recorded size be treated as authored at 24MP.
 
 
+## Prescaling is the same correction from the other end (2026-08-29)
+
+Everything above moves **the parameters** to fit the photograph. `Prescaling
+Source` moves **the photograph** to fit the parameters, and since every file in
+`presets/` records `reference_mp: 24` and is now stamped `prescale_mp: 24`, the
+factor this section computes is 1.00x whenever prescaling is on at its default.
+
+That is deliberate, and it means the two must not both do the work:
+`params_for` measures `scale_factor` against the *prescaled frame*, not the
+file. It also removes a real loss this mechanism has and cannot avoid -- the
+clamp back into `[min, max]` below, which silently pins parameters at their
+sliders' ceilings on a large upscale. See `docs/prescale.md`.
+
+Note the reasoning at the top of this section -- "there is deliberately **no
+built-in default size**: inventing one would silently change the look of every
+legacy preset" -- is knowingly *not* followed by `prescale`'s default of on at
+24MP. That was requested outright, so a legacy preset file with no `prescale`
+key does now prescale. The difference from the case above is that this one was
+asked for with its consequence stated, rather than guessed at.
+
 ## The scaling factor can be set by hand (added 2026-08-08)
 
 The Size Scaling section offered the computed factor or nothing at all, and

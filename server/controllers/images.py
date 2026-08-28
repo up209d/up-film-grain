@@ -39,6 +39,13 @@ def upload(file: UploadFile = File(...)) -> dict:
         "megapixels": round(up.w * up.h / 1e6, 1),
         "proxy_width": int(up.proxy.shape[1]),
         "proxy_height": int(up.proxy.shape[0]),
+        # The constant itself, not just this photograph's proxy. The client
+        # mirrors the prescale arithmetic to label the export and to size the
+        # stage, and a prescaled frame has a proxy of its own -- which it cannot
+        # work out from `proxy_width` alone, because on a photograph smaller
+        # than the long edge that number is the photograph's own size and says
+        # nothing about the ceiling. See `web/src/models/prescale.ts`.
+        "proxy_long_edge": up_model.PROXY_LONG_EDGE,
     }
 
 

@@ -6,6 +6,7 @@ import {
 } from "@heroicons/react/24/outline";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { type ExportJob, type ImageMeta } from "../../services/api";
+import type { Geom } from "../../models/prescale";
 import type { Compare } from "../../models/types";
 import PreviewFrame from "./PreviewFrame";
 import {
@@ -38,6 +39,12 @@ import {
  *  Zoom to 100% to judge grain; that view is exact. */
 function Stage(props: {
   meta: ImageMeta | null;
+  /** The frame the pipeline renders, which is the file only while Prescaling
+   *  Source is off. Every dimension in here is this one: the display box, Fit,
+   *  the zoom percentage and both proxy-honesty thresholds are about the frame
+   *  on screen and the file it will be written as, not about the file that was
+   *  opened. See `models/prescale.ts`. */
+  geom: Geom | null;
   previewUrl: string | null;
   sourceUrl: string | null;
   compare: Compare;
@@ -140,8 +147,8 @@ function Stage(props: {
     return () => ro.disconnect();
   }, [compare, !!meta]);
 
-  const iw = meta?.width ?? 1;
-  const ih = meta?.height ?? 1;
+  const iw = props.geom?.width ?? meta?.width ?? 1;
+  const ih = props.geom?.height ?? meta?.height ?? 1;
   // Fit means "the whole thing is visible", and with a mount on, the mount is
   // part of the whole thing -- so the room it needs comes out of the fit before
   // the zoom is computed. Reserved on both axes because the border is drawn on
@@ -357,7 +364,7 @@ function Stage(props: {
   // The proxy resolves detail only up to its own resolution; past that the
   // browser is enlarging it and grain is not being shown honestly. Say so
   // rather than letting a soft preview read as a soft result.
-  const proxyLimit = (meta?.proxy_width ?? 0) / iw;
+  const proxyLimit = (props.geom?.proxyWidth ?? meta?.proxy_width ?? 0) / iw;
   const softened = !previewFull && eff > proxyLimit * 1.05;
 
   // Whether the picture is actually being *reduced* on the way to the display,
@@ -366,7 +373,8 @@ function Stage(props: {
   // control which cannot do anything is not shown, the way the wipe appears only
   // in overlay mode, so the toggle is gated on this rather than always present.
   const dpr = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
-  const natural = previewFull ? 1 : (meta?.proxy_width ?? iw) / iw;
+  const natural =
+    previewFull ? 1 : (props.geom?.proxyWidth ?? meta?.proxy_width ?? iw) / iw;
   const downscaling = eff * dpr < natural * 0.999;
 
   // One bar for compare mode, the wipe, the zoom and the mount -- grouped left

@@ -281,6 +281,15 @@ def run(cx: Ctx) -> None:
     # One parameter from every section, changed against a warm cache. Each must
     # come back exactly as a cold engine renders it. A key that failed to cover
     # an upstream section shows up here as a frame that did not move.
+    #
+    # `Prescaling Source` is deliberately absent and must stay absent. Its keys
+    # never reach a stage -- they resample the frame `render_image` is *handed*,
+    # in `models/upload.py` -- so a probe on one would compare two identical
+    # renders and pass as a tautology, and it cannot be written the honest way
+    # here because the two frames would be different shapes. That boundary is
+    # checked in `tests/checks/prescale.py` instead, where the switch is made
+    # through `render_tier` and each resolution is compared against its own cold
+    # render.
     probes = [
         ("normalize", 1.0),
         ("grade_exposure", 0.35), ("pre_blur", 1.2), ("pre_sharpen", 0.6),

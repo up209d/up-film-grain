@@ -25,8 +25,16 @@ renders the source itself at scale 1.0 -- the real full-resolution render, at 1x
 not the default, because it is the one file the preview cannot show you.
 
 The output size is unchanged at every setting, so the menu still asks one
-question rather than two: the file is always the source's own dimensions, and
-the number says how finely it was rendered.
+question rather than two: the file is always the working frame's own dimensions,
+and the number says how finely it was rendered.
+
+**Prescaling Source (2026-08-29) moved what "the source" means**, and it is the
+only thing that can. With it on the photograph has been resampled to a working
+resolution before any of this, so the frame every tier renders -- and therefore
+the file every entry writes -- is that resolution rather than the file's.
+``prescale_output`` is the one opt-out: it resamples the finished render back to
+the photograph's own dimensions, which is a resample of grain and says so in its
+help text.
 """
 
 from __future__ import annotations
@@ -34,13 +42,22 @@ from __future__ import annotations
 from .. import imageio as iio
 from ..runtime import DEVICE, RENDER_LOCK
 from ..services.render import render_tier
-from .upload import Upload
+from .upload import Frame, Upload
 
 JOBS: dict[str, dict] = {}
 
 
-def run_export(job_id: str, up: Upload, p: dict, fmt: str, ss: float,
-               quality: int, full: bool = False) -> None:
+def run_export(job_id: str, fr: Upload | Frame, p: dict, fmt: str, ss: float,
+               quality: int, full: bool = False,
+               out_hw: tuple[int, int] | None = None) -> None:
+    """Render, resize to the requested output size, encode.
+
+    ``fr`` is the photograph at its working resolution and ``out_hw`` is the
+    size the *file* is written at -- the same numbers unless Prescaling Source is
+    on and set to write the photograph's own dimensions. The caller decides,
+    because it is the caller that has the `Upload` to compare against; this only
+    has the frame.
+    """
     job = JOBS[job_id]
     try:
         def progress(f: float) -> None:
@@ -59,14 +76,21 @@ def run_export(job_id: str, up: Upload, p: dict, fmt: str, ss: float,
             # at 1.0. It goes through the same call rather than round the side
             # of it, so the 1:1 export and the `Render 1:1` preview are the same
             # pixels for the same reason the other five are.
-            out = render_tier(up, p, ss, full, progress=progress)
-            # Then up to the source's own dimensions. Plain bicubic, no
-            # antialias -- there is nothing to alias against when adding
-            # samples -- and a pass-through returning the array itself when the
-            # source was never bigger than the proxy, where the two are already
-            # the same pixels. The full tier lands here already at size, so this
-            # is that same pass-through rather than a branch.
-            out = iio.upscale(out, up.h, up.w, DEVICE)
+            out = render_tier(fr, p, ss, full, progress=progress)
+            # Then to the frame's own dimensions -- or the photograph's, if
+            # `prescale_output` asked for that. A pass-through returning the
+            # array itself when the size already matches, which is the common
+            # case: a source no bigger than the proxy, and the full tier, both
+            # land here already at size.
+            #
+            # `resize_to` rather than `upscale`, and the difference is not
+            # cosmetic. Writing a prescaled-up photograph back at its own size
+            # is a **reduction** of a finished, grainy frame, and reducing grain
+            # without antialias folds it above Nyquist into visible crawl.
+            # `upscale` is right when the only direction is up, which stopped
+            # being true when prescaling could enlarge the input.
+            th, tw = out_hw if out_hw is not None else (fr.h, fr.w)
+            out = iio.resize_to(out, th, tw, DEVICE)
             job["status"] = "encoding"
             data = iio.encode(out, fmt, quality)
 

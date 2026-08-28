@@ -10,12 +10,17 @@ import { useRef } from "react";
 import { PRESET_FORMAT } from "../models/constants";
 import { coerceValues } from "../models/paramState";
 import type { Author, Values } from "../models/types";
-import type { ImageMeta, Schema } from "../services/api";
+import type { Schema } from "../services/api";
 
 export function usePresetFile(opts: {
   schema: Schema | null;
   values: Values;
-  meta: ImageMeta | null;
+  /** Megapixels of the frame being rendered, for the `reference_mp` fallback.
+   *  Not `meta.megapixels`: with Prescaling Source on, the numbers being saved
+   *  were dialled in against the prescaled frame, and stamping the file's size
+   *  would record a photograph the look was never judged on. Matches what
+   *  "Set from photo" writes. */
+  frameMp: number | null;
   referenceMp: number | null;
   lut: string | null;
   author: Author | null;
@@ -29,7 +34,7 @@ export function usePresetFile(opts: {
   const fileRef = useRef<HTMLInputElement | null>(null);
 
   const savePreset = () => {
-    const { schema, values, meta, referenceMp, lut, author } = opts;
+    const { schema, values, frameMp, referenceMp, lut, author } = opts;
     if (!schema) return;
     const name = window.prompt("Preset name", "my-look")?.trim();
     if (!name) return;
@@ -50,7 +55,7 @@ export function usePresetFile(opts: {
       // Stamped so the preset can be rescaled onto a different-sized photo.
       // Falls back to whatever it was loaded with, so re-saving a preset you
       // did not author here does not silently re-base it onto this image.
-      reference_mp: referenceMp ?? meta?.megapixels ?? null,
+      reference_mp: referenceMp ?? frameMp ?? null,
       // A sibling of `values`, not one of them -- a LUT is named, not numbered.
       // An uploaded LUT's id will not resolve in a future session; that is the
       // honest thing to write, and the picker shows the name as missing rather

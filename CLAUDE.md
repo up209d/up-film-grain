@@ -46,6 +46,31 @@ available — accepting outside PRs without a CLA or DCO is what would erode it.
 **In scope — the point of the app:** detail destruction, edge softening and
 edge noising, grain, halation, chromatic edge fringing.
 
+**In scope as of 2026-08-29:** a `Prescaling Source` section **above
+everything**, including Normalize -- a switch, a free megapixel target
+(default 24) and a menu choosing the exported file's size. It resamples the
+photograph to a fixed working resolution so the pipeline's lengths mean the same
+thing whatever came out of the camera. Requested with the export written at the
+prescaled size ("everything will work as we import a 24 mpx photo", including
+the file), as part of the look rather than a session preference, and with the
+resample cached per photograph -- "make it a checkpoint so we dont have to
+rescaling anytime we move any slider below". Two things about it are unlike every
+other section and both are deliberate:
+
+* **It is not a stage.** No mixin, no constants file, nothing in `render()`, and
+  it reserves nothing in `pad_for`. It changes the *array the engine is called
+  with*, in `models/upload.py`, which is what leaves both invariants untouched
+  by it.
+* **It is `GROUPS[0]` but rendered above Size Scaling**, not at the head of the
+  parameter panel -- the one section that does not sit where `GROUPS` puts it.
+  The two answer the same question from opposite ends (this moves the photograph
+  to fit the parameters; Size Scaling moves the parameters to fit the
+  photograph) and reading them a panel apart made neither make sense. It is
+  still generated from the schema, by a second `SliderPanel` fed one section.
+
+Every preset is stamped `prescale: 1, prescale_mp: 24`, which makes Size
+Scaling's factor 1.00x across the shipped library. See `docs/prescale.md`.
+
 **In scope as of 2026-08-16:** a `Normalize` section **above** Colour Grading —
 one checkbox, shipping off, that corrects an input photograph's lightness and
 white balance and compresses its dynamic range so neither end clips. Requested
@@ -263,6 +288,20 @@ colour-match two different painters. Do not "simplify" that back to `show: true`
 The corollary is worth remembering for any future window work: an on-screen
 colour problem that does not reproduce in `capturePage()` is not in the page.
 
+## Pipeline order (a section added above the top 2026-08-29)
+
+`Prescaling Source` is step **-3**, above `Normalize`. It is first in `GROUPS`
+and first in nothing else: it is not a stage, so there is no call to it in
+`render()` and no checkpoint boundary of its own. What it does happens before
+the engine is entered at all -- `Upload.at()` hands `render_tier` a different
+array.
+
+The tripwire the section below records did **not** fire this time, and that is
+the whole point of having fixed it by name: `checkpoint.py` takes its suffixes
+with `_from("<section>")`, so a group inserted at index 0 shifted nothing. The
+shallowest boundary simply carries three more keys in its signature, which is
+conservative and correct. Grep for `GROUPS[` before inserting a section anyway.
+
 ## Pipeline order (a section added at the top 2026-08-16)
 
 `Normalize` is step **-2**, above Colour Grading and so above everything. It is
@@ -373,11 +412,15 @@ borders rather than always the right-hand one, and Normalize — that its meteri
 *direction* on a known-wrong frame, that its white balance is luma-neutral to
 0.00e+00 and backs off to exactly identity on a scene that is legitimately one
 colour, and that its highlight roll keeps 250 of 256 8-bit levels in a real
-photograph's bright region where the version it replaced kept 153, and that Highlight Priority hands that band back at 21 levels against 79, and that a shipped preset's author credit reaches the client instead of being dropped at the door — 420 checks. It exits
+photograph's bright region where the version it replaced kept 153, and that Highlight Priority hands that band back at 21 levels against 79, and that a shipped preset's author credit reaches the client instead of being dropped at the door, and Prescaling Source — that the target arithmetic holds
+the aspect ratio to half a pixel per axis, that switching it off is the *same
+object* rather than a second code path, that four proxy reads are one resample,
+that two working resolutions of one photograph never share a checkpoint, and
+that prescaling and `reference_mp` never both fire — 450 checks. It exits
 non-zero on failure.
 
-Those 420 live in `tests/checks/`, one module per area, since 2026-08-08 — it
-was a single 3900-line function taking 4m24s, and it is 18 modules taking ~72s
+Those 450 live in `tests/checks/`, one module per area, since 2026-08-08 — it
+was a single 3900-line function taking 4m24s, and it is 19 modules taking ~50s
 (39s until `luts/` grew to 303 files, every one of which the `grading` module
 parses on purpose).
 **Name the modules covering what you touched and only those run:**
@@ -447,6 +490,7 @@ optional reading before touching the area it covers.
 
 | file | what is in it |
 |---|---|
+| [docs/prescale.md](docs/prescale.md) | Step -3: the input resampled to a fixed working resolution, why it is not a stage, the per-photograph `Frame` cache, and the one section the panel renders out of `GROUPS` order |
 | [docs/normalize.md](docs/normalize.md) | Step −2: the one stage whose settings are *measured* rather than dialled, why the metering is per-upload and not per-tile, and why the shoulder is uncapped where the toe is not |
 | [docs/using-the-controls.md](docs/using-the-controls.md) | What each control does, for a user rather than a maintainer — moved out of `README.md` 2026-08-08 |
 | [docs/architecture.md](docs/architecture.md) | Where everything lives after the 2026-08-08 package split, the two import rules that keep it acyclic, and why `Stage.tsx` was left whole |

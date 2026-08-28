@@ -8,6 +8,7 @@ group; ``GROUPS`` in ``..param`` orders the groups themselves.
 from __future__ import annotations
 
 from ..param import Param
+from .prescale import PARAMS as _prescale
 from .normalize import PARAMS as _normalize
 from .colour_grading import PARAMS as _colour_grading
 from .pre_blur import PARAMS as _pre_blur
@@ -27,6 +28,7 @@ from .film_texture import PARAMS as _film_texture
 from .output import PARAMS as _output
 
 PARAMS: list[Param] = [
+    *_prescale,
     *_normalize,
     *_colour_grading,
     *_pre_blur,

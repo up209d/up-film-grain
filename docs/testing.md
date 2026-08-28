@@ -48,6 +48,7 @@ whole log in order with the failure in place.
 | `tiling` | tile independence, crop fidelity, zoom fidelity |
 | `colour` | colour pass-through, the Original button, vibrance, split tone |
 | `presets` | `reference_mp` rescaling, the mark-count dead zone |
+| `prescale` | the target arithmetic, the two identity paths, the per-photograph resample cache, and that two working resolutions never share a checkpoint |
 | `normalize` | auto exposure, auto white balance, the toe and shoulder, the metering's direction |
 | `grading` | the Colour Grading section, highlight reconstruction, `.cube` parsing |
 | `response` | the luminance-response band, edge bias, the smooth-area guard |

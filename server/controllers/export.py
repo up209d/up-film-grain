@@ -20,7 +20,7 @@ router = APIRouter(prefix="/api")
 
 @router.post("/export")
 def export(body: dict = Body(...)) -> dict:
-    """Render and encode a download. **Always at the source's full size.**
+    """Render and encode a download, at the working frame's full size.
 
     ``supersample`` is the only quality choice -- 0.5, 1, 1.5, 2 (default) or 3
     -- and it picks how finely the frame is rendered, not how big the file is.
@@ -44,16 +44,32 @@ def export(body: dict = Body(...)) -> dict:
     entries differed in resolution *and* look at the same time. A ``scale`` key
     in the body is still ignored rather than rejected, so a stale client
     degrades to a full-size export instead of a 400.
+
+    **"Full size" means the frame that was rendered** (2026-08-29), which is the
+    file's own dimensions only while Prescaling Source is off. When it is on, the
+    photograph has been resampled to a working resolution and that is what every
+    tier of this endpoint renders; ``prescale_output`` in the parameters decides
+    whether the file is written at that resolution or resampled back to the
+    photograph's own. Note this is the one export decision that lives in the
+    parameters rather than in this body: it travels with a preset, on request.
     """
     up = up_model.get(body.get("id", ""))
-    p = up_model.params_for(up, body)
+    # The frame as well as the values -- see `models/upload.py:params_for`.
+    fr, p = up_model.params_for(up, body)
     fmt = body.get("format", "jpeg")
     if fmt not in iio.FORMATS:
         raise HTTPException(400, f"Unknown format {fmt!r}.")
     ss = _clamp_ss(body.get("supersample", 2))
     full = bool(body.get("full", False))
     quality = max(60, min(100, int(body.get("quality", 95))))
-    h, w = up.h, up.w
+    # Which dimensions the file is written at, and it is the one question the
+    # supersample menu deliberately does *not* answer. `prescale_output` picks:
+    # 0 writes the frame that was rendered, 1 resamples it back to the file's
+    # own dimensions. With prescaling off the two are the same number, so this
+    # is the historic behaviour by construction rather than by a branch.
+    prescaled = fr is not up
+    at_photo_size = prescaled and float(p.get("prescale_output", 0.0)) >= 0.5
+    h, w = (up.h, up.w) if at_photo_size else (fr.h, fr.w)
     job_id = uuid.uuid4().hex[:12]
     stem = Path(up.name).stem or "image"
     # Every export is the same pixel dimensions now, so the filename cannot use
@@ -72,6 +88,13 @@ def export(body: dict = Body(...)) -> dict:
     else:
         tag = ("_grain" if abs(ss - 2.0) < 1e-6
                else f"_grain_ss{ss:g}".replace(".", "_"))
+    # A prescaled export says so, and this one is not optional in the way the
+    # supersample tag is. With `prescale_output` writing the photograph's own
+    # size, a prescaled export and a plain one are the **same dimensions** and a
+    # different picture -- the exact case where a folder listing cannot tell two
+    # files apart, which is what every tag in this block exists for.
+    if prescaled:
+        tag += f"_pre{fr.target_mp:g}mp".replace(".", "_")
     JOBS[job_id] = {
         "id": job_id, "status": "queued", "progress": 0.0,
         "filename": f"{stem}{tag}.{iio.FORMATS[fmt][1]}",
@@ -79,7 +102,8 @@ def export(body: dict = Body(...)) -> dict:
         "width": int(w), "height": int(h),
     }
     threading.Thread(
-        target=run_export, args=(job_id, up, p, fmt, ss, quality, full),
+        target=run_export,
+        args=(job_id, fr, p, fmt, ss, quality, full, (int(h), int(w))),
         daemon=True,
     ).start()
     return {"job": job_id}

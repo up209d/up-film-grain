@@ -195,6 +195,29 @@ def encode_preview(arr: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
+def _interp(arr: np.ndarray, h: int, w: int, antialias: bool,
+            device=None) -> np.ndarray:
+    """One bicubic resample to an exact size, in float32.
+
+    The shared body of `downscale`, `upscale` and `resize_to`. They differ in
+    exactly two things -- how the target size is arrived at, and whether
+    `antialias` is passed -- and both of those are the caller's decision, so
+    three copies of this were three places for the device handling and the
+    clamp to drift apart.
+    """
+    t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+    # Any accelerator, not just CUDA. The old `== "cuda"` guard quietly ran a
+    # 24MP bicubic-antialias downscale in CPU torch on every upload on this
+    # machine, because the device here is `mps`.
+    if device is not None and device.type in ("cuda", "mps"):
+        t = t.to(device)
+    out = F.interpolate(
+        t, size=(h, w), mode="bicubic", antialias=antialias, align_corners=False,
+    )
+    out = out.clamp(0.0, 1.0).squeeze(0).permute(1, 2, 0).cpu().numpy()
+    return np.ascontiguousarray(out)
+
+
 def downscale(arr: np.ndarray, scale: float, device=None) -> np.ndarray:
     """Antialiased downscale in float32.
 
@@ -205,15 +228,7 @@ def downscale(arr: np.ndarray, scale: float, device=None) -> np.ndarray:
         return arr
     h, w, _ = arr.shape
     nh, nw = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
-    t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-    # Any accelerator, not just CUDA. The old `== "cuda"` guard quietly ran a
-    # 24MP bicubic-antialias downscale in CPU torch on every upload on this
-    # machine, because the device here is `mps`.
-    if device is not None and device.type in ("cuda", "mps"):
-        t = t.to(device)
-    out = F.interpolate(t, size=(nh, nw), mode="bicubic", antialias=True, align_corners=False)
-    out = out.clamp(0.0, 1.0).squeeze(0).permute(1, 2, 0).cpu().numpy()
-    return np.ascontiguousarray(out)
+    return _interp(arr, nh, nw, True, device)
 
 
 def upscale(arr: np.ndarray, h: int, w: int, device=None) -> np.ndarray:
@@ -233,9 +248,31 @@ def upscale(arr: np.ndarray, h: int, w: int, device=None) -> np.ndarray:
     """
     if arr.shape[0] == h and arr.shape[1] == w:
         return arr
-    t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-    if device is not None and device.type in ("cuda", "mps"):
-        t = t.to(device)
-    out = F.interpolate(t, size=(h, w), mode="bicubic", align_corners=False)
-    out = out.clamp(0.0, 1.0).squeeze(0).permute(1, 2, 0).cpu().numpy()
-    return np.ascontiguousarray(out)
+    return _interp(arr, h, w, False, device)
+
+
+def resize_to(arr: np.ndarray, h: int, w: int, device=None) -> np.ndarray:
+    """Resample to an exact target size in either direction, in float32.
+
+    `downscale` takes a factor and always antialiases; `upscale` takes a size
+    and never does. This takes a size and decides, which is what a caller that
+    does not know which way it is going needs -- prescaling a photograph to a
+    fixed megapixel count (`models/upload.py`) and writing a prescaled export
+    back at the file's own dimensions (`models/export_job.py`) are each an
+    enlargement on one photograph and a reduction on the next.
+
+    `antialias` is on as soon as *either* axis shrinks, for the reason `upscale`
+    gives for omitting it read in the other direction: the flag exists to fight
+    aliasing when samples are being discarded, and an axis that shrinks is
+    discarding them however the other axis moves. Getting this wrong is not
+    subtle on a rendered frame -- grain is nothing but content at the Nyquist
+    limit, so an unfiltered reduction of it aliases into visible crawl.
+
+    A no-op returning the input array itself when the size already matches, the
+    same pass-through `upscale` offers and for the same reason: `Upload.at()`
+    calls this on a photograph that is already the target size.
+    """
+    if arr.shape[0] == h and arr.shape[1] == w:
+        return arr
+    shrinking = h < arr.shape[0] or w < arr.shape[1]
+    return _interp(arr, h, w, shrinking, device)

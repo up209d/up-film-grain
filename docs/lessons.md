@@ -1,5 +1,24 @@
 # Things I got wrong, so you don't repeat them
 
+* **A check module's memory footprint is multiplied by the pool, and mine
+  crashed the machine** (2026-08-29, reported by the user). `tests/checks/prescale.py`
+  was written with realistic scenes -- a 22MP source, a 24MP one, a 6MP one --
+  and prescaled frames of them, holding roughly **1.1GB live** for the whole
+  function because every one stayed referenced to the end. On its own that is
+  fine, and it passed in 5.4s at `-j 1`. The runner defaults to `cores - 2`
+  workers, so it landed beside `edges`, `global_layers` and `film_tiling` each
+  holding fixtures of their own, and the machine ran out of memory.
+
+  What makes it a lesson rather than a slip is that **none of those arrays were
+  earning anything.** Every branch the module tests -- the target arithmetic,
+  the two identity paths, the cache, `proxy_scale`, the checkpoint id -- is
+  scale-free, so a 0.24MP source exercises exactly the code a 50MP one would.
+  The rewrite is sub-megapixel throughout, builds one 4MP frame for the single
+  assertion that genuinely needs a frame wider than `PROXY_LONG_EDGE`, drops it
+  again, and runs in 1.5s. A module is a unit of parallelism, so a big array in
+  one is a big array in fourteen: reaching for a realistic size in a check has
+  to be justified by a property that actually depends on it.
+
 * **"Strictly increasing" is not "detail survives", and a check that confuses
   them will pass while the stage destroys the picture** (reported by the user
   2026-08-16). Normalize's highlight roll was verified by asserting the transfer

@@ -46,7 +46,7 @@ COST = {
     "global_field": 24.2, "global_grain": 22.0, "scatter": 20.5,
     "internals": 19.6, "global_mix": 19.5, "film_texture": 18.5,
     "grading": 15.4, "tiling": 14.0, "sharpen": 9.9, "halation": 4.9,
-    "normalize": 3.6,
+    "normalize": 3.6, "prescale": 1.5,
     "response": 2.5, "colour": 0.3, "presets": 0.2, "imageio": 0.0,
 }
 

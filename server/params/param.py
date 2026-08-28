@@ -62,6 +62,17 @@ GLOBAL_BLENDS: tuple[str, ...] = (
 # `docs/panel-layout.md`, which also has why this list is not, and cannot be,
 # pipeline-ordered as a whole.
 GROUPS: list[str] = [
+    # Step -3, above everything, including Normalize. Not a stage: it resamples
+    # the photograph the pipeline is handed rather than the pixels in it, so it
+    # appears nowhere in `engine/stages/render.py` and reserves nothing in
+    # `pad_for` -- see `server/models/upload.py` for where the resample lives
+    # and `docs/prescale.md` for why it is above the engine rather than in it.
+    #
+    # First in this list, but the client renders this one section *above* Size
+    # Scaling rather than at the head of the parameter panel: the two answer the
+    # same question from opposite ends and reading them apart was worse than the
+    # one exception. See `docs/panel-layout.md`.
+    "Prescaling Source",
     # Step -2, above Colour Grading and therefore above everything. Its own
     # section rather than a control inside Colour Grading because it is a
     # different kind of decision: grading says what the photograph should look

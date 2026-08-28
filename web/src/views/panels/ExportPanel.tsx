@@ -63,6 +63,14 @@ export default function ExportPanel(props: {
   onFormat: (f: string) => void;
   onExport: () => void;
   job: ExportJob | null;
+  /** The pixel dimensions the file will actually be written at.
+   *
+   *  Not `meta`'s, since Prescaling Source: with it on, the photograph is
+   *  resampled to a working resolution and that is what gets written -- unless
+   *  its own Export size control asks for the file's dimensions back. Both
+   *  answers come from `models/prescale.ts:exportDims`, so this panel's labels
+   *  cannot disagree with what the server writes. */
+  outDims?: { width: number; height: number } | null;
   /** Anything to sit at the right-hand end of the bar, past its separator.
    *  What goes in it is the caller's business. */
   headerAside?: React.ReactNode;
@@ -70,7 +78,8 @@ export default function ExportPanel(props: {
   const { meta, job } = props;
   const opt = exportOption(props.exportKey);
   const exportSs = opt.ss;
-  const size = `${meta?.width}×${meta?.height}`;
+  const out = props.outDims;
+  const size = `${out?.width ?? meta?.width}×${out?.height ?? meta?.height}`;
   // Five entries render *what the preview renders* and enlarge it to the
   // source's dimensions, so the file matches the picture the settings were
   // judged on. The supersample is quality within that render, and cost is
@@ -129,7 +138,7 @@ export default function ExportPanel(props: {
         items={EXPORT_OPTIONS.map((o) => ({
           value: o.key,
           label:
-            `Full size${meta ? ` ${meta.width}×${meta.height}` : ""}` +
+            `Full size${meta ? ` ${size}` : ""}` +
             (o.full ? " / 1:1 SS 1×" : ` / SS ${o.ss}×`),
         }))}
         value={props.exportKey}

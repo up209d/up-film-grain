@@ -24,6 +24,14 @@ DEFAULTS: dict[str, float] = {p.key: p.default for p in PARAMS}
 # a worse failure than any of them being over-zealous. `verify.py` renders with
 # these and asserts the output is the input.
 NEUTRAL_ZERO: tuple[str, ...] = (
+    # Step -3, above everything. In here because it changes which pixels the
+    # pipeline is handed, so "Original" and the section's own mute button have
+    # to switch it off or an untouched photograph would come back resampled.
+    #
+    # `prescale_mp` is deliberately *not* here, and neither is `prescale_output`:
+    # a target size is a size, like a radius or a seed, and switching the section
+    # back on should return what you had dialled in rather than 1MP.
+    "prescale",
     # Step -2, above everything. It changes pixels when on, so "Original" has
     # to switch it off or the untouched photograph would come back corrected.
     "normalize", "highlight_priority",

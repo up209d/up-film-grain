@@ -36,12 +36,21 @@ def preview(body: dict = Body(...)) -> Response:
         at this point: same pixels, same coordinates, differing only in bit
         depth.
 
+    "The source" here means the photograph at its working resolution, which is
+    the file's own only while Prescaling Source is off. Both tiers are derived
+    from the same prescaled frame, so switching the target moves them together
+    and the preview never disagrees with the export about what is being
+    rendered.
+
     Both go through the identical pipeline at their working scale, which is
     what scale invariance buys -- the proxy predicts the full render's
     structure, it just cannot resolve its finest detail.
     """
     up = up_model.get(body.get("id", ""))
-    p = up_model.params_for(up, body)
+    # `params_for` returns the frame as well as the values: Prescaling Source
+    # decides what resolution the photograph *is* before any of this, and the
+    # rescaling of the values depends on the answer. See `models/upload.py`.
+    fr, p = up_model.params_for(up, body)
     ss = _clamp_ss(body.get("supersample", 2))
     full = bool(body.get("full", False))
 
@@ -55,7 +64,7 @@ def preview(body: dict = Body(...)) -> Response:
     t0 = time.time()
     try:
         with RENDER_LOCK:
-            out = render_tier(up, p, ss, full, should_cancel=superseded)
+            out = render_tier(fr, p, ss, full, should_cancel=superseded)
     except RenderCancelled:
         # 499, nginx's "client closed request". The client aborted this fetch the
         # moment it issued the newer one, so nothing is waiting for this body --

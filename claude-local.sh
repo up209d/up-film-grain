@@ -1,0 +1,5 @@
+#!/bin/bash
+ 
+ANTHROPIC_BASE_URL=http://192.168.86.250:11434 \
+ANTHROPIC_AUTH_TOKEN=llm ANTHROPIC_API_KEY= \
+claude --model qwen3.8:27b

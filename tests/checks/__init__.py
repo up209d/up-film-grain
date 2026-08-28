@@ -13,14 +13,14 @@ global_mix` is the honest re-run; the whole suite is not.
 from __future__ import annotations
 
 from tests.checks import (  # noqa: F401
-    tiling, colour, presets, normalize, grading, response,
+    tiling, colour, presets, prescale, normalize, grading, response,
     global_grain, global_layers, global_field, global_mix,
     edges, scatter, halation, sharpen, film_texture, film_tiling,
     internals, imageio,
 )
 
 ORDER = [
-    "tiling", "colour", "presets", "normalize", "grading", "response",
+    "tiling", "colour", "presets", "prescale", "normalize", "grading", "response",
     "global_grain", "global_layers", "global_field", "global_mix",
     "edges", "scatter", "halation", "sharpen", "film_texture", "film_tiling",
     "internals", "imageio",

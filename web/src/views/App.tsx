@@ -27,6 +27,7 @@ import {
   sectionDomId,
 } from "../models/constants";
 import { groupedParams, isNeutral } from "../models/paramState";
+import { PRESCALE_GROUP, exportDims, prescaleGeom } from "../models/prescale";
 import type { Compare } from "../models/types";
 import type { ImageMeta } from "../services/api";
 import filmGrain16x9 from "../assets/film-grain-16x9.jpg";
@@ -90,15 +91,33 @@ export default function App() {
   const v = useValues(schema, booted, meta?.id ?? null, randomizeSeedOnOpen);
   const { showBefore, setShowBefore } = useBeforePeek();
 
+  /** The frame the pipeline actually renders, which is the file only while
+   *  Prescaling Source is off. Everything that quotes a size or sizes itself
+   *  from one reads this rather than `meta` -- see `models/prescale.ts`.
+   *
+   *  From `applied`, not `values`: it describes the render on screen, and a
+   *  half-finished drag of the target has not been rendered yet. The export
+   *  panel is the one exception, because `useExport` sends `values`. */
+  const geom = useMemo(() => prescaleGeom(meta, v.applied), [meta, v.applied]);
+  const outDims = useMemo(
+    () => exportDims(meta, prescaleGeom(meta, v.values), v.values),
+    [meta, v.values],
+  );
+
   /** The reference size the *render* uses, which is not always the one the
    *  preset recorded. The server scales lengths by sqrt(photoMP / referenceMP),
    *  so a hand-set linear factor `f` is exactly the reference size that solves
    *  that for `f` -- which keeps the override on this side of the API and
    *  leaves `v.referenceMp` holding what the preset actually says, so saving a
-   *  file still stamps the truth. */
+   *  file still stamps the truth.
+   *
+   *  Against the *prescaled* megapixels, because that is what the server
+   *  measures against (`models/upload.py:params_for`). Reading the file's own
+   *  size here would make a hand-set factor solve the wrong equation and the
+   *  readout disagree with the render. */
   const renderReferenceMp =
-    scaleOverride !== null && meta
-      ? meta.megapixels / (scaleOverride * scaleOverride)
+    scaleOverride !== null && geom
+      ? geom.megapixels / (scaleOverride * scaleOverride)
       : v.referenceMp;
 
   const preview = usePreview({
@@ -148,7 +167,7 @@ export default function App() {
   const presetFile = usePresetFile({
     schema,
     values: v.values,
-    meta,
+    frameMp: geom?.megapixels ?? null,
     referenceMp: v.referenceMp,
     lut: v.lut,
     author: v.author,
@@ -161,6 +180,46 @@ export default function App() {
   });
 
   const grouped = useMemo(() => groupedParams(schema), [schema]);
+  /** Prescaling Source is rendered above Size Scaling rather than at the head
+   *  of the parameter panel, which is the one section that does not sit where
+   *  `GROUPS` puts it.
+   *
+   *  It is still generated from the schema by the same `SliderPanel` -- this is
+   *  a second instance of it fed one section, not a hand-built panel, so
+   *  `docs/architecture.md`'s rule that no view defines a control still holds
+   *  and mute, reset, the jump menu and preset save/load need no special case.
+   *  The reason is that the two sections answer the same question from opposite
+   *  ends: Size Scaling moves the parameters to fit the photograph, this moves
+   *  the photograph to fit the parameters, and reading them a panel apart made
+   *  neither make sense. */
+  /** Everything a `SliderPanel` needs except which sections it renders. Both
+   *  instances take the identical wiring -- a second copy of it is how the two
+   *  would quietly stop behaving the same way. */
+  const panelProps = {
+    values: v.values,
+    muted: v.muted,
+    collapsed,
+    onToggleCollapsed: (g: string) =>
+      setCollapsed((c) => ({ ...c, [g]: !c[g] })),
+    onResetGroup: v.resetGroup,
+    onToggleGroup: v.toggleGroup,
+    onChange: v.setValue,
+    onChangeNow: v.setValueNow,
+    onCommit: v.commit,
+    luts,
+    lut: v.lut,
+    onPickLut: lutCtl.pickLut,
+    onLoadLutFile: () => lutCtl.fileRef.current?.click(),
+  };
+
+  const prescaleGroup = useMemo(
+    () => grouped.filter((g) => g.group === PRESCALE_GROUP),
+    [grouped],
+  );
+  const pipelineGroups = useMemo(
+    () => grouped.filter((g) => g.group !== PRESCALE_GROUP),
+    [grouped],
+  );
   // "Collapse all" while anything is open, "Expand all" once everything is
   // shut -- one button, and which way it goes is never in doubt because the
   // panel in front of you is the state it is reading.
@@ -191,6 +250,7 @@ export default function App() {
     <div className="app">
       <TopBar
         meta={meta}
+        geom={geom}
         device={device}
         rendering={preview.rendering}
         renderMs={preview.renderMs}
@@ -207,6 +267,7 @@ export default function App() {
       <main className="body">
         <Stage
           meta={meta}
+          geom={geom}
           previewUrl={preview.previewUrl}
           sourceUrl={preview.sourceUrl}
           compare={compare}
@@ -227,6 +288,7 @@ export default function App() {
           corner={
             <ExportPanel
               meta={meta}
+              outDims={outDims}
               exportKey={exporter.exportKey}
               onExportKey={exporter.setExportKey}
               format={exporter.format}
@@ -272,13 +334,25 @@ export default function App() {
               bar now: they are things you do *to the view*, like zoom, and
               having them in the panel meant looking away from the photo to
               drive a wipe across it. */}
+          {/* Above Size Scaling, and the pair is deliberate: this section
+              resamples the photograph to fit the parameters and the one below
+              rescales the parameters to fit the photograph. With both at 24MP
+              the second one's factor sits at 1.00x, which is the clearest
+              possible statement of how they relate. */}
+          <SliderPanel {...panelProps} grouped={prescaleGroup} />
+
           <ScalePanel
             meta={meta}
+            geom={geom}
             referenceMp={v.referenceMp}
             scaleToRef={scaleToRef}
             scaleOverride={scaleOverride}
             onToggleScaleToRef={() => setScaleToRef((x) => !x)}
-            onSetFromPhoto={() => meta && v.setReferenceMp(meta.megapixels)}
+            // The *working* size, not the file's. `reference_mp` records the
+            // size these numbers were dialled in at, and with prescaling on
+            // that is the prescaled frame -- stamping the file's size would
+            // record a photograph the look was never judged on.
+            onSetFromPhoto={() => geom && v.setReferenceMp(geom.megapixels)}
             onScaleOverride={(f) => {
               setScaleOverride(f);
               // Setting a factor by hand means wanting it used; leaving it
@@ -303,7 +377,7 @@ export default function App() {
           </Field>
           <p className="hint">
             Editing renders a{" "}
-            {meta ? `${meta.proxy_width}×${meta.proxy_height}` : "proxy"} proxy
+            {geom ? `${geom.proxyWidth}×${geom.proxyHeight}` : "proxy"} proxy
             so sliders stay responsive. It predicts structure but cannot resolve
             the finest grain — <strong>Render 1:1</strong> for the exact
             exported pixels, and judge grain there at 100% zoom. Any adjustment
@@ -355,24 +429,7 @@ export default function App() {
             notice={notice}
           />
 
-          <SliderPanel
-            grouped={grouped}
-            values={v.values}
-            muted={v.muted}
-            collapsed={collapsed}
-            onToggleCollapsed={(g) =>
-              setCollapsed((c) => ({ ...c, [g]: !c[g] }))
-            }
-            onResetGroup={v.resetGroup}
-            onToggleGroup={v.toggleGroup}
-            onChange={v.setValue}
-            onChangeNow={v.setValueNow}
-            onCommit={v.commit}
-            luts={luts}
-            lut={v.lut}
-            onPickLut={lutCtl.pickLut}
-            onLoadLutFile={() => lutCtl.fileRef.current?.click()}
-          />
+          <SliderPanel {...panelProps} grouped={pipelineGroups} />
           <input
             ref={lutCtl.fileRef}
             type="file"
