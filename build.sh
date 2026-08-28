@@ -18,6 +18,13 @@
 #   ./build.sh --skip-client          reuse the existing web/dist
 #   ./build.sh --skip-runtime         reuse build/bundle/runtime (fast iteration)
 #
+# CLEANUP_OLD_BUILD=1 ./build.sh    delete the previous build/bundle and dist/
+#                                   first, so nothing from an earlier run can be
+#                                   carried into this one. --skip-runtime still
+#                                   wins for build/bundle/runtime: the cleanup
+#                                   would otherwise re-download it and the two
+#                                   flags together would mean nothing.
+#
 # Windows and Linux are not supported yet and say so; tools/bundle.py records
 # what they will need.
 set -euo pipefail
@@ -36,7 +43,7 @@ for arg in "$@"; do
     --no-electron) WITH_ELECTRON=0 ;;
     --skip-client) SKIP_CLIENT=1 ;;
     --skip-runtime) SKIP_RUNTIME=1 ;;
-    -h|--help)     sed -n '2,25p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)     sed -n '2,29p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -62,6 +69,19 @@ case "$TARGET" in
   windows|linux) python3 tools/bundle.py --target "$TARGET" || exit $? ;;
   *) die "unknown target: $TARGET (mac, windows, linux)" ;;
 esac
+
+# Optional clean slate, off by default -- a normal build is incremental on
+# purpose (the Python runtime is a ~700MB download). Everything removed here is
+# build output; nothing in the source tree is touched.
+if [ -n "${CLEANUP_OLD_BUILD:-}" ] && [ "${CLEANUP_OLD_BUILD}" != "0" ]; then
+  say "cleanup: removing previous build output"
+  rm -rf dist build/bundle/payload
+  if [ "$SKIP_RUNTIME" = 1 ]; then
+    say "cleanup: keeping build/bundle/runtime (--skip-runtime)"
+  else
+    rm -rf build/bundle/runtime
+  fi
+fi
 
 # ---------------------------------------------------------------- 1. client --
 # node from nvm, chosen by .nvmrc rather than a hardcoded patch version. The old
