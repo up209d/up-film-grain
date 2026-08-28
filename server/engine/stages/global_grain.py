@@ -7,7 +7,6 @@ import torch
 from ..constants.core import (
     _AMP_SCALE, _GLAYER_SEEDS, _GNORM, _GSRC_KEYS, _MIN_CELL,
 )
-from ..device import _grain_cache_bytes
 from ..masks import _grain_delta, _source_masks
 from ..noise.fields import _fbm, _smooth_noise
 from ..noise.grain import _grain_points
@@ -173,14 +172,12 @@ class GlobalGrainMixin:
         if gen != self._gg_gen:
             self._gg_prev_gen, self._gg_gen = self._gg_gen, gen
             live = (self._gg_gen, self._gg_prev_gen)
-            for k in [k for k in self._gg_cache if k[5:] not in live]:
-                old = self._gg_cache.pop(k)
-                self._gg_bytes -= old.element_size() * old.nelement()
-                self.gg_evicted += 1
+            self.gg_evicted += self._gg_cache.drop_if(
+                lambda k, live=live: k[5:] not in live
+            )
 
-        hit = self._gg_cache.get(key)
+        hit = self._gg_cache.get(key, self.device)
         if hit is not None:
-            self._gg_cache.move_to_end(key)
             # Counted apart so a test can tell *which* layer missed. The two
             # share the one LRU and the one byte budget, deliberately -- five
             # layers competing for one allowance rather than five allowances --
@@ -271,21 +268,18 @@ class GlobalGrainMixin:
 
         gg = (gg / _GNORM).clamp(-1.0, 1.0)
 
-        # LRU insert. An entry larger than the whole budget is returned without
-        # being cached rather than immediately evicting itself -- otherwise a
-        # single-tile render of a large frame would thrash the cache empty on
-        # every pass and pay the bookkeeping for nothing.
-        nbytes = gg.element_size() * gg.nelement()
-        # Read per insert rather than at import: it is derived from the device's
-        # own budget now, and a process that changes `FILM_GRAIN_TILE_BUDGET_GB`
-        # to reproduce a small machine has to see the smaller cache too.
-        cap = _grain_cache_bytes()
-        if nbytes <= cap:
-            self._gg_cache[key] = gg
-            self._gg_bytes += nbytes
-            while self._gg_bytes > cap and len(self._gg_cache) > 1:
-                _, old = self._gg_cache.popitem(last=False)
-                self._gg_bytes -= old.element_size() * old.nelement()
+        # LRU insert, onto the SSD -- the store writes the file and keeps a path
+        # (`engine/diskcache.py`). An entry larger than the whole budget is
+        # returned without being cached rather than immediately evicting itself,
+        # which the store enforces: otherwise a single-tile render of a large
+        # frame would thrash the cache empty on every pass and pay the
+        # bookkeeping for nothing.
+        #
+        # **This layer is a texture, not a photograph, and that is what makes it
+        # safe to write.** It reads no image data at all -- every input is a
+        # parameter or an absolute coordinate -- so nothing about the user's
+        # picture is on the disk here, unlike the checkpoint store next door.
+        self._gg_cache.put(key, gg)
         return gg
 
     def _global_grain(

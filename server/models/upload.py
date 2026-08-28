@@ -8,6 +8,20 @@ rendered smaller so a slider stays responsive. ``Frame`` is a *look* decision
 -- a different working resolution for the photograph itself, so that the
 pipeline's lengths mean the same thing whatever came out of the camera. Every
 ``Frame`` has a proxy of its own for exactly that reason.
+
+**None of these arrays is held in process memory** (2026-08-29). A 24MP source
+is 288MB of float32 and an `Upload` carries four such arrays once it has a
+`Frame` -- source, proxy, prescaled source, prescaled proxy -- against a cap of
+twelve uploads, so this was the largest single claim on RAM in the app by a wide
+margin and most of it was for photographs the user had moved on from. Each is
+written once to the SSD and mapped back copy-on-write when something reads it
+(`engine.diskcache.Spill`), so the pages are file-backed: the kernel can drop
+them under pressure instead of swapping them, and `GrainEngine.flush_ram` drops
+the mapping outright once rendering stops.
+
+It is a `Spill` rather than a `DiskStore` entry because these are not cache
+misses waiting to happen -- the decoded photograph cannot be recomputed from
+anything the process still has. A store may answer `None`; this may not.
 """
 
 from __future__ import annotations
@@ -21,6 +35,7 @@ from fastapi import HTTPException
 from .. import imageio as iio
 from .. import lut as lutlib
 from .. import params as P
+from ..engine.diskcache import Spill
 from ..engine.stages import normalize
 from ..runtime import DEVICE
 
@@ -122,8 +137,8 @@ class Frame:
         # braces -- which is the right amount for a cache whose stale hit is a
         # plausible but wrong *photograph*.
         self.id = f"{up.id}@{target_mp:g}mp"
-        self._arr: np.ndarray | None = None
-        self._proxy: np.ndarray | None = None
+        self._arr: Spill | None = None
+        self._proxy: Spill | None = None
 
     @property
     def arr(self) -> np.ndarray:
@@ -132,10 +147,17 @@ class Frame:
         Lazy, unlike the proxy's eager cousin on ``Upload``, because only the
         full tier and the 1:1 export ever ask: at 24MP this is ~288MB, and a
         session that never leaves the proxy must not pay for it.
+
+        Laziness is still worth having now the array lives on disk. What it
+        saves has changed rather than gone: not 288MB of RAM, but a resample and
+        a 288MB write that a session which never leaves the proxy would never
+        read back.
         """
         if self._arr is None:
-            self._arr = iio.resize_to(self.up.arr, self.h, self.w, DEVICE)
-        return self._arr
+            self._arr = Spill(
+                "frame", iio.resize_to(self.up.arr, self.h, self.w, DEVICE)
+            )
+        return self._arr.array
 
     @property
     def proxy(self) -> np.ndarray:
@@ -151,8 +173,10 @@ class Frame:
         if self._proxy is None:
             ph = max(1, int(round(self.h * self.proxy_scale)))
             pw = max(1, int(round(self.w * self.proxy_scale)))
-            self._proxy = iio.resize_to(self.up.arr, ph, pw, DEVICE)
-        return self._proxy
+            self._proxy = Spill(
+                "frame-proxy", iio.resize_to(self.up.arr, ph, pw, DEVICE)
+            )
+        return self._proxy.array
 
     def norm_stats(self) -> dict[str, float]:
         """Normalize's metering -- the upload's, shared, and not re-measured.
@@ -167,19 +191,37 @@ class Frame:
         """
         return self.up.norm_stats()
 
+    def release(self) -> None:
+        """Delete this frame's files. Nothing may read it afterwards.
+
+        Called when the target changes or the upload is reaped. Without it the
+        cache directory keeps a full-resolution array per working resolution the
+        user ever tried, which is exactly the unbounded growth the single-slot
+        `Upload.frame` was written to avoid in memory.
+        """
+        for sp in (self._arr, self._proxy):
+            if sp is not None:
+                sp.release()
+        self._arr = self._proxy = None
 
 
 class Upload:
-    __slots__ = ("id", "name", "arr", "h", "w", "proxy", "proxy_scale",
+    __slots__ = ("id", "name", "_arr", "h", "w", "_proxy", "proxy_scale",
                  "src_enc", "norm", "frame", "touched")
 
     def __init__(self, uid: str, name: str, arr: np.ndarray) -> None:
         self.id = uid
         self.name = name
-        self.arr = arr
         self.h, self.w = arr.shape[:2]
         self.proxy_scale = min(1.0, PROXY_LONG_EDGE / float(max(self.h, self.w)))
-        self.proxy = iio.downscale(arr, self.proxy_scale, DEVICE)
+        proxy = iio.downscale(arr, self.proxy_scale, DEVICE)
+        # Both go straight to the SSD; `arr` and `proxy` below map them back.
+        self._arr = Spill("source", arr)
+        # `downscale` hands back the input array itself when the scale is 1 --
+        # a photograph no larger than the proxy long edge is its own proxy. Share
+        # the one file in that case rather than writing a second copy of the same
+        # pixels, which is both a wasted write and a second thing to keep in step.
+        self._proxy = self._arr if proxy is arr else Spill("proxy", proxy)
         # The untouched image never changes, so it is encoded once and served
         # from here rather than re-encoded on every parameter change. Named for
         # "encoded" rather than a format: it follows `iio.encode_preview`, which
@@ -203,6 +245,34 @@ class Upload:
         # as `(target_mp, Frame)`. See `at()`.
         self.frame: tuple[float, Frame] | None = None
         self.touched = time.time()
+
+    @property
+    def arr(self) -> np.ndarray:
+        """The decoded photograph, mapped from disk. See the module docstring."""
+        return self._arr.array
+
+    @property
+    def proxy(self) -> np.ndarray:
+        """The working proxy, mapped from disk."""
+        return self._proxy.array
+
+    def release(self) -> None:
+        """Delete every file this upload owns. It is unusable afterwards.
+
+        Called by `reap()`. Deleting rather than leaving the files for the
+        `atexit` sweep, because the whole point of the twelve-upload cap is that
+        an editing session over a hundred photographs does not accumulate all
+        hundred -- and that argument does not change when the accumulation is on
+        a disk instead of in memory.
+        """
+        if self.frame is not None:
+            self.frame[1].release()
+            self.frame = None
+        # `_proxy` may be `_arr` -- see `__init__`. `Spill.release` is idempotent,
+        # so the aliased case needs no special handling here.
+        self._proxy.release()
+        self._arr.release()
+        self.src_enc = None
 
     def norm_stats(self) -> dict[str, float]:
         """The metered correction for this photograph, measured once."""
@@ -242,6 +312,12 @@ class Upload:
             return self
         if self.frame is not None and self.frame[0] == target_mp:
             return self.frame[1]
+        if self.frame is not None:
+            # The outgoing frame's files go with it. In the old in-memory version
+            # rebinding the slot was enough and the arrays were collected; a file
+            # has to be unlinked, and one left behind is a full-resolution array
+            # on the disk that nothing can ever reach again.
+            self.frame[1].release()
         fr = Frame(self, target_mp)
         self.frame = (target_mp, fr)
         return fr
@@ -252,11 +328,61 @@ _MAX_UPLOADS = 12
 
 
 def reap() -> None:
-    """Drop the oldest uploads; full-resolution arrays are large."""
+    """Drop the oldest uploads; full-resolution arrays are large.
+
+    Still capped at twelve now that the arrays are on the SSD rather than in
+    memory. The resource being protected changed and the reason did not: twelve
+    24MP photographs with a prescaled frame apiece are ~8GB, which is as
+    unreasonable a thing to leave on someone's disk as it was to hold in their
+    RAM.
+    """
     if len(UPLOADS) <= _MAX_UPLOADS:
         return
     for uid in sorted(UPLOADS, key=lambda k: UPLOADS[k].touched)[:-_MAX_UPLOADS]:
-        UPLOADS.pop(uid, None)
+        up = UPLOADS.pop(uid, None)
+        if up is not None:
+            up.release()
+
+
+def reset(keep: str) -> None:
+    """Opening a photograph throws away everything cached for the last one.
+
+    Requested outright (2026-08-29), and it is the right call rather than merely
+    what was asked for: **every cache in the app is keyed to a photograph and
+    none of it can ever be hit again once you open a different one.** The
+    checkpoint frames carry the upload id in their key by construction; the
+    source and proxy arrays are that photograph's pixels. Left alone they sit on
+    the disk until the twelve-upload cap or the process gets round to them,
+    which for a session that opens forty photographs is thirty-nine
+    photographs' worth of files nothing will read.
+
+    So the cap is not what bounds this any more -- it is the fallback for the
+    case this misses, which is why it stays. What actually bounds the disk is
+    that opening a photograph is a hard reset.
+
+    Two things deliberately survive:
+
+    * **Finished exports.** A rendered file waiting to be downloaded is not a
+      cache, it is the user's output, and dropping it because they opened the
+      next photograph would be silent data loss.
+    * **The Global Grain texture store**, which is cleared for tidiness rather
+      than necessity -- it reads no image data at all, so its entries are
+      *technically* still valid for the new photograph. They are dropped anyway
+      because a new photograph is almost always a new set of parameters, and
+      holding gigabytes on the off-chance is the habit this whole change is
+      about. That is a judgement, not a correctness requirement; if a workflow
+      ever turns out to open images with the look already dialled in, this is
+      the line to reconsider.
+    """
+    from ..runtime import ENGINE
+
+    for uid in [u for u in UPLOADS if u != keep]:
+        up = UPLOADS.pop(uid, None)
+        if up is not None:
+            up.release()
+    ENGINE.ckpt.clear()
+    ENGINE.clear_caches()
+    ENGINE.flush_ram()
 
 
 def get(uid: str) -> Upload:

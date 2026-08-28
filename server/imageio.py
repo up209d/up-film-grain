@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageOps
 
+from .engine.device import device_work
+
 # Pillow refuses very large images by default as a decompression-bomb guard.
 # Raise it: 45MP+ stills are the target, not an attack.
 Image.MAX_IMAGE_PIXELS = 400_000_000
@@ -205,16 +207,23 @@ def _interp(arr: np.ndarray, h: int, w: int, antialias: bool,
     three copies of this were three places for the device handling and the
     clamp to drift apart.
     """
-    t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-    # Any accelerator, not just CUDA. The old `== "cuda"` guard quietly ran a
-    # 24MP bicubic-antialias downscale in CPU torch on every upload on this
-    # machine, because the device here is `mps`.
-    if device is not None and device.type in ("cuda", "mps"):
-        t = t.to(device)
-    out = F.interpolate(
-        t, size=(h, w), mode="bicubic", antialias=antialias, align_corners=False,
-    )
-    out = out.clamp(0.0, 1.0).squeeze(0).permute(1, 2, 0).cpu().numpy()
+    # The one place in this module that touches the GPU, so the one place that
+    # has to say so. `device_work` is what stops the engine's idle flush from
+    # calling `empty_cache` underneath this -- an upload resamples on a request
+    # thread holding no render lock at all, and on MPS that collision aborts the
+    # process rather than merely racing. See `engine/device.py`.
+    with device_work():
+        t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+        # Any accelerator, not just CUDA. The old `== "cuda"` guard quietly ran a
+        # 24MP bicubic-antialias downscale in CPU torch on every upload on this
+        # machine, because the device here is `mps`.
+        if device is not None and device.type in ("cuda", "mps"):
+            t = t.to(device)
+        out = F.interpolate(
+            t, size=(h, w), mode="bicubic", antialias=antialias,
+            align_corners=False,
+        )
+        out = out.clamp(0.0, 1.0).squeeze(0).permute(1, 2, 0).cpu().numpy()
     return np.ascontiguousarray(out)
 
 

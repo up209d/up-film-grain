@@ -26,4 +26,11 @@
   font-size: 12px; line-height: 1.45;
   box-shadow: 0 8px 26px rgba(0,0,0,.55);
   pointer-events: none;
+  /* Newlines in the text are kept, runs of spaces are not. A no-op for every
+     tooltip written before the cache readout -- they are single paragraphs with
+     no newlines in them at all -- and what lets that one list the stores on
+     their own lines instead of running them into a sentence. `pre-wrap` would
+     also preserve the indentation of the source string, which in a TS template
+     literal is whatever the code happened to be indented by. */
+  white-space: pre-line;
 }

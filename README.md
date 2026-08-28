@@ -130,8 +130,9 @@ clears it:
 | `FILM_GRAIN_LUTS` | `luts/` | read the LUT tree from elsewhere |
 | `FILM_GRAIN_DEVICE` | unset (auto) | force `cpu`, `mps` or `cuda`; an unavailable one warns and falls back to auto |
 | `FILM_GRAIN_TILE_BUDGET_GB` | half the device's recommended max | render memory pool; lower it to reproduce a smaller machine |
-| `FILM_GRAIN_GRAIN_CACHE_GB` | 15% of the pool | Global Grain texture cache cap |
-| `FILM_GRAIN_CHECKPOINT_GB` | 15% of the pool | pipeline checkpoint cache; 0 disables it |
+| `FILM_GRAIN_CACHE_DIR` | the OS cache dir | where the disk caches live; a per-run subfolder is made inside it and removed on exit |
+| `FILM_GRAIN_DISK_CACHE_GB` | `8` (clamped to a quarter of free space) | disk shared by the checkpoint and grain-texture stores, half each. **0 switches both off** — the honest way to measure what they are worth, and the opt-out for anyone who would rather not spend the write cycles |
+| `FILM_GRAIN_FLUSH_IDLE` | `2` | seconds after the last render before mapped frames and the allocator's free list are handed back; 0 flushes immediately after every render |
 
 **Production is the default**, because dev is the mode that needs holes in it:
 

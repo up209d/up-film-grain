@@ -16,12 +16,12 @@ from tests.checks import (  # noqa: F401
     tiling, colour, presets, prescale, normalize, grading, response,
     global_grain, global_layers, global_field, global_mix,
     edges, scatter, halation, sharpen, film_texture, film_tiling,
-    internals, imageio,
+    internals, imageio, diskcache,
 )
 
 ORDER = [
     "tiling", "colour", "presets", "prescale", "normalize", "grading", "response",
     "global_grain", "global_layers", "global_field", "global_mix",
     "edges", "scatter", "halation", "sharpen", "film_texture", "film_tiling",
-    "internals", "imageio",
+    "internals", "imageio", "diskcache",
 ]

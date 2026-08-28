@@ -27,7 +27,9 @@ parameters measured 7.36s and 0 hits; with a budget that fits, 1.78s and 5 hits.
 `Stock` never showed it because one layer always fitted — which is why the
 2026-08-04 audit recorded this cache as working.
 
-It is `device._grain_cache_bytes()` now, a share of the same pool `tile_for`
+It is a share of a *disk* budget now (`engine/diskcache.py`, 2026-08-29);
+between 2026-08-08 and then it was `device._grain_cache_bytes()`, a share of the
+same device pool `tile_for`
 draws on. The two genuinely compete and the split is explicit for the first time:
 `tile_for` used to take the whole budget while the cache took 0.5GB on top, so
 their sum was never a real ceiling.
@@ -197,6 +199,11 @@ from every section against a warm cache and requires the result to be bit-equal
 to an engine that has never seen a checkpoint. A stale hit here renders a
 plausible, wrong *photograph*, where the texture cache's version renders only a
 wrong texture.
+
+**Neither cache is in memory any more** (2026-08-29): both are indexes over
+files on the SSD, and a checkpoint hit reads 184MB back in under 100ms to skip
+1.2s of render. See `docs/disk-cache.md`. Everything below still holds — the
+policy did not change, only the medium.
 
 Memory is bounded the same way the texture cache is — two generations per
 boundary, so 369–737MB at a 2400px proxy rather than growing to the cap.

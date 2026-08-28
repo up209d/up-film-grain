@@ -1,5 +1,55 @@
 # Things I got wrong, so you don't repeat them
 
+* **Guarding the callers is not guarding the resource, and on MPS the penalty
+  is the process, not a wrong answer** (2026-08-29). The idle flush that hands
+  the allocator's free list back fires on a timer thread. First version took
+  `runtime.RENDER_LOCK` before calling `release_cache`, which looks like the
+  right lock -- it is the one every render takes. The whole check suite died:
+
+      -[IOGPUMetalCommandBuffer validate]: failed assertion
+        `commit an already committed command buffer'
+
+  `torch.mps.empty_cache()` commits and synchronises the command queue, so
+  running it while *any* thread has device work in flight aborts the process
+  outright. And plenty of device work does not go through `render_image`: every
+  check in `tests/checks/` that calls `render()` directly, and every upload,
+  which resamples through `imageio._interp` on a request thread holding nothing
+  at all. Moving the lock onto the engine did not help either -- it was the same
+  mistake one object over.
+
+  The fix is that the thing being protected is **the device**, so the guard has
+  to live there: `device.device_work()` is a counter every GPU entry point
+  increments, and `device.try_release_cache` does nothing unless it reads zero.
+  A counter rather than a mutex because the exclusion is asymmetric -- many
+  threads may use the device at once, which was already true and already fine,
+  and only the release must be alone. A lock held for a whole render would have
+  made an upload during a 24MP export wait for the export.
+
+  The general shape: when a call is unsafe *concurrently with a resource being
+  in use*, enumerate the resource, not the callers. Enumerating callers means
+  being right about every path today and every path anyone adds, and the failure
+  is a crash in a thread nobody was looking at.
+
+* **`atexit` does not run on SIGTERM, and SIGTERM is how the desktop app
+  quits** (2026-08-29). The disk cache registered its cleanup with `atexit` and
+  swept dead `run-<pid>` directories on the next start, which covered a clean
+  exit and a `SIGKILL` and looked complete. It missed the *normal* path:
+  `electron/main.js` sends SIGTERM, Python's default handler terminates without
+  running `atexit`, so every ordinary quit left a full run's spill -- up to the
+  disk budget plus the open photograph's frames -- lying in `~/Library/Caches`
+  until the app was next opened.
+
+  Two things made this worth writing down. First, it was invisible in every test
+  I ran, because I kept restarting the app and the sweep tidied up behind me;
+  the bug only exists for the user who quits and does not come back. Second, the
+  fix depends on a uvicorn detail that looks like it should not work: uvicorn
+  installs its own signal handlers for the duration of `Server.run` and, on the
+  way out, **restores the previous ones and re-raises the captured signal**. So a
+  handler installed *before* `run()` is not shadowed, it is deferred. Installing
+  one after `run()` returns is too late; replacing uvicorn's breaks the graceful
+  shutdown. Check what your server framework does with signals before assuming
+  either.
+
 * **A check module's memory footprint is multiplied by the pool, and mine
   crashed the machine** (2026-08-29, reported by the user). `tests/checks/prescale.py`
   was written with realistic scenes -- a 22MP source, a 24MP one, a 6MP one --

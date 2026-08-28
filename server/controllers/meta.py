@@ -8,8 +8,8 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from .. import lut as lutlib
 from .. import params as P
-from ..engine import device_name
-from ..runtime import DEVICE
+from ..engine import device_name, diskcache
+from ..runtime import DEVICE, ENGINE
 
 router = APIRouter(prefix="/api")
 
@@ -17,6 +17,43 @@ router = APIRouter(prefix="/api")
 @router.get("/health")
 def health() -> dict:
     return {"ok": True, "device": device_name(DEVICE)}
+
+
+@router.get("/cache")
+def cache() -> dict:
+    """What the caches are holding, and where.
+
+    Its own endpoint rather than a field on ``/api/health`` because the client
+    polls this one on a timer while the picture is up, and health is asked once
+    at boot. Everything in it is assembled by `engine.diskcache.stats` -- what
+    counts as "the cache" is that module's business, and a controller that
+    itemised the stores would need editing every time one is added.
+
+    Read-only and cheap: the byte totals are counters the stores already keep,
+    so nothing here walks the directory.
+    """
+    return diskcache.stats()
+
+
+@router.post("/cache/clear")
+def cache_clear() -> dict:
+    """Throw away every cache that can be rebuilt. The photograph survives.
+
+    What it drops is the checkpoint frames and the Global Grain textures, plus
+    the mapped pages and the allocator's free list that `flush_ram` would have
+    given back on its own a couple of seconds later. What it deliberately does
+    **not** drop is the uploaded photograph's own arrays or a finished export --
+    neither can be rebuilt from anything the process still has, so clearing them
+    would not be freeing a cache, it would be losing the user's work.
+
+    Opening a new photograph clears rather more than this (see
+    `models.upload.reset`), because a different photograph makes the frames
+    themselves unreachable and this does not.
+    """
+    ENGINE.ckpt.clear()
+    ENGINE.clear_caches()
+    ENGINE.flush_ram()
+    return diskcache.stats()
 
 
 @router.get("/params")

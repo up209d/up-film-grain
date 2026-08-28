@@ -14,6 +14,7 @@
 import { useMemo, useState } from "react";
 
 import { useBeforePeek } from "../controllers/useBeforePeek";
+import { useCacheStats } from "../controllers/useCacheStats";
 import { useExport } from "../controllers/useExport";
 import { useLuts } from "../controllers/useLuts";
 import { usePresetFile } from "../controllers/usePresetFile";
@@ -33,6 +34,7 @@ import type { ImageMeta } from "../services/api";
 import filmGrain16x9 from "../assets/film-grain-16x9.jpg";
 import Field from "./controls/Field";
 import SelectMenu from "./controls/SelectMenu";
+import CacheReadout from "./panels/CacheReadout";
 import ExportPanel from "./panels/ExportPanel";
 import PresetPicker from "./panels/PresetPicker";
 import ScalePanel from "./panels/ScalePanel";
@@ -129,6 +131,14 @@ export default function App() {
     lut: v.lut,
     onError: setError,
     onDevice: setDevice,
+  });
+
+  // Polled while a photograph is up. `pulse` is the render flag, so the numbers
+  // refresh the moment a render finishes rather than up to a tick later --
+  // which is precisely when somebody watching this readout is watching it.
+  const cache = useCacheStats({
+    active: !!meta,
+    pulse: preview.rendering || preview.renderingFull,
   });
 
   const exporter = useExport({
@@ -303,6 +313,12 @@ export default function App() {
               // than the picture.
               headerAside={
                 <>
+                  <CacheReadout
+                    stats={cache.stats}
+                    onClear={cache.clear}
+                    busy={cache.busy}
+                  />
+                  <span className="vsep" />
                   <button
                     className="seg"
                     onClick={toggleAllCollapsed}

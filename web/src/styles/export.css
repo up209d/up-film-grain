@@ -50,6 +50,25 @@
   width: 1px; align-self: stretch; margin: 1px 3px;
   background: var(--line);
 }
+/* The cache readout. Tabular figures and a floor on the width, for the reason
+   every other number in this bar is sized: "1.9 GB" becoming "980 MB" must not
+   drag the controls either side of it sideways, and this one changes on a timer
+   rather than on a gesture, so a bar that twitched would twitch while nobody
+   was touching it. */
+.cornerbar .cachefig {
+  flex: 0 0 auto;
+  min-width: 132px;
+  font-size: 11px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: default;
+}
+.cornerbar .cachefig b { color: var(--text); font-weight: 600; }
+/* Separates the two figures without the weight of another `.vsep` -- they are
+   one readout, not two groups of controls. */
+.cornerbar .cachedot { margin: 0 5px; opacity: .55; }
+
 /* In-flight export, inline. The bar is fixed-width elsewhere, so this is too:
    a progress readout that grows as the percentage gains a digit would nudge
    everything to its left. */

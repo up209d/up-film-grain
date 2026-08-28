@@ -63,6 +63,7 @@ whole log in order with the failure in place.
 | `film_texture` | dust, hair, scratches, light leaks, speck shape, mark counts |
 | `film_tiling` | that drawn marks reserve no tile overlap |
 | `internals` | bit-exact performance rewrites, the texture cache, tile size, cancellation |
+| `diskcache` | that the caches really are on the SSD: the round trip, byte accounting against the files, eviction unlinking, a vanished file reading as a miss, and two engines not sharing a directory |
 | `imageio` | the hand-written 16-bit PNG writer, upscale |
 
 The grouping is by **what you would re-run after touching one thing**, not by

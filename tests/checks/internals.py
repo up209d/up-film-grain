@@ -229,10 +229,16 @@ def run(cx: Ctx) -> None:
     # generations are kept -- one would make dragging a slider back and forth
     # rebuild every time.
     #
-    # Tested as *resident bytes*, not as a hit rate: the failure mode is the
-    # cache quietly holding the whole budget in fields nothing can reach, which
-    # renders perfectly and simply starves the machine. On an 8GB box that is
-    # most of the allowance.
+    # Tested as *held bytes*, not as a hit rate: the failure mode is the cache
+    # quietly holding the whole budget in fields nothing can reach, which
+    # renders perfectly and simply wastes the allowance.
+    #
+    # Those bytes are on the SSD rather than in RAM since 2026-08-29
+    # (`engine/diskcache.py`), and the check is unchanged by that on purpose.
+    # Generation eviction was never about which medium the waste sat in -- it is
+    # about entries no render can ever ask for again -- and a version of this
+    # that started tolerating unbounded growth because the growth is cheaper now
+    # would be measuring the budget instead of the policy.
     ev_eng = GrainEngine(dev)
     for i in range(6):
         q = P.sanitize({**gp, "global_size": 1.6 + 0.1 * i})
@@ -242,7 +248,7 @@ def run(cx: Ctx) -> None:
           gens <= 2 and ev_eng.gg_evicted > 0,
           f"{gens} generations resident after 6 distinct parameter states, "
           f"{ev_eng.gg_evicted} entries evicted, "
-          f"{ev_eng._gg_bytes / 1e6:.0f} MB held")
+          f"{ev_eng._gg_cache.nbytes / 1e6:.0f} MB held")
 
     # And the previous generation really is kept: going back one step must hit.
     back = P.sanitize({**gp, "global_size": 1.6 + 0.1 * 4})

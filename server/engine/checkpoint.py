@@ -34,15 +34,21 @@ sanitised parameter dict minus the keys belonging to sections below the boundary
 with those sections read from `GROUPS`. A hand-maintained list of upstream keys
 would silently stop covering the next parameter anyone adds, and CLAUDE.md
 promises that adding a control is one `Param` and one `p["key"]` read.
+
+**The frames themselves live on the SSD as of 2026-08-29** -- see
+`engine/diskcache.py`. Nothing above changes: the boundaries are the same, the
+key is derived the same way, and the generation sweep still bounds the live set
+to two parameter states. What moved is where a 184MB frame is *kept* between
+renders, which was the single largest RAM allocation in the app and was held
+speculatively, against a hit that might never come.
 """
 
 from __future__ import annotations
 
-import collections
-
 import torch
 
 from .. import params as P
+from .diskcache import DiskStore
 from ..params.param import GROUPS
 
 
@@ -160,37 +166,41 @@ def upstream_signature(p: dict, boundary: str) -> tuple:
 class CheckpointCache:
     """A byte-capped LRU of section-boundary frames, keyed by everything above.
 
-    Not thread-safe, and does not need to be: `runtime.RENDER_LOCK` serialises
-    every render, the same assumption the texture cache already rests on.
+    **The frames live on the SSD, not in RAM** (2026-08-29). A checkpoint at a
+    2400px proxy is 184MB and there are three boundaries, so this was the
+    largest thing the app held and it held it between renders, for a hit that
+    might never come. `engine/diskcache.py` has the argument; the short version
+    is that a hit here skips 68-89% of a render and a 184MB read from an SSD is
+    under 100ms, which is not a close trade. What is left in memory is the index
+    -- a key tuple, a path and a byte count per entry.
+
+    Everything else about this class is unchanged, including the part that
+    matters most: **a stale hit is the worst failure this codebase has**, and
+    the generation sweep below is what bounds the live set to two parameter
+    states regardless of how large the budget is.
+
+    Not thread-safe at this level, and does not need to be: `runtime.RENDER_LOCK`
+    serialises every render. The store underneath takes its own lock because the
+    upload path reaches it from threads that lock is not holding.
     """
 
-    def __init__(self, cap_bytes: int) -> None:
-        self._d: collections.OrderedDict = collections.OrderedDict()
-        self._bytes = 0
-        self.cap = cap_bytes
-        self.hits = 0
-        self.misses = 0
-        self.evicted = 0
+    def __init__(self, share: float) -> None:
+        self._store = DiskStore("checkpoints", share)
         # The last two upstream signatures seen at each boundary. An older one
         # is unreachable for the same reason an old texture generation is: a
         # render that wanted it would have to put those parameters back, and
         # would then be current.
         #
-        # Two rather than one because a frame is 184MB at a 2400px proxy and
-        # this is the largest thing the app caches -- letting the byte cap alone
-        # decide means holding 1.6GB of frames nothing can ask for, measured,
-        # which is the waste this class would otherwise be introducing while the
-        # texture cache next door was having it removed.
+        # Two rather than one because a frame is 184MB at a 2400px proxy -- and
+        # that argument survives the move to disk with its sign flipped. It is
+        # no longer about holding 1.6GB of RAM nothing can ask for; it is about
+        # *writing* it, which costs the drive rather than the machine. Bounding
+        # the live set is the reason either way.
         self._gens: dict[str, list] = {}
+        self.device: torch.device | None = None
 
     def get(self, key) -> torch.Tensor | None:
-        v = self._d.get(key)
-        if v is None:
-            self.misses += 1
-            return None
-        self._d.move_to_end(key)
-        self.hits += 1
-        return v
+        return self._store.get(key, self.device)
 
     def put(self, key, t: torch.Tensor) -> None:
         # Key layout is (id, boundary, scale, y0, x0, h, w, device, signature),
@@ -202,39 +212,37 @@ class CheckpointCache:
         if sig not in seen:
             seen.insert(0, sig)
             del seen[2:]
-            for k in [k for k in self._d
-                      if k[1] == boundary and k[-1] not in seen]:
-                old = self._d.pop(k)
-                self._bytes -= old.element_size() * old.nelement()
-                self.evicted += 1
-
-        n = t.element_size() * t.nelement()
-        # An entry bigger than the whole budget is not stored rather than
-        # immediately evicting itself -- otherwise a large single-tile render
-        # would empty the cache on every pass and pay the bookkeeping for it.
-        if n > self.cap:
-            return
-        # Subtract first if this key is already present. Re-putting is legal --
-        # a caller that stored on a miss and stores again on a hit is doing
-        # nothing wrong -- but counting the bytes twice is not, and the symptom
-        # is a byte total that climbs while the entry count stays flat.
-        prev = self._d.pop(key, None)
-        if prev is not None:
-            self._bytes -= prev.element_size() * prev.nelement()
-        self._d[key] = t
-        self._bytes += n
-        while self._bytes > self.cap and len(self._d) > 1:
-            _, old = self._d.popitem(last=False)
-            self._bytes -= old.element_size() * old.nelement()
+            live = tuple(seen)
+            self._store.drop_if(
+                lambda k, b=boundary, live=live: k[1] == b and k[-1] not in live
+            )
+        self._store.put(key, t)
 
     def clear(self) -> None:
-        self._d.clear()
-        self._bytes = 0
+        self._store.clear()
         self._gens.clear()
+
+    # -- reporting; the checks in `verify.py` read these ------------------- #
+
+    @property
+    def cap(self) -> int:
+        return self._store.cap
+
+    @property
+    def hits(self) -> int:
+        return self._store.hits
+
+    @property
+    def misses(self) -> int:
+        return self._store.misses
+
+    @property
+    def evicted(self) -> int:
+        return self._store.evicted
 
     @property
     def nbytes(self) -> int:
-        return self._bytes
+        return self._store.nbytes
 
     def __len__(self) -> int:
-        return len(self._d)
+        return len(self._store)

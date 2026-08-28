@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import socket
 import sys
 import threading
@@ -163,9 +164,65 @@ def watch_parent(pid: int, interval: float = 2.0) -> None:
                       file=sys.stderr, flush=True)
             except Exception:
                 pass
+            # `os._exit` runs no `atexit` handler, deliberately (see above), so
+            # the disk cache has to be removed by hand here or an unclean shell
+            # exit leaves a full run's spill behind. Guarded like the print
+            # above it, for the same reason: nothing between here and the exit
+            # may be allowed to raise.
+            try:
+                cache_cleanup()
+            except Exception:
+                pass
             os._exit(0)
 
     threading.Thread(target=loop, name="parent-watchdog", daemon=True).start()
+
+
+def cache_cleanup() -> None:
+    """Delete this run's disk cache, if there is one. Never raises."""
+    try:
+        from server.engine import diskcache
+
+        diskcache.cleanup()
+    except Exception:
+        # Import can fail if we are shutting down before `server` was reachable,
+        # and a failed tidy-up must never turn a clean exit into a traceback.
+        pass
+
+
+def install_cache_cleanup() -> None:
+    """Delete the disk cache on the way out, including on a signal.
+
+    **The signal path is the desktop app's normal quit**, not an edge case:
+    `electron/main.js` sends SIGTERM, and Python does not run `atexit` handlers
+    for a signal, so without this every ordinary quit left a full run's spill --
+    up to the disk budget plus the open photograph's frames -- lying in
+    `~/Library/Caches` until the next start swept it up.
+
+    It works because of a specific uvicorn behaviour worth writing down, since
+    it looks like it should not: uvicorn installs its own SIGINT/SIGTERM
+    handlers for the duration of `Server.run`, and on the way out it **restores
+    whatever was there before and then re-raises the captured signal**
+    (`Server.capture_signals`). So a handler installed *before* `run()` is not
+    shadowed -- it is deferred, and fires after the graceful shutdown has
+    finished. Installing one *after* `run()` returns would be too late, and
+    replacing uvicorn's would break the graceful shutdown outright.
+
+    `signal.SIG_DFL` is restored before exiting so a second SIGTERM during
+    cleanup kills the process outright rather than re-entering this.
+    """
+    def handler(signum, _frame):
+        cache_cleanup()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            # Not the main thread, or a platform without it. The next start's
+            # sweep is the backstop.
+            pass
 
 
 # ------------------------------------------------------------------ selftest --
@@ -339,12 +396,19 @@ def main(argv: list[str] | None = None) -> int:
         # of the app.
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
 
+    install_cache_cleanup()
+
     server = uvicorn.Server(uvicorn.Config(
         "server.main:app", log_level="info",
         # The socket carries the address; passing host/port as well would be a
         # second source of truth for the same thing.
     ))
     server.run(sockets=[sock])
+    # Reached only on a shutdown that was *not* signalled -- a signalled one is
+    # re-raised inside `run()` and lands on the handler installed above. Both
+    # roads have to clean up, and `cleanup` is idempotent so saying so twice
+    # costs nothing.
+    cache_cleanup()
     return 0
 
 

@@ -6,6 +6,7 @@ import torch
 
 from ..colour import _linear_to_srgb, _srgb_to_linear
 from ..constants.core import EDGE_REF, _AMP_SCALE, _MIN_CELL
+from ..device import device_work
 from ..constants.edge import (
     _JITTER_MAX, _SAND_DIR_K, _SAND_MIN_GRAD, _SAND_PASSES, _SAND_TAPS,
 )
@@ -29,6 +30,20 @@ class RenderMixin:
         ``scale`` is working-res / full-res; ``y0``/``x0`` are the tile's offset
         in working-resolution coordinates.
         """
+        # Marks the device busy for the duration -- see `device.device_work`.
+        # Redundant when reached through `render_supersampled`, which already
+        # holds it, and not redundant at all when reached directly, which is how
+        # most of `tests/checks/` calls the pipeline. A counter, so the nesting
+        # is free.
+        with device_work():
+            return self._render(img, p, scale, y0, x0, full_hw)
+
+    def _render(
+        self, img: torch.Tensor, p: dict, scale: float = 1.0,
+        y0: float = 0.0, x0: float = 0.0,
+        full_hw: tuple[float, float] | None = None,
+    ) -> torch.Tensor:
+        """`render`'s body, with the device already marked busy."""
         h, w = img.shape[-2:]
 
         # -1. Colour grading, above everything -- temperature, shadows,

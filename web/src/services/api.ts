@@ -143,6 +143,54 @@ export async function getHealth(): Promise<{ device: string }> {
 /** Every LUT the picker can offer. Its own request rather than a field on the
  *  schema because this list grows during a session — uploading one adds to it —
  *  while the parameter schema never changes. */
+/** One line of the cache readout: a store, the spilled source frames, or the
+ *  finished exports. `hits`/`misses`/`written` are present only for the two
+ *  byte-capped stores -- the frames and the exports are places to keep things,
+ *  not places to maybe find them, so a hit rate would be meaningless for them.
+ *
+ *  Hand-written mirror of `engine/diskcache.py:stats`, like every other
+ *  interface here; a field left out is invisible rather than an error. */
+export interface CachePart {
+  name: string;
+  bytes: number;
+  entries: number;
+  cap?: number;
+  hits?: number;
+  misses?: number;
+  evicted?: number;
+  written?: number;
+}
+
+export interface CacheStats {
+  /** False when there is no writable cache directory -- a read-only home, a
+   *  full disk, a sandbox. The app renders correctly and simply never caches,
+   *  so the readout says so rather than reporting zeroes that look like health. */
+  enabled: boolean;
+  root: string | null;
+  budget: number;
+  /** Live bytes across every part. */
+  bytes: number;
+  /** Bytes ever written by the two capped stores -- what this is costing the
+   *  drive, which no live size can show. */
+  written: number;
+  memory: { rss: number; peak: number };
+  parts: CachePart[];
+}
+
+export async function getCacheStats(): Promise<CacheStats> {
+  const r = await fetch("/api/cache");
+  if (!r.ok) return fail(r);
+  return r.json();
+}
+
+/** Drop everything rebuildable. The photograph and any finished export survive
+ *  -- see the endpoint, which is the authority on that distinction. */
+export async function clearCache(): Promise<CacheStats> {
+  const r = await fetch("/api/cache/clear", { method: "POST" });
+  if (!r.ok) return fail(r);
+  return r.json();
+}
+
 export async function getLuts(): Promise<LutInfo[]> {
   const r = await fetch("/api/luts");
   if (!r.ok) return fail(r);

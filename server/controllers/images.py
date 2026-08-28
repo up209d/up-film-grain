@@ -29,6 +29,10 @@ def upload(file: UploadFile = File(...)) -> dict:
 
     uid = uuid.uuid4().hex[:12]
     up_model.UPLOADS[uid] = up_model.Upload(uid, file.filename or "image", arr)
+    # A new photograph invalidates every cache in the app -- see
+    # `upload.reset`. Called before `reap`, which is now the fallback for the
+    # case this misses rather than the thing that bounds the registry.
+    up_model.reset(uid)
     up_model.reap()
     up = up_model.UPLOADS[uid]
     return {

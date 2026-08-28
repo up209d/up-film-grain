@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
+import threading
 
 import torch
 
@@ -41,32 +43,24 @@ _WORKING_BYTES_PER_PX = 640
 # system RAM, so overcommitting means swapping rather than a clean failure.
 _RENDER_BUDGET_FRACTION = 0.5
 
-# How the budget above is split between the two things that spend it. They are
-# genuinely in competition -- the Global Grain texture cache holds device
-# tensors that the renderer then cannot have -- and the old arrangement left
-# that competition implicit: `tile_for` took the whole budget and the cache took
-# a flat 0.5GB decided by a comment that described a tile size and a layer count
-# neither of which is true any more. Splitting it here is what makes raising one
-# visibly lower the other.
+# The renderer's share of the pool.
 #
-# **The renderer's 0.7 is the number that must not drop**, and the two caches
-# were sized around it rather than out of it. Taking the checkpoint share off
-# the tile budget instead was tried and measured: 0.6 puts a 2400px proxy over
-# the line into two tiles, and `SuperPortra` went 1.75s -> 2.72s on the GPU and
-# 7.9s -> 9.5s on the CPU. A cache that makes the uncached path slower is a bad
-# trade however good its hit rate.
+# It used to be a three-way split -- 0.7 to `tile_for`, 0.15 each to the Global
+# Grain texture cache and the pipeline checkpoints -- because those two caches
+# held *device* tensors that the renderer then could not have. **Both moved to
+# the SSD on 2026-08-29** (`engine/diskcache.py`), so nothing competes for this
+# pool any longer and the two shares are gone rather than set to zero.
 #
-# 0.15 each to the two caches, which is what they actually need rather than
-# what was left over. The texture cache wants 922MB for five layers at one tile
-# of a 2400px proxy and 1.6GB at a 24MP export tile; the checkpoints want 184MB
-# per boundary per tile. On this machine's 14GB pool that is 2.1GB apiece and
-# everything fits; on an 8GB machine it is 300MB and each holds part of its set,
-# which is a partial hit rate rather than the 0% a too-small budget produces.
-# Generation-aware eviction keeps both *live* sets to two parameter states
-# regardless, so the caps bound the worst case rather than the usual one.
+# **0.7 is kept anyway, and is the number that must not drop.** It was measured
+# rather than left over: at 0.6 a 2400px proxy tips into two tiles and
+# `SuperPortra` goes 1.75s -> 2.72s on the GPU and 7.9s -> 9.5s on the CPU.
+# Raising it toward 1.0 is now free of the old objection and is deliberately not
+# done -- larger tiles mean a larger *peak* working set, and the change that
+# removed these caches was made to lower the app's memory use, not to spend the
+# saving somewhere else. The remaining 0.3 is headroom for the client, the
+# encoder and whatever else shares the machine, which is what it was always
+# described as.
 _TILE_BUDGET_SHARE = 0.7
-_GRAIN_CACHE_SHARE = 0.15
-_CHECKPOINT_SHARE = 0.15
 
 # How large one tile's working set has to be, as a share of the tile budget,
 # before `release_cache` is worth calling between tiles.
@@ -118,8 +112,9 @@ def _system_ram_bytes() -> int:
     told a 64GB machine it had 4GB, and since this figure drives
     `_render_budget_bytes` -> `_tile_budget_bytes` -> `tile_for`, every tile
     clamped to `_TILE_MIN` and both caches landed in the starved regime that
-    `_grain_cache_bytes` measured at 7.36s against 1.78s. Wrong by 16x in the
-    direction that costs performance, reported by nothing.
+    the Global Grain texture cache measured at 7.36s against 1.78s when it was
+    starved the same way. Wrong by 16x in the direction that costs performance,
+    reported by nothing.
 
     `GlobalMemoryStatusEx` is the Windows equivalent and needs no dependency --
     `ctypes` is stdlib. **Unverified until the windows target is actually built**;
@@ -211,18 +206,18 @@ def _resolve_device() -> torch.device:
 def _render_budget_bytes() -> int:
     """Total device-memory budget for a render, in bytes.
 
-    The **pool**, not the tile's share of it -- `_tile_budget_bytes` and
-    `_grain_cache_bytes` divide this between them. It used to be the tile budget
-    outright while the texture cache took a flat 0.5GB on top, so the two could
-    not both be honoured and the real ceiling was whatever they happened to sum
-    to.
+    The **pool**, not the tile's share of it -- `_tile_budget_bytes` takes
+    `_TILE_BUDGET_SHARE` of it and the rest is headroom. It used to be divided
+    three ways, with the texture cache and the checkpoints holding device
+    tensors out of it; both live on the SSD now (`engine/diskcache.py`), so this
+    pool has one claimant again.
 
     `FILM_GRAIN_TILE_BUDGET_GB` overrides it outright, in the same spirit as
     `FILM_GRAIN_DEFAULT_PRESET` -- useful both for forcing large tiles on a big
     machine and for reproducing a small machine's tiling on a large one, which is
     what makes the tile-independence checks in `verify.py` testable here. It
-    keeps its name and overrides the *pool*: a machine reproduced by it should
-    reproduce both halves of the split, not just one.
+    keeps its name and overrides the *pool* rather than the tile's share of it,
+    so a machine reproduced by it reproduces the headroom too.
     """
     env = os.environ.get("FILM_GRAIN_TILE_BUDGET_GB")
     if env:
@@ -256,43 +251,69 @@ def _tile_budget_bytes() -> int:
     return int(_render_budget_bytes() * _TILE_BUDGET_SHARE)
 
 
-def _checkpoint_bytes() -> int:
-    """The pipeline checkpoint cache's share of the pool.
+# How many threads are currently submitting work to the device.
+#
+# **This exists so that nothing ever calls `release_cache` while another thread
+# has device work in flight**, which on MPS is not a race that produces a wrong
+# answer -- it aborts the process:
+#
+#     -[IOGPUMetalCommandBuffer validate]: failed assertion
+#     `commit an already committed command buffer'
+#
+# Measured, not theorised: the idle flush was first written to fire on its timer
+# thread under the render lock, and the check suite died on exactly that
+# assertion, because a check calling `render()` directly holds no such lock and
+# an upload resampling on a request thread holds nothing at all. Guarding the
+# *callers* meant enumerating every path that touches the GPU and being right
+# about all of them; guarding the *device* means one counter that every path
+# increments and a releaser that waits for zero.
+#
+# A counter rather than a mutex because the thing being excluded is asymmetric:
+# any number of threads may use the device at once (that was already true and
+# already fine), and only the release must be alone. A plain lock held for the
+# length of a render would have made an upload during a 24MP export wait for the
+# export, which is a regression nobody asked for.
+_busy = 0
+_busy_lk = threading.Lock()
 
-    `FILM_GRAIN_CHECKPOINT_GB` overrides it; 0 switches checkpointing off
-    entirely, which is the honest way to measure what it is worth.
+
+@contextlib.contextmanager
+def device_work():
+    """Mark this thread as using the device for the duration of the block.
+
+    Wrap any entry point that submits work to the GPU. Nesting is free -- it is
+    a counter, not a lock -- so an outer `render_image` and the `render` inside
+    it may both take it, which is what lets the direct-`render()` calls in
+    `tests/checks/` be covered without the engine's own call graph caring.
     """
-    env = os.environ.get("FILM_GRAIN_CHECKPOINT_GB")
-    if env:
-        try:
-            return int(float(env) * (1 << 30))
-        except ValueError:
-            pass
-    return int(_render_budget_bytes() * _CHECKPOINT_SHARE)
+    global _busy
+    with _busy_lk:
+        _busy += 1
+    try:
+        yield
+    finally:
+        with _busy_lk:
+            _busy -= 1
 
 
-def _grain_cache_bytes() -> int:
-    """The Global Grain texture cache's share of the pool.
+def try_release_cache(dev: torch.device) -> bool:
+    """`release_cache`, but only if the device is idle. True if it ran.
 
-    Derived rather than constant, and that is the fix for a measured 0% hit rate.
-    The old flat 0.5GB was sized by a comment reading "113MB per tile at tile
-    1536 / supersample 2" -- written when the tile was a hard-coded constant and
-    the section had **one** layer. It now has five and `tile_for` computes the
-    tile, so `SuperPortra` at a 2400px proxy wants 5 x 184MB = 922MB, the LRU
-    held two entries, and every render missed all five. Measured 2026-08-08: the
-    same render was 7.36s with the flat budget and 1.78s with a budget that fits,
-    on identical parameters, 0 hits vs 5.
+    For callers that are **not** on a render thread -- today, the engine's idle
+    flush. Everything on a render thread should call `release_cache` directly:
+    it is already inside `device_work`, so this would always answer False, and
+    the between-tiles release that keeps `_WORKING_BYTES_PER_PX` honest would
+    silently stop happening.
 
-    `FILM_GRAIN_GRAIN_CACHE_GB` still overrides it outright, which is how the
-    starved case can be reproduced deliberately.
+    The check and the release are one critical section on purpose. Testing the
+    counter and then releasing outside the lock would leave exactly the window
+    this function exists to close.
     """
-    env = os.environ.get("FILM_GRAIN_GRAIN_CACHE_GB")
-    if env:
-        try:
-            return int(float(env) * (1 << 30))
-        except ValueError:
-            pass
-    return int(_render_budget_bytes() * _GRAIN_CACHE_SHARE)
+    with _busy_lk:
+        if _busy:
+            return False
+        release_cache(dev)
+        return True
 
 
 def release_cache(dev: torch.device) -> None:

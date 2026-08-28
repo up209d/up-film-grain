@@ -405,7 +405,14 @@ def run(cx: Ctx) -> None:
         while JOBS[job_id]["status"] not in ("done", "error") and time.time() < deadline:
             time.sleep(0.05)
         job = JOBS[job_id]
-        arr = iio.load_image(job.get("bytes", b"")) if job["status"] == "done" else None
+        # `blob.data` rather than a `bytes` on the job: a finished export is
+        # written to the SSD and streamed from there (`engine.diskcache.Blob`),
+        # so this reads the file back the way the download route serves it. That
+        # is the stronger check of the two anyway -- it proves the bytes reached
+        # the disk intact, which reading them out of a dict never could.
+        blob = job.get("blob")
+        arr = (iio.load_image(blob.data)
+               if job["status"] == "done" and blob is not None else None)
         check(
             f"prescale_output {out_mode} writes {want[1]}x{want[0]}",
             job["status"] == "done" and (job["height"], job["width"]) == want

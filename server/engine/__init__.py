@@ -44,7 +44,7 @@ from .colour import (
     _MID_GREY, _apply_lut, _characteristic_curve, _linear_to_srgb, _recon_estimate, _reconstruct_highlights, _shoulder, _soft_knee, _srgb_to_linear, _tone_roll,
 )
 from .device import (
-    _GRAIN_CACHE_SHARE, _RENDER_BUDGET_FRACTION, _TILE_BUDGET_SHARE, _TILE_MAX, _TILE_MIN, _WORKING_BYTES_PER_PX, _grain_cache_bytes, _render_budget_bytes, _tile_budget_bytes, device_name, pick_device, release_cache,
+    _RENDER_BUDGET_FRACTION, _TILE_BUDGET_SHARE, _TILE_MAX, _TILE_MIN, _WORKING_BYTES_PER_PX, _render_budget_bytes, _tile_budget_bytes, device_name, pick_device, release_cache,
 )
 from .exceptions import RenderCancelled
 from .marks import (
@@ -196,9 +196,7 @@ __all__ = [
     '_mark_window',
     '_recon_estimate',
     '_reconstruct_highlights',
-    '_GRAIN_CACHE_SHARE',
     '_TILE_BUDGET_SHARE',
-    '_grain_cache_bytes',
     '_render_budget_bytes',
     '_tile_budget_bytes',
     'release_cache',

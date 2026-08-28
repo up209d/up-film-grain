@@ -141,6 +141,10 @@ server/engine/        the pipeline (package docstring states the invariants)
                           takes its suffixes **by name**, never by index -- a
                           positional slice breaks silently the moment a section
                           is inserted above one, and did)
+  diskcache.py          the SSD backing store for every large cache: DiskStore
+                          (a byte-capped LRU of files), Spill (one array, mapped
+                          back copy-on-write), Blob (a finished export). Nothing
+                          large is held in RAM between renders
   grain_engine.py       GrainEngine -- composes the stage mixins
 server/models/        Upload, export jobs (domain, no HTTP)
 server/services/      render_tier -- the one path both preview tiers take
@@ -288,6 +292,60 @@ colour-match two different painters. Do not "simplify" that back to `show: true`
 The corollary is worth remembering for any future window work: an on-screen
 colour problem that does not reproduce in `capturePage()` is not in the page.
 
+## The SSD is the cache (2026-08-29)
+
+Reported as "the app eats a lot of RAM", and the uncertainty in the report was
+the interesting part -- **two of the five things holding memory were not caches
+at all, and neither of those two had any ceiling.** Before this, on a 24MP
+photograph: ~8GB reachable in `UPLOADS` (four full arrays per photograph against
+a cap of twelve), ~2GB of checkpoints, ~2GB of Global Grain textures, an
+*unbounded* pile of finished export bytes on `JOBS`, and an *unbounded* set of
+parsed `.cube` tables. Roughly twelve gigabytes before anything had been
+rendered twice.
+
+All of it now lives on the SSD (`engine/diskcache.py`) and there is **no
+in-memory tier to spill from** -- a `put` writes a file, a `get` reads one and
+returns a tensor that dies with the render. Measured on a 24MP source: 3861MB
+resident after three previews, **471MB** after the idle flush, and the second
+preview still 3.4x faster than the first because the checkpoint hit came off the
+disk in under 100ms. `docs/disk-cache.md` has the whole argument. Five things
+worth knowing before touching any of it:
+
+* **The ratio is what makes this work, not the medium.** Every cache here skips
+  work measured in *seconds* and a 184MB SSD read is 50-90ms. Do not add
+  anything *small* to a store: a payload cheaper to recompute than to read back
+  belongs in neither tier. `lut._DISK` got an LRU cap instead of a file for
+  exactly that reason.
+* **The flush is on a two-second idle timer, not on the last render.** Flushing
+  when a render returns costs `Stock` 1.13s -> 1.45s per frame of a slider drag
+  to hand back blocks the next render immediately re-asks for. During a drag the
+  free list is not idle memory; it is the next frame arriving early.
+* **`release_cache` must never fire while another thread has device work in
+  flight** -- on MPS that aborts the process rather than racing, and it took the
+  whole check suite down the first time. The guard is on the *device*, not the
+  callers: `device.device_work()` is a counter every GPU entry point takes and
+  `device.try_release_cache` does nothing unless it reads zero. The per-tile
+  release inside `_render_image` deliberately calls `release_cache` directly --
+  routing it through the guarded version would silently stop it happening.
+* **Opening a photograph clears everything for the old one** (`upload.reset`),
+  on request and because every cache in the app is keyed to a photograph and
+  none of it can ever be hit again. Finished exports survive: they are the
+  user's output, not a cache.
+* **The desktop app quits by SIGTERM, and `atexit` does not run on that.**
+  `launch.py` installs a handler *before* `server.run()`, which works because
+  uvicorn restores the previous handler and re-raises the captured signal on the
+  way out. The next start's sweep of dead `run-<pid>` directories is the backstop
+  for SIGKILL.
+
+Two things did *not* change and must not drift: both invariants (no stage learns
+its frame came from a file) and generation eviction in both caches (it was never
+about which medium the waste sat in).
+
+`GET /api/cache` reports it and the client shows it bottom right beside Export --
+disk held and current RSS. The readout exists because "the app eats RAM" was a
+question nobody in the session could answer, and a fix you cannot see is
+indistinguishable from no fix.
+
 ## Pipeline order (a section added above the top 2026-08-29)
 
 `Prescaling Source` is step **-3**, above `Normalize`. It is first in `GROUPS`
@@ -416,11 +474,16 @@ photograph's bright region where the version it replaced kept 153, and that High
 the aspect ratio to half a pixel per axis, that switching it off is the *same
 object* rather than a second code path, that four proxy reads are one resample,
 that two working resolutions of one photograph never share a checkpoint, and
-that prescaling and `reference_mp` never both fire — 450 checks. It exits
-non-zero on failure.
+that prescaling and `reference_mp` never both fire, and the SSD-backed caches —
+that a stored tensor comes back bit-identical on the right device, that the
+payload really is a file rather than a dict wearing the same API, that two gets
+are independent objects, that eviction unlinks rather than merely forgetting,
+that a file deleted underneath the store reads as a miss instead of raising, and
+that two engines in one process cannot answer each other's keys — 475 checks. It
+exits non-zero on failure.
 
-Those 450 live in `tests/checks/`, one module per area, since 2026-08-08 — it
-was a single 3900-line function taking 4m24s, and it is 19 modules taking ~50s
+Those 475 live in `tests/checks/`, one module per area, since 2026-08-08 — it
+was a single 3900-line function taking 4m24s, and it is 20 modules taking ~53s
 (39s until `luts/` grew to 303 files, every one of which the `grading` module
 parses on purpose).
 **Name the modules covering what you touched and only those run:**
@@ -490,6 +553,7 @@ optional reading before touching the area it covers.
 
 | file | what is in it |
 |---|---|
+| [docs/disk-cache.md](docs/disk-cache.md) | Why every large cache lives on the SSD, the idle flush, the device-busy counter that keeps `empty_cache` from aborting the process, and the three exits that each need their own cleanup |
 | [docs/prescale.md](docs/prescale.md) | Step -3: the input resampled to a fixed working resolution, why it is not a stage, the per-photograph `Frame` cache, and the one section the panel renders out of `GROUPS` order |
 | [docs/normalize.md](docs/normalize.md) | Step −2: the one stage whose settings are *measured* rather than dialled, why the metering is per-upload and not per-tile, and why the shoulder is uncapped where the toe is not |
 | [docs/using-the-controls.md](docs/using-the-controls.md) | What each control does, for a user rather than a maintainer — moved out of `README.md` 2026-08-08 |

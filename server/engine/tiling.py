@@ -14,7 +14,7 @@ from .constants.edge import (
 from .constants.grade import _RECON_ROLL_GATE_FRAC
 from .device import (
     _RELEASE_MIN_SHARE, _TILE_MAX, _TILE_MIN, _WORKING_BYTES_PER_PX,
-    _tile_budget_bytes, release_cache,
+    _tile_budget_bytes, device_work, release_cache,
 )
 from .checkpoint import upstream_signature
 from .exceptions import RenderCancelled
@@ -63,6 +63,22 @@ class TilingMixin:
         if op <= 0.0:
             return img
 
+        # Marks the device busy so the idle flush cannot `empty_cache` under a
+        # render -- see `device.device_work`. Taken here as well as in
+        # `render_image` because `render_view` and the checks in `tests/checks/`
+        # both enter through this method rather than through that one; it is a
+        # counter, so the overlap is free.
+        with device_work():
+            return self._render_supersampled(img, p, scale, y0, x0, ss, full_hw)
+
+    def _render_supersampled(
+        self, img: torch.Tensor, p: dict, scale: float, y0: float, x0: float,
+        ss: int, full_hw: tuple[float, float] | None = None,
+    ) -> torch.Tensor:
+        """`render_supersampled`'s body, with the device already marked busy."""
+        op = p["master_opacity"]
+        if op <= 0.0:
+            return img
         if abs(ss - 1.0) < 1e-6:
             r = self.render(img, p, scale, y0, x0, full_hw)
         else:
@@ -439,6 +455,16 @@ class TilingMixin:
         export. Zoom below 1.0 renders at that working scale, which is the
         honest thing to show: at 50% the export's grain really is half-resolved.
         """
+        # See `render_supersampled` -- this method does device work of its own
+        # (the read window's upload and downscale) before reaching it.
+        with device_work():
+            return self._render_view(arr, p, box, zoom, supersample)
+
+    def _render_view(
+        self, arr: np.ndarray, p: dict, box: tuple[int, int, int, int],
+        zoom: float = 1.0, supersample: float = 2.0,
+    ) -> np.ndarray:
+        """`render_view`'s body, with the device already marked busy."""
         y, x, bh, bw = box
         H, W, _ = arr.shape
         scale = min(float(zoom), 1.0)
@@ -522,7 +548,14 @@ class TilingMixin:
         self._cancel = should_cancel
         self._ckpt_id = checkpoint_id
         try:
-            return self._render_image(arr, p, scale, tile, supersample, progress)
+            # Marks the device busy for the whole render, so the idle flush
+            # cannot call `empty_cache` into the middle of one. See
+            # `device.device_work`; it is a counter, so the nested takes in
+            # `render_supersampled` and `render` cost nothing.
+            with device_work():
+                return self._render_image(
+                    arr, p, scale, tile, supersample, progress
+                )
         except RenderCancelled:
             # An abandoned render's tensors are dead the moment the exception
             # unwinds, but the allocator keeps their blocks -- which on a
@@ -535,6 +568,12 @@ class TilingMixin:
         finally:
             self._cancel = None
             self._ckpt_id = None
+            # Schedule the memory this render is still holding to be given back
+            # once rendering actually stops -- source-frame page tables and the
+            # allocator's free list. Scheduled rather than done here, because
+            # doing it here is a measured 25% tax on every frame of a slider
+            # drag for nothing saved. See `GrainEngine.arm_flush`.
+            self.arm_flush()
 
     def _render_image(
         self, arr: np.ndarray, p: dict, scale: float, tile: int,

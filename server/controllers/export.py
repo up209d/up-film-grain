@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Body, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 
 from .. import imageio as iio
 from ..models import upload as up_model
@@ -149,7 +149,9 @@ def export_status(job_id: str) -> dict:
     job = JOBS.get(job_id)
     if job is None:
         raise HTTPException(404, "Unknown job.")
-    return {k: v for k, v in job.items() if k != "bytes"}
+    # `blob` is a file handle, not JSON -- and `size` beside it already says
+    # everything a client wants to know about it.
+    return {k: v for k, v in job.items() if k not in ("bytes", "blob")}
 
 
 @router.get("/export/{job_id}/download")
@@ -159,8 +161,21 @@ def export_download(job_id: str) -> Response:
         raise HTTPException(404, "Unknown job.")
     if job.get("status") != "done":
         raise HTTPException(409, f"Job is {job.get('status')}.")
-    return Response(
-        content=job["bytes"],
-        media_type=job["mime"],
-        headers={"Content-Disposition": f'attachment; filename="{job["filename"]}"'},
-    )
+    blob = job.get("blob")
+    if blob is None:
+        raise HTTPException(410, "That export has been cleared.")
+    headers = {
+        "Content-Disposition": f'attachment; filename="{job["filename"]}"'
+    }
+    if blob.path is not None:
+        # Streamed off the disk by the OS rather than read into a `bytes` and
+        # handed to Starlette -- a 24MP 16-bit PNG is ~140MB, and materialising
+        # it here would put the whole file back in the memory this change took
+        # it out of, at exactly the moment the user is least willing to wait.
+        return FileResponse(
+            blob.path, media_type=job["mime"], headers=headers,
+            filename=job["filename"],
+        )
+    # No writable cache directory: the bytes were kept in memory as the
+    # fallback, so serve them the way this always did.
+    return Response(content=blob.data, media_type=job["mime"], headers=headers)

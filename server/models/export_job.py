@@ -40,11 +40,46 @@ help text.
 from __future__ import annotations
 
 from .. import imageio as iio
+from ..engine.diskcache import Blob
 from ..runtime import DEVICE, RENDER_LOCK
 from ..services.render import render_tier
 from .upload import Frame, Upload
 
 JOBS: dict[str, dict] = {}
+
+#: How many finished exports keep their file. Older ones are deleted.
+#:
+#: There was no limit at all before 2026-08-29: a finished job kept its encoded
+#: bytes on the dict for the life of the process, and a 24MP 16-bit PNG is
+#: ~140MB, so ten exports in a session was 1.4GB of RAM that nothing would ever
+#: free. That is a leak rather than a cache with a bad policy -- the bytes were
+#: not being kept against a future hit, they were simply never dropped.
+#:
+#: The bytes live on the SSD now (`engine.diskcache.Blob`), so what this bounds
+#: is disk rather than memory, and four is chosen against what the *client*
+#: does: it downloads a job as soon as it reports done. A finished file is
+#: therefore live only for the moment between those two, and the depth exists
+#: for the browser that was closed mid-download or the user who wants the last
+#: one again -- not as a library.
+_KEEP_FINISHED = 4
+
+
+def _reap_finished() -> None:
+    """Delete all but the newest `_KEEP_FINISHED` finished exports.
+
+    Only finished ones are considered. A queued or rendering job holds no file
+    yet, and removing its record would strand the worker writing into it.
+    """
+    done = sorted(
+        (j for j in list(JOBS.values())
+         if j.get("status") in ("done", "error")),
+        key=lambda j: j.get("created", 0.0),
+    )
+    for j in done[:-_KEEP_FINISHED] if len(done) > _KEEP_FINISHED else []:
+        blob = j.pop("blob", None)
+        if blob is not None:
+            blob.release()
+        JOBS.pop(j.get("id"), None)
 
 
 def run_export(job_id: str, fr: Upload | Frame, p: dict, fmt: str, ss: float,
@@ -94,10 +129,15 @@ def run_export(job_id: str, fr: Upload | Frame, p: dict, fmt: str, ss: float,
             job["status"] = "encoding"
             data = iio.encode(out, fmt, quality)
 
-        job["bytes"] = data
+        # Straight to the SSD. The download route serves the file with
+        # `FileResponse`, so these bytes never come back through Python's heap
+        # -- the encode is the only moment the whole export exists in memory.
+        job["blob"] = Blob(job_id, data)
         job["size"] = len(data)
         job["status"] = "done"
         job["progress"] = 1.0
+        _reap_finished()
     except Exception as e:  # surfaced to the client rather than swallowed
         job["status"] = "error"
         job["error"] = f"{type(e).__name__}: {e}"
+        _reap_finished()

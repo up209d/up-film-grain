@@ -17,8 +17,10 @@ EDGE_REF = 0.06
 _GNORM = 0.55
 
 # The Global Grain texture cache's byte cap **is not here any more** (moved
-# 2026-08-08). It is `device._grain_cache_bytes()`, derived from the same pool
-# `tile_for` sizes tiles against.
+# 2026-08-08, moved again 2026-08-29). It is the store's own `cap` in
+# `engine/diskcache.py` -- a share of a *disk* budget now, since the layers no
+# longer live in memory at all. It was briefly `device._grain_cache_bytes()`,
+# a share of the same device pool `tile_for` sizes tiles against.
 #
 # It was a flat 0.5GB, and it was wrong in a way a constant cannot fix: the
 # comment sizing it described tile 1536 and *one* layer, both of which stopped

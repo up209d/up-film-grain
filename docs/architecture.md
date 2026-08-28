@@ -47,7 +47,8 @@ the old flat module did — it sits a level deeper, and getting that wrong point
 `PRESET_DIR` at `server/presets` and boots with no presets at all.
 
 `engine/` is the pipeline. `GrainEngine` is a composition root: it holds only
-the device and the two texture caches, and every stage is a mixin under
+the device and the two caches -- both of which are now indexes over files on
+the SSD rather than tensors (`engine/diskcache.py`) -- and every stage is a mixin under
 `stages/`. Mixins rather than separate collaborators because every stage reads
 the same engine state and the test suite calls them as engine methods — the
 alternative was threading `self` through seven constructors to no benefit.

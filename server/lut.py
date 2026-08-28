@@ -69,6 +69,23 @@ MIN_LUT_SIZE = 2
 #: How many uploaded LUTs are kept. They are a few MB of float32 each.
 _MAX_UPLOADS = 8
 
+#: How many parsed folder LUTs are kept, oldest dropped first.
+#:
+#: This used to be uncapped, which was fine while `luts/` held a handful and
+#: stopped being fine on 2026-08-09 when a library of 300 arrived. A 64-cube is
+#: 3.1MB of table plus a 3.1MB device tensor once it has been rendered with, so
+#: a browse through the whole picker was ~1.9GB held for good -- small next to
+#: the frame caches, and the only one of the five holders that grew with a
+#: *user gesture* rather than with rendering.
+#:
+#: A LUT is not spilled to disk like the frames are, and the difference is the
+#: point of `engine/diskcache.py`'s opening argument: reparsing a 275k-line
+#: .cube costs more than reading a 3MB file, but 3MB is small enough that
+#: neither is worth doing -- the right answer for something this size is to hold
+#: a few and reparse the rest. Sixteen covers any plausible A/B between grades
+#: and bounds this at ~100MB.
+_MAX_DISK_LUTS = 16
+
 CUBE_SUFFIX = ".cube"
 
 
@@ -237,8 +254,9 @@ def parse_cube(
 # --------------------------------------------------------------------------- #
 
 _LOCK = threading.Lock()
-#: id (a relative path, extension dropped) -> (mtime, size_on_disk, Lut)
-_DISK: dict[str, tuple[float, int, Lut]] = {}
+#: id (a relative path, extension dropped) -> (mtime, size_on_disk, Lut),
+#: oldest first; capped at `_MAX_DISK_LUTS`.
+_DISK: "OrderedDict[str, tuple[float, int, Lut]]" = OrderedDict()
 #: id -> Lut, oldest first
 _UPLOADED: "OrderedDict[str, Lut]" = OrderedDict()
 
@@ -365,6 +383,7 @@ def get(lut_id: str | None) -> Lut | None:
     with _LOCK:
         hit = _DISK.get(lut_id)
         if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
+            _DISK.move_to_end(lut_id)
             return hit[2]
     if st.st_size > MAX_LUT_BYTES:
         return None
@@ -390,6 +409,9 @@ def get(lut_id: str | None) -> Lut | None:
         return None
     with _LOCK:
         _DISK[lut_id] = (st.st_mtime, st.st_size, lut)
+        _DISK.move_to_end(lut_id)
+        while len(_DISK) > _MAX_DISK_LUTS:
+            _DISK.popitem(last=False)
     return lut
 
 
