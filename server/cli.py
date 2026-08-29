@@ -34,7 +34,8 @@ from . import imageio as iio
 from .controllers.export import export as start_export
 from .models import upload as up_model
 from .models.export_job import JOBS
-from .models.upload import SUPERSAMPLES
+from .models.upload import (PROXY_EDGE_MAX, PROXY_EDGE_MIN,
+                            PROXY_LONG_EDGE, SUPERSAMPLES)
 from . import params as P
 from .params import PRESET_DIR, load_presets
 
@@ -135,6 +136,12 @@ def _list_presets() -> int:
             facts.append(f"LUT {pre['lut']}")
         if pre["reference_mp"]:
             facts.append(f"{pre['reference_mp']:g} MP")
+        # Only when it is not the built-in default: the column is what makes
+        # two presets tellable apart, and a number every entry repeats tells
+        # nobody anything. A look judged on a smaller or larger proxy than the
+        # rest of the library is exactly the thing worth seeing here.
+        if pre["proxy_edge"] and pre["proxy_edge"] != PROXY_LONG_EDGE:
+            facts.append(f"{pre['proxy_edge']:d}px proxy")
         line = "  " + bold(pre["name"])
         if facts:
             # Padded on the *undecorated* name -- the escape codes are zero
@@ -196,6 +203,12 @@ def _describe_preset(name: str) -> int:
     meta = [f"LUT {pre['lut']}"] if pre["lut"] else []
     if pre["reference_mp"]:
         meta.append(f"dialled in at {pre['reference_mp']:g} MP")
+    # Unconditional here where the list prints it only when it is unusual: this
+    # is the one command that answers "what will `-p this` actually render",
+    # and the edge is a render decision the preset makes on your behalf unless
+    # `-e` says otherwise.
+    meta.append(f"{pre['proxy_edge'] or PROXY_LONG_EDGE:d}px proxy"
+                + ("" if pre["proxy_edge"] else " (default)"))
     meta.append(f"{PRESET_DIR / (pre['name'] + '.json')}")
     print("  " + dim(" · ".join(meta)))
 
@@ -286,6 +299,20 @@ def main(argv: list[str] | None = None) -> int:
                     help="output mode: how finely the frame is rendered. "
                          "ss2 is the default and what every preset was dialled "
                          "in against; full is a real 1:1 render (default: ss2)")
+    # No `default`, so "not given" stays tellable from "given as 2400". The
+    # preset is the fallback, and a preset that names an edge has to be able to
+    # win over the built-in default while still losing to an explicit -e.
+    ap.add_argument("-e", "--proxy-edge", type=int, default=None,
+                    metavar="PX",
+                    help=f"long edge of the proxy the frame is rendered at, "
+                         f"{PROXY_EDGE_MIN}-{PROXY_EDGE_MAX} in steps of 100. "
+                         f"Cost goes roughly as its square, and the file "
+                         f"carries that tier's texture enlarged, so this is the "
+                         f"largest lever over both render time and how much "
+                         f"detail the export resolves. Ignored by -m full, "
+                         f"which renders the frame itself at 1:1. Omitted, the "
+                         f"preset's own edge is used (see -d), and a preset "
+                         f"that names none renders at {PROXY_LONG_EDGE}")
     ap.add_argument("-f", "--format", choices=list(iio.FORMATS),
                     help="override the encoder implied by the output name")
     ap.add_argument("-q", "--quality", type=int, default=95,
@@ -343,6 +370,13 @@ def main(argv: list[str] | None = None) -> int:
         "format": _format_for(out, args.format),
         "supersample": ss,
         "full": full,
+        # Clamped and snapped server-side by `_clamp_edge`, exactly as a request
+        # body is, so the CLI cannot ask for anything the app could not. `None`
+        # when `-e` was not given, which is not the same as absent-and-defaulted:
+        # the controller reads it as "no opinion" and falls back to the preset's
+        # own edge, then to `PROXY_LONG_EDGE`. Passing the default here instead
+        # would make every CLI render silently override the preset.
+        "proxy_edge": args.proxy_edge,
         "quality": args.quality,
         # Recorded in the written file's metadata, and only here -- the name,
         # not the values. Absent when `-p` was not given, so a default render

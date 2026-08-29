@@ -43,7 +43,7 @@ from .. import imageio as iio
 from ..engine.diskcache import Blob
 from ..runtime import DEVICE, RENDER_LOCK
 from ..services.render import render_tier
-from .upload import Frame, Upload
+from .upload import PROXY_LONG_EDGE, Frame, Upload
 
 JOBS: dict[str, dict] = {}
 
@@ -85,7 +85,8 @@ def _reap_finished() -> None:
 def run_export(job_id: str, fr: Upload | Frame, p: dict, fmt: str, ss: float,
                quality: int, full: bool = False,
                out_hw: tuple[int, int] | None = None,
-               preset: dict | None = None) -> None:
+               preset: dict | None = None,
+               edge: int = PROXY_LONG_EDGE) -> None:
     """Render, resize to the requested output size, encode.
 
     ``preset`` is the `load_presets` record the look came from, or ``None``.
@@ -97,6 +98,9 @@ def run_export(job_id: str, fr: Upload | Frame, p: dict, fmt: str, ss: float,
     on and set to write the photograph's own dimensions. The caller decides,
     because it is the caller that has the `Upload` to compare against; this only
     has the frame.
+
+    ``edge`` is the proxy long edge the preview was rendered at, passed straight
+    through so this renders the tier that was on screen. Unused when ``full``.
     """
     job = JOBS[job_id]
     try:
@@ -116,7 +120,7 @@ def run_export(job_id: str, fr: Upload | Frame, p: dict, fmt: str, ss: float,
             # at 1.0. It goes through the same call rather than round the side
             # of it, so the 1:1 export and the `Render 1:1` preview are the same
             # pixels for the same reason the other five are.
-            out = render_tier(fr, p, ss, full, progress=progress)
+            out = render_tier(fr, p, ss, full, edge, progress=progress)
             # Then to the frame's own dimensions -- or the photograph's, if
             # `prescale_output` asked for that. A pass-through returning the
             # array itself when the size already matches, which is the common

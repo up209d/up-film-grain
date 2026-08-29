@@ -5,6 +5,7 @@
   "author": "UP",
   "author_link": "https://github.com/up209d",
   "reference_mp": 24,
+  "proxy_edge": 2400,
   "lut": "UP-SuperPortra",
   "values": {
     "prescale": 1,

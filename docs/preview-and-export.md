@@ -114,18 +114,137 @@ every export is the same dimensions, size cannot do it.
 ## The preview is client-scaled, two-tier (changed 2026-07-31)
 
 `/api/preview` renders **the whole frame**, never a crop. The request carries
-`id`, `params`, `supersample` and `full` — no mode, no zoom, no viewport. The
-browser does all the scaling.
+`id`, `params`, `supersample`, `proxy_edge` and `full` — no mode, no zoom, no
+viewport. The browser does all the scaling.
 
 `full` picks the fidelity, and it is the only difference between the two:
 
-* `false` (default) — the working proxy, `PROXY_LONG_EDGE = 2400`. This is what
-  every slider change triggers. At *parameter defaults* it is a few hundred ms;
-  what it actually costs depends almost entirely on the preset — see the
-  performance section, where `Stock` measures 8.8× defaults.
+* `false` (default) — the working proxy, whose long edge is `proxy_edge`,
+  defaulting to `PROXY_LONG_EDGE = 2400`. This is what every slider change
+  triggers. At *parameter defaults* it is a few hundred ms; what it actually
+  costs depends almost entirely on the preset — see the performance section,
+  where `Stock` measures 8.8× defaults.
 * `true` — the whole source at scale 1.0. The preview *is* the export at this
   point. Only ever fired by the explicit "Render 1:1" button; any parameter
-  change drops back to the proxy.
+  change drops back to the proxy. `proxy_edge` is ignored here — there is no
+  proxy.
+
+### The proxy edge is adjustable (2026-08-29, on request)
+
+`proxy_edge` moves that long edge over **100–4800 in steps of 100**, defaulting
+to 2400 so a client that never sends it behaves exactly as every client did
+before. `_clamp_edge` in `models/upload.py` clamps and snaps it, the same
+bargain `_clamp_ss` makes with the supersample: a value outside the range is a
+client bug, and answering at the nearest legitimate one beats refusing.
+
+Cost is roughly the **square** of the edge, which makes it the largest single
+lever over render time — larger than the supersample, because it moves the pixel
+count of the frame rather than of one tile's working grid. Measured on a
+synthetic 24MP source, `Stock` at 1× on the M4 Max, after a warm-up pass:
+
+| edge | tier | cold | warm checkpoint |
+|---|---|---|---|
+| 400 | 400×267 | 0.19s | 0.05s |
+| 800 | 800×533 | 0.23s | 0.08s |
+| 1200 | 1200×800 | 0.46s | 0.10s |
+| 2400 | 2400×1600 | **1.08s** | 0.38s |
+| 4800 | 4800×3200 | 3.96s | 1.63s |
+
+It runs in **both** directions and that is deliberate: below the default for a
+slider that keeps up on a large photograph, above it for a proxy that resolves
+more than the default does. A 4800px tier on a 24MP source is 15MP of working
+frame, which is most of the way to the 1:1 render at a third of its cost.
+
+**It is shared with the export, not preview-only**, and that is the whole
+design rather than an oversight. Five of the six export entries render the proxy
+tier and enlarge it, so this number already set export texture before it was
+adjustable; pinning the export at 2400 while the preview moved would break the
+one property this file exists to defend — that the file is the picture you
+judged. The costs of sharing it are paid where they are visible:
+
+* the export menu label carries the edge whenever it is not the default
+  (`Full size 5657×4243 / SS 2× / 800px proxy`), and every preview-tier entry's
+  help says what that means for the file;
+* the written filename carries `_px<edge>`, for the reason every other tag in
+  `controllers/export.py` exists — it changes the texture of the file without
+  changing a single one of its dimensions, so nothing in a folder listing could
+  otherwise tell two exports apart.
+
+**Why the edge is not in the checkpoint id.** It does not need to be. The
+engine's own key is `(id, boundary, scale, y0, x0, h, w, device, signature)` and
+a different edge moves `scale`, `h` and `w` together, so two edges cannot
+collide; entries for an edge the user has moved off become unreachable and age
+out under the byte cap — a miss, never a wrong picture. The one case where two
+edges key identically is when both sit at or past the frame's long side, and
+there they are genuinely the same render. `tests/checks/prescale.py` pins this by
+rendering four alternating edges against cold engines and requiring 0.00e+00.
+
+**Where it is cached.** `proxy_at(edge)` on both `Upload` and `Frame` holds a
+*single slot*, rebuilt when the edge changes and the outgoing file unlinked —
+the same argument `Upload.at()` makes about the prescale target, and for the same
+reason: a photograph is edited by dragging sliders, and neither of these moves
+while that is happening. A dict would grow one array per edge the user tried. An
+edge at or past the long side is not a resample at all and hands back `arr`
+itself, which is what removed the old aliased `_proxy is _arr` file and with it
+the hazard of a proxy slot that must not be released.
+
+### It travels with the preset, and the render waits for the release (2026-08-29, later the same day)
+
+Two changes on request, and they are the same realisation from two ends: the
+edge is *part of the look*, and it was being treated as neither a look nor a
+gesture.
+
+**It is a preset key now, and it is still not a `Param`.** `proxy_edge` sits
+beside `reference_mp` and `lut` at the top level of a preset file — a sibling of
+the values, never one of them, because the engine never reads it. It decides
+which *frame* the engine is handed, exactly as `reference_mp` decides which
+lengths it is handed. Every shipped preset is stamped `"proxy_edge": 2400`, and
+`usePresetFile` writes it into anything saved from the app, so a look now records
+the tier it was judged on and an export reproduces that tier without being told.
+A file written before this existed carries no key and renders at 2400, which is
+what it always did.
+
+The previous paragraph here said the opposite — session state, not part of the
+look — and it was wrong for one specific reason worth keeping: five of the six
+export entries render this tier and enlarge it, so the edge is in the *file*.
+Anything that changes what comes out of the export cannot be a preference about
+this session.
+
+**Three sources, in strict order, and `controllers/export.py` is the one place
+that resolves them:** the request body if it names an edge, else the named
+`preset`'s own, else `PROXY_LONG_EDGE`. So `./export.sh photo.jpg -p Stock`
+renders Stock's edge and `-e 800` overrides it. The CLI's `-e` has **no
+argparse default** for that to work — `None` is what makes "not declared"
+distinguishable from "declared as 2400", and a default there would have made
+every CLI render silently override the preset. The web client always sends the
+edge it is showing, so its precedence is the first rule and the preset reaches it
+by having seeded the slider.
+
+`load_presets` deliberately does **not** clamp the value: `_clamp_edge` lives in
+`models/upload.py`, which imports `params`, so reaching for it there would close
+the import graph on itself. Every consumer clamps instead — the export
+controller server-side, the slider's own bounds client-side — which is the same
+bargain `reference_mp` already makes with `sanitize`.
+
+**The slider commits on release, like every other slider.** It was a plain
+`useState` in `App.tsx` feeding `usePreview` directly, so *every step* of a drag
+across it started a render: a proxy resample plus a full pipeline pass, at a size
+nobody had stopped on, for each of up to 47 steps. The state moved into
+`useValues` beside `referenceMp` and `lut` — where it belonged once it became a
+preset fact anyway — and split in two the way the values already are:
+`proxyEdge` is what the slider shows, `appliedProxyEdge` is what the renderer
+sees, and the window `pointerup` listener that has always committed slider drags
+now commits both. `onKeyUp`/`onBlur` cover the keyboard path, exactly as
+`ParamControl` does.
+
+The split is visible in who reads which: the preview and every size readout read
+`appliedProxyEdge` (what is on screen), the slider and the export read
+`proxyEdge` (what you asked for). An export is a click, so a release has already
+committed by the time it fires and the two agree.
+
+It stays out of the undo history for the reason the supersample and the mount
+are out of it: undo is about the look, and a fidelity gesture would fill the
+stack with steps that change no pixel of the picture's *content*.
 
 Payload is a **JPEG q95 4:4:4** (`imageio.encode_preview`), not the PNG it used
 to be: grain defeats PNG's predictor, so a level-1 PNG of a 2400px proxy measured
@@ -201,8 +320,11 @@ What the client-side scaling bought:
 
 The honesty problem this creates, and how the UI handles it: enlarged past its
 own resolution the proxy is soft, and a soft preview reads as a soft *result*.
-The stage shows a `proxy` badge whenever `eff > proxy_width / source_width`, and
-the panel says to Render 1:1 before judging grain. Do not remove those.
+The stage shows a `proxy` badge whenever `eff > proxy_width / source_width` —
+where `proxy_width` is now derived from the edge this session is rendering at,
+via `prescaleGeom`, so lowering the edge makes the badge appear sooner exactly as
+it should. The panel says to Render 1:1 before judging grain. Do not remove
+those.
 
 ### A third export tier: the preview's look, at the source's own size (2026-08-05)
 

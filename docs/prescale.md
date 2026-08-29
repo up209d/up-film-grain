@@ -199,7 +199,7 @@ the two would quietly stop behaving the same way.
 
 ## What the client had to learn
 
-Prescaling makes `meta.width / height / megapixels / proxy_width` facts about
+Prescaling makes `meta.width / height / megapixels` facts about
 the *file* rather than about the frame, and almost everything in the app that
 quoted a size was quoting the wrong one. `models/prescale.ts` is the one place
 the difference is worked out — `prescaleGeom` for the frame, `exportDims` for
@@ -214,9 +214,14 @@ Two details:
   Python's `round` is banker's rounding and `Math.round` is not, and they
   disagree on exactly the half-pixel case that a ratio-preserving resize is
   built around.
-* `/api/upload` reports `proxy_long_edge` now. The client cannot derive it from
-  `proxy_width`: on a photograph smaller than the ceiling that number is the
-  photograph's own width and says nothing about where the ceiling is.
+* `/api/upload` reports the proxy long edge, not a measured proxy size. The
+  client cannot derive the ceiling from a measurement: on a photograph smaller
+  than it, a measured `proxy_width` is the photograph's own width and says
+  nothing about where the ceiling is. Since 2026-08-29 that is
+  `proxy_edge_default` plus the bounds a request may move it over, because the
+  edge became a property of the request and there is no longer one proxy to
+  measure at all — `proxyOf` takes the edge the session is asking for. See
+  `docs/preview-and-export.md`.
 
 Nothing new goes on the wire. The three values ride in `params` like every other
 control, which is the main dividend of making them parameters rather than

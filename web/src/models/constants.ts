@@ -116,6 +116,14 @@ export const SCALE_MANUAL_MIN = 0.1;
 export const SCALE_MANUAL_MAX = 4;
 export const SCALE_MANUAL_STEP = 0.01;
 
+/** Fallback bounds for the proxy-size slider, used before a photograph is open
+ *  and as the starting edge for a preset that names none.
+ *
+ *  The real bounds come from `/api/upload` so they cannot drift out of step
+ *  with `_clamp_edge` -- these exist because the control is rendered, and the
+ *  value is held, before any meta exists. `def` mirrors `PROXY_LONG_EDGE`. */
+export const PROXY_EDGE_FALLBACK = { min: 100, max: 4800, step: 100, def: 2400 };
+
 /** Marker written into saved preset files. Only used to make a hand-inspected
  *  file self-describing -- loading deliberately does not require it, so a bare
  *  `{"intensity": 40}` typed by hand still works. */

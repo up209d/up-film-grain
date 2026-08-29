@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, Response
 
 from .. import imageio as iio
 from ..models import upload as up_model
-from ..models.upload import _clamp_ss
+from ..models.upload import PROXY_LONG_EDGE, _clamp_edge, _clamp_ss
 from ..models.export_job import JOBS, run_export
 from ..params import load_presets
 
@@ -53,6 +53,13 @@ def export(body: dict = Body(...)) -> dict:
     whether the file is written at that resolution or resampled back to the
     photograph's own. Note this is the one export decision that lives in the
     parameters rather than in this body: it travels with a preset, on request.
+
+    ``proxy_edge`` is answered from three places in order (2026-08-29, on
+    request): the body if it names one, else the named ``preset``'s own
+    ``proxy_edge``, else ``PROXY_LONG_EDGE``. It is not a parameter -- it is a
+    sibling of the values in the preset file, like ``lut`` and
+    ``reference_mp`` -- so the look carries the tier it was judged on without
+    the engine ever seeing the number.
     """
     up = up_model.get(body.get("id", ""))
     # The frame as well as the values -- see `models/upload.py:params_for`.
@@ -63,17 +70,40 @@ def export(body: dict = Body(...)) -> dict:
     ss = _clamp_ss(body.get("supersample", 2))
     full = bool(body.get("full", False))
     quality = max(60, min(100, int(body.get("quality", 95))))
-    # The preset the look came from, by name, purely so the written file can say
-    # so. Optional and unvalidated beyond "is there a file called that": a
-    # caller that does not name one -- which the web client never does, because
-    # it stops tracking the name the moment a slider moves -- gets a file with
-    # no metadata, which is the requested behaviour rather than a degraded one.
+    # The preset the look came from, by name, so the written file can say so --
+    # and, since 2026-08-29, so the proxy edge can fall back to the one the look
+    # was dialled in on. Optional and unvalidated beyond "is there a file called
+    # that": a caller that does not name one -- which the web client never does,
+    # because it stops tracking the name the moment a slider moves -- gets a
+    # file with no metadata, which is the requested behaviour rather than a
+    # degraded one.
     want = body.get("preset")
     preset = next(
         (pre for pre in load_presets()
          if isinstance(want, str) and pre["name"].lower() == want.lower()),
         None,
     )
+    # The same proxy edge `/api/preview` was rendering at, and it has to be the
+    # same for the same reason `render_tier` is one call site: five of the six
+    # entries render the proxy tier, so this number is the file's texture.
+    #
+    # Three sources in strict order (2026-08-29, on request): **what the caller
+    # asked for wins**, then the named preset's own `proxy_edge`, then
+    # `PROXY_LONG_EDGE`. The middle one is the new part and it is what makes a
+    # preset a complete description of a look -- the tier it was judged on
+    # travels with it, so `./export.sh photo.jpg -p Stock` writes the file the
+    # look's author saw rather than the file this server's default produces.
+    # An explicit `-e` still overrides it, because a caller naming a number is
+    # answering the question the preset only had an opinion about.
+    #
+    # `None` rather than a sentinel default in `body.get`, so "not declared"
+    # and "declared as junk" stay distinguishable: the first falls through to
+    # the preset, the second is a client bug and `_clamp_edge` answers it at the
+    # nearest value it could legitimately have asked for.
+    edge_req = body.get("proxy_edge")
+    if edge_req is None and preset is not None:
+        edge_req = preset["proxy_edge"]
+    edge = _clamp_edge(PROXY_LONG_EDGE if edge_req is None else edge_req)
     # Which dimensions the file is written at, and it is the one question the
     # supersample menu deliberately does *not* answer. `prescale_output` picks:
     # 0 writes the frame that was rendered, 1 resamples it back to the file's
@@ -94,6 +124,11 @@ def export(body: dict = Body(...)) -> dict:
     # sharpest case of it: `_grain_ss1` and a full-tier render at 1x are the
     # same dimensions and the same factor, and differ in the one thing anybody
     # would keep both files for.
+    #
+    # A non-default proxy edge is tagged for the same reason and it is the
+    # strongest case of all of them: it changes the texture of the file without
+    # changing a single one of its dimensions, so nothing in a folder listing
+    # distinguishes two exports that differ only in this.
     if full:
         tag = ("_grain_full" if abs(ss - 1.0) < 1e-6
                else f"_grain_full_ss{ss:g}".replace(".", "_"))
@@ -107,6 +142,8 @@ def export(body: dict = Body(...)) -> dict:
     # files apart, which is what every tag in this block exists for.
     if prescaled:
         tag += f"_pre{fr.target_mp:g}mp".replace(".", "_")
+    if not full and edge != PROXY_LONG_EDGE:
+        tag += f"_px{edge:d}"
     JOBS[job_id] = {
         "id": job_id, "status": "queued", "progress": 0.0,
         "filename": f"{stem}{tag}.{iio.FORMATS[fmt][1]}",
@@ -115,7 +152,8 @@ def export(body: dict = Body(...)) -> dict:
     }
     threading.Thread(
         target=run_export,
-        args=(job_id, fr, p, fmt, ss, quality, full, (int(h), int(w)), preset),
+        args=(job_id, fr, p, fmt, ss, quality, full, (int(h), int(w)), preset,
+              edge),
         daemon=True,
     ).start()
     return {"job": job_id}

@@ -10,7 +10,7 @@ from fastapi.responses import Response
 from .. import imageio as iio
 from ..engine import RenderCancelled, device_name
 from ..models import upload as up_model
-from ..models.upload import _clamp_ss
+from ..models.upload import PROXY_LONG_EDGE, _clamp_edge, _clamp_ss
 from ..runtime import DEVICE, RENDER_LOCK, is_superseded, next_preview_gen
 from ..services.render import render_tier
 
@@ -31,7 +31,9 @@ def preview(body: dict = Body(...)) -> Response:
 
       * ``false`` (default) -- the working proxy. Fast enough to sit behind a
         slider. Magnified past its own resolution it is soft, so it cannot be
-        used to judge grain.
+        used to judge grain. ``proxy_edge`` says how large that proxy is; cost
+        goes roughly as its square, and the export renders the same tier, so it
+        is a quality decision rather than only a preview one.
       * ``true`` -- the whole source at scale 1.0. The preview *is* the export
         at this point: same pixels, same coordinates, differing only in bit
         depth.
@@ -53,6 +55,10 @@ def preview(body: dict = Body(...)) -> Response:
     fr, p = up_model.params_for(up, body)
     ss = _clamp_ss(body.get("supersample", 2))
     full = bool(body.get("full", False))
+    # The proxy's long edge, and so how much of the photograph the fast tier
+    # actually resolves. Absent means the default, which is what every client
+    # before this existed asks for. Ignored when `full` is set.
+    edge = _clamp_edge(body.get("proxy_edge", PROXY_LONG_EDGE))
 
     # Take a ticket *before* waiting on the lock, so a request already queued
     # here is superseded by a newer one arriving behind it rather than after it.
@@ -64,7 +70,7 @@ def preview(body: dict = Body(...)) -> Response:
     t0 = time.time()
     try:
         with RENDER_LOCK:
-            out = render_tier(fr, p, ss, full, should_cancel=superseded)
+            out = render_tier(fr, p, ss, full, edge, should_cancel=superseded)
     except RenderCancelled:
         # 499, nginx's "client closed request". The client aborted this fetch the
         # moment it issued the newer one, so nothing is waiting for this body --

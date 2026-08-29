@@ -70,6 +70,8 @@ other section and both are deliberate:
 
 Every preset is stamped `prescale: 1, prescale_mp: 24`, which makes Size
 Scaling's factor 1.00x across the shipped library. See `docs/prescale.md`.
+Every preset is also stamped `"proxy_edge": 2400` — a top-level key beside
+`reference_mp` and `lut`, not a value; see the proxy-edge section below.
 
 **In scope as of 2026-08-16:** a `Normalize` section **above** Colour Grading —
 one checkbox, shipping off, that corrects an input photograph's lightness and
@@ -351,6 +353,69 @@ disk held and current RSS. The readout exists because "the app eats RAM" was a
 question nobody in the session could answer, and a fix you cannot see is
 indistinguishable from no fix.
 
+## The proxy edge is adjustable, the tile size is not (2026-08-29)
+
+Asked as one question — "our preview proxy builds on a 1200px tile, would 2^n
+tiles be faster, make it configurable" — and it is really two, with opposite
+answers. Neither number was 1200.
+
+**Tile size was already not a constant** and is not a speed dial. `tile_for`
+descends from the image's longest edge in steps of **128**, clamped to
+`[768, 8192]`, sized against a measured memory budget. Powers of two are a
+subset of what it already picks; there is no FFT in this pipeline, so there is
+no radix-2 boundary to align to; and small tiles are catastrophic rather than
+fast, because `pad_for` overlap is fixed — a 128px tile against a ~178px pad
+reads 484² to keep 128², about 14x overdraw, which is what `_TILE_MIN = 768`
+exists to prevent. `docs/performance.md` measures the trend: bigger is
+monotonically faster all the way to a single tile, and the only ceiling is peak
+memory. **It is deliberately not exposed.** Do not add a control for it.
+
+**The proxy long edge is the dial that question was reaching for**, and it is
+now a request field: `proxy_edge`, 100–4800 in steps of 100, default 2400 so a
+client that omits it behaves exactly as every client did before. Cost is roughly
+its *square* — 0.19s at 400px against 1.08s at 2400 and 3.96s at 4800, on a 24MP
+source. Four things about it:
+
+* **It is shared with the export, not preview-only.** Five of the six export
+  entries render the proxy tier and enlarge it, so this number already set export
+  texture before it was adjustable — pinning the export at 2400 while the preview
+  moved would break "export what I am looking at". The cost is paid where it is
+  visible: the export menu label and the written filename both carry a
+  non-default edge (`_px800`), because it changes the file's texture without
+  changing any of its dimensions.
+* **It is a preset key, and it is still not a `Param`.** Corrected the same day
+  it was written, on request: this bullet used to say session state, on the same
+  test `ScalePanel.tsx` states for Manual scale. That test does not reach it — the
+  edge is in the *file*, because five of the six export entries render this tier
+  and enlarge it, and a number that changes what comes out of the export cannot
+  be a preference about this session. `proxy_edge` sits beside `reference_mp`
+  and `lut` at a preset's top level, never among the values (the engine never
+  reads it), and every shipped preset is stamped `2400`. **Export resolves three
+  sources in order — the request, then the named preset's, then
+  `PROXY_LONG_EDGE` — in `controllers/export.py` and nowhere else**, which is
+  why the CLI's `-e` has no argparse default: `None` is what keeps "not
+  declared" apart from "declared as 2400", and a default there would have made
+  every `./export.sh` run silently override the preset it was handed.
+* **The slider commits on release**, like every other slider, and did not until
+  it was reported. It was a plain `useState` in `App.tsx` feeding `usePreview`
+  directly, so every step of a drag started a proxy resample and a full pipeline
+  pass at a size nobody had stopped on. It lives in `useValues` now — beside
+  `referenceMp` and `lut`, where the preset key put it anyway — split into
+  `proxyEdge` (what the slider shows) and `appliedProxyEdge` (what the renderer
+  sees), committed by the window `pointerup` listener that has always committed
+  slider drags. The preview and every size readout read the applied one; the
+  slider and the export read the live one.
+* **It needs no place in the checkpoint id**, and that is stated in
+  `services/render.py` rather than left to be rediscovered: the engine's key
+  carries `scale`, `h` and `w`, and a different edge moves all three.
+* **`Upload.proxy` and `Frame.proxy` are gone** in favour of `proxy_at(edge)` —
+  one slot, rebuilt when the edge changes, the outgoing file unlinked, exactly
+  the argument `Upload.at()` makes about the prescale target. An edge at or past
+  the long side hands back `arr` itself, which removed the old aliased
+  `_proxy is _arr` file and with it the hazard of a proxy slot that must never be
+  released. `/api/upload` reports the *bounds* now, not a measured proxy size:
+  there is no longer one proxy to measure.
+
 ## Pipeline order (a section added above the top 2026-08-29)
 
 `Prescaling Source` is step **-3**, above `Normalize`. It is first in `GROUPS`
@@ -484,11 +549,17 @@ that a stored tensor comes back bit-identical on the right device, that the
 payload really is a file rather than a dict wearing the same API, that two gets
 are independent objects, that eviction unlinks rather than merely forgetting,
 that a file deleted underneath the store reads as a miss instead of raising, and
-that two engines in one process cannot answer each other's keys — 475 checks. It
+that two engines in one process cannot answer each other's keys, and the
+adjustable proxy edge — that it clamps and snaps the way the client's mirror of
+it does, that an edge past the long side is the *same object* rather than a
+second code path, that one edge is held rather than one per edge ever asked for,
+that two edges of one photograph never share a checkpoint, that the export
+renders the edge the preview was showing, and that the edge falls back from
+the request to the preset's own to the default in that order — 492 checks. It
 exits non-zero on failure.
 
-Those 475 live in `tests/checks/`, one module per area, since 2026-08-08 — it
-was a single 3900-line function taking 4m24s, and it is 20 modules taking ~53s
+Those 492 live in `tests/checks/`, one module per area, since 2026-08-08 — it
+was a single 3900-line function taking 4m24s, and it is 20 modules taking ~62s
 (39s until `luts/` grew to 303 files, every one of which the `grading` module
 parses on purpose).
 **Name the modules covering what you touched and only those run:**
@@ -564,7 +635,7 @@ optional reading before touching the area it covers.
 | [docs/using-the-controls.md](docs/using-the-controls.md) | What each control does, for a user rather than a maintainer — moved out of `README.md` 2026-08-08 |
 | [docs/architecture.md](docs/architecture.md) | Where everything lives after the 2026-08-08 package split, the two import rules that keep it acyclic, and why `Stage.tsx` was left whole |
 | [docs/pipeline-order.md](docs/pipeline-order.md) | Which stages are placed by *position* and what breaks if they move; `pre_blur` vs `micro_blur`; why `master_opacity` lives outside `render()` |
-| [docs/preview-and-export.md](docs/preview-and-export.md) | The client-scaled two-tier preview, and why every export is the preview tier enlarged to full size with the supersample as the only choice |
+| [docs/preview-and-export.md](docs/preview-and-export.md) | The client-scaled two-tier preview, the adjustable proxy long edge, and why every export is the preview tier enlarged to full size |
 | [docs/colour-grading.md](docs/colour-grading.md) | Step −1: LUTs as *resources*, the twelve adjustments, the Shadows/Highlights rewrite, highlight reconstruction — and, filed with them, Tone Response's bidirectional split tone |
 | [docs/halation.md](docs/halation.md) | Blue compensation and why it runs before the wash; highlight recovery metered against real headroom |
 | [docs/edge-destruction.md](docs/edge-destruction.md) | Scatter (diffusion without the average) and anti-aliasing (filter along the contour) |

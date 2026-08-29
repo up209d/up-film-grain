@@ -89,6 +89,7 @@ def load_presets() -> list[dict]:
         if not isinstance(values, dict):
             values = raw
         ref = raw.get("reference_mp") or DEFAULT_REFERENCE_MP
+        edge = raw.get("proxy_edge")
         lut = raw.get("lut")
         author = raw.get("author")
         author_link = raw.get("author_link")
@@ -104,6 +105,22 @@ def load_presets() -> list[dict]:
             # different photo. Absent in older files -> no scaling, which is
             # the pre-existing behaviour rather than a guess.
             "reference_mp": float(ref) if isinstance(ref, (int, float)) and ref else None,
+            # Long edge of the proxy tier the look was judged on (2026-08-29,
+            # on request). A sibling of the values for the same reason
+            # `reference_mp` is: it is not a quantity the engine reads, it is a
+            # fact about how finely the frame this look was dialled in on had
+            # been resolved -- and five of the six export entries render that
+            # tier, so it decides the texture of the file as much as any slider
+            # does. Absent -> the caller's own default, which is
+            # `PROXY_LONG_EDGE` everywhere it is consumed.
+            #
+            # Deliberately *not* clamped here. `_clamp_edge` lives in
+            # `models/upload.py`, which imports this package, so reaching for it
+            # would close the import graph on itself; every consumer already
+            # clamps (`controllers/export.py` server-side, the slider's own
+            # bounds client-side), which is the same bargain `reference_mp`
+            # makes with `sanitize`.
+            "proxy_edge": int(edge) if isinstance(edge, (int, float)) and edge else None,
             # Who made the look, and where to find them. Carried through rather
             # than dropped because the client writes them back out when the
             # preset is saved to a file again -- every shipped preset has

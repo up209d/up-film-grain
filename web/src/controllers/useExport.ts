@@ -17,6 +17,9 @@ export function useExport(opts: {
   meta: ImageMeta | null;
   values: Values;
   supersample: number;
+  /** The edge the preview is rendering at. The export must render the same
+   *  tier, or the file is not the picture the look was judged on. */
+  proxyEdge: number;
   referenceMp: number | null;
   scaleToRef: boolean;
   lut: string | null;
@@ -49,6 +52,7 @@ export function useExport(opts: {
         params: opts.values,
         format,
         supersample: opt.ss,
+        proxy_edge: opts.proxyEdge,
         full: opt.full,
         quality: 95,
         reference_mp: opts.scaleToRef ? opts.referenceMp : null,

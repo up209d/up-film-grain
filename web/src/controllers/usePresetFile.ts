@@ -22,9 +22,15 @@ export function usePresetFile(opts: {
    *  "Set from photo" writes. */
   frameMp: number | null;
   referenceMp: number | null;
+  /** Long edge of the proxy tier this look is being judged on. Written into the
+   *  file beside `reference_mp`, and read back out on load: the export renders
+   *  this tier, so a look saved without it is a look whose file cannot be
+   *  reproduced from the preset alone. */
+  proxyEdge: number;
   lut: string | null;
   author: Author | null;
   setReferenceMp: (v: number | null) => void;
+  setProxyEdge: (v: number) => void;
   setLut: (v: string | null) => void;
   setAuthor: (v: Author | null) => void;
   applyValues: (v: Values) => void;
@@ -34,7 +40,8 @@ export function usePresetFile(opts: {
   const fileRef = useRef<HTMLInputElement | null>(null);
 
   const savePreset = () => {
-    const { schema, values, frameMp, referenceMp, lut, author } = opts;
+    const { schema, values, frameMp, referenceMp, proxyEdge, lut, author } =
+      opts;
     if (!schema) return;
     const name = window.prompt("Preset name", "my-look")?.trim();
     if (!name) return;
@@ -56,6 +63,12 @@ export function usePresetFile(opts: {
       // Falls back to whatever it was loaded with, so re-saving a preset you
       // did not author here does not silently re-base it onto this image.
       reference_mp: referenceMp ?? frameMp ?? null,
+      // The tier the look was judged on, stamped for the same reason the size
+      // is: five of the six export entries render this proxy and enlarge it, so
+      // two files from the same values and different edges are two different
+      // pictures. Written in the same position the shipped presets carry it, so
+      // a re-saved file still diffs cleanly against them.
+      proxy_edge: proxyEdge,
       // A sibling of `values`, not one of them -- a LUT is named, not numbered.
       // An uploaded LUT's id will not resolve in a future session; that is the
       // honest thing to write, and the picker shows the name as missing rather
@@ -93,6 +106,12 @@ export function usePresetFile(opts: {
       const raw = JSON.parse(await file.text());
       const { values: v, dropped } = coerceValues(opts.schema, raw);
       if (typeof raw?.reference_mp === "number") opts.setReferenceMp(raw.reference_mp);
+      // Only when the file says. Unlike the LUT, absence is not a value here:
+      // a hand-written `{"intensity": 40}` is a set of numbers rather than a
+      // whole look, and dropping the session back to the default edge would
+      // re-render at a tier the person loading it did not ask for.
+      if (typeof raw?.proxy_edge === "number" && raw.proxy_edge > 0)
+        opts.setProxyEdge(raw.proxy_edge);
       // Set unconditionally, `null` included: a file with no LUT describes a
       // look that has none, and leaving the previous selection in place would
       // silently blend two grades.

@@ -25,6 +25,11 @@
 #                                   would otherwise re-download it and the two
 #                                   flags together would mean nothing.
 #
+# ELECTRON_BUILDER_COMPRESSION_LEVEL=9 ./build.sh
+#                                   compress the .tar.gz as hard as 7-Zip will.
+#                                   Defaults to 5 here; see the note at stage 3
+#                                   for why 9 costs minutes and buys ~1%.
+#
 # Windows and Linux are not supported yet and say so; tools/bundle.py records
 # what they will need.
 set -euo pipefail
@@ -43,7 +48,7 @@ for arg in "$@"; do
     --no-electron) WITH_ELECTRON=0 ;;
     --skip-client) SKIP_CLIENT=1 ;;
     --skip-runtime) SKIP_RUNTIME=1 ;;
-    -h|--help)     sed -n '2,29p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)     sed -n '2,34p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -146,7 +151,29 @@ fi
   (cd electron && npm install --no-audit --no-fund)
 }
 setup_node
-say "shell: packaging"
+
+# The gzip level for the .tar.gz, and the reason the last step used to take
+# minutes. electron-builder writes a plain .tar and then hands it to 7-Zip's
+# Deflate encoder, which defaults to `-mx=9` -- and 7-Zip's -mx=9 is not gzip -9,
+# it is a far more exhaustive match search that this payload cannot pay off.
+# Measured end to end, `./build.sh --skip-client --skip-runtime` on the 1.1GB
+# .app -- the whole difference is this one step:
+#
+#     -mx=9   6m29s   327,334,315 bytes
+#     -mx=5   1m46s   330,841,139 bytes    (+1.07%)
+#
+# Seven times the compression time for one percent of the size, and all of it on
+# one core -- 7-Zip's gzip encoder is not threaded, so the other thirteen are idle
+# whichever level is picked. Nothing else in the build is close to this: stages 1
+# and 2 together are ~15s, and the plain .tar that feeds this is ~19s.
+#
+# `-mx=1` was measured too (2.5s against 98.2s on the 353MB of torch dylibs that
+# dominate the payload) but costs 6% of the size, which is 20MB people download.
+#
+# Set the variable yourself to override; `9` restores the old behaviour.
+export ELECTRON_BUILDER_COMPRESSION_LEVEL="${ELECTRON_BUILDER_COMPRESSION_LEVEL:-5}"
+
+say "shell: packaging (gzip -mx=$ELECTRON_BUILDER_COMPRESSION_LEVEL)"
 (cd electron && npx --no-install electron-builder \
     --config electron-builder.yml --publish never)
 

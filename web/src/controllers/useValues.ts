@@ -16,6 +16,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { PROXY_EDGE_FALLBACK } from "../models/constants";
 import {
   groupIndex, muteAll, neutralised, presetAuthor, startingValues,
 } from "../models/paramState";
@@ -44,6 +45,25 @@ export function useValues(
 ) {
   const [values, setValues] = useState<Values>({});
   const [applied, setApplied] = useState<Values>({});
+  /** The proxy long edge, and it is the same two-value story as the values
+   *  above and for the same reason: `proxyEdge` is what the slider shows and
+   *  moves on every input event, `appliedProxyEdge` is what the renderer sees.
+   *
+   *  It lives here rather than in `App` (moved 2026-08-29) because of what it
+   *  became: a *preset* fact, like `referenceMp` and `lut`, carried in the file
+   *  beside the values and set by boot, Reset and `applyPreset`. Holding it
+   *  next to them is what keeps those three paths from having to remember it
+   *  one at a time -- and it puts it under the `pointerup` commit below, which
+   *  is the bug this move fixed: every step of a drag across the slider used to
+   *  start a render of a proxy nobody was going to look at.
+   *
+   *  It is still not a `Param`. The engine never reads it; it decides which
+   *  frame the engine is handed, which is why it is not in the schema and why
+   *  `sanitize` has never heard of it. */
+  const [proxyEdge, setProxyEdgeLive] = useState(PROXY_EDGE_FALLBACK.def);
+  const [appliedProxyEdge, setAppliedProxyEdge] = useState(
+    PROXY_EDGE_FALLBACK.def,
+  );
   const [muted, setMuted] = useState<Record<string, Values>>({});
   const [referenceMp, setReferenceMp] = useState<number | null>(null);
   const [lut, setLut] = useState<string | null>(null);
@@ -54,6 +74,8 @@ export function useValues(
 
   const valuesRef = useRef<Values>(values);
   valuesRef.current = values;
+  const edgeRef = useRef<number>(proxyEdge);
+  edgeRef.current = proxyEdge;
 
   // Seed from the schema the moment it lands. The starting preset's values are
   // held as "muted" rather than applied -- the app opens showing the untouched
@@ -64,6 +86,7 @@ export function useValues(
     setValues(booted.neutral);
     setApplied(booted.neutral);
     setReferenceMp(start.referenceMp);
+    setProxyEdgeNow(start.proxyEdge);
     setLut(start.lut);
     setAuthor(start.author);
     setMuted(muteAll(booted, start.values));
@@ -101,11 +124,31 @@ export function useValues(
     liveFor(k);
   };
 
+  /** Move the slider without rendering. The pointer release commits it, the
+   *  same bargain every parameter slider makes -- a proxy edge is *seconds* of
+   *  work per step and the frames a drag queues are stale before they arrive.
+   *  Use `setProxyEdgeNow` for anything that is not a gesture. */
+  const setProxyEdge = (n: number) => setProxyEdgeLive(n);
+
+  /** Set the edge *and* render it, for the discrete actions -- boot, Reset, a
+   *  preset. Both setters take the number directly rather than one of them
+   *  reading `edgeRef`, for the reason `setValueNow` spells out: the ref is
+   *  only refreshed during render, so a commit called synchronously after a
+   *  set would apply the value from before it. */
+  const setProxyEdgeNow = (n: number) => {
+    setProxyEdgeLive(n);
+    setAppliedProxyEdge(n);
+  };
+
   /** Hand the live values to the renderer. Passing the ref's current object
    *  means an uncommitted gesture is a no-op: React bails out when the state
    *  is set to the identical reference, so this costs nothing when nothing
-   *  moved. */
-  const commit = useCallback(() => setApplied(valuesRef.current), []);
+   *  moved. The proxy edge rides along for exactly that reason -- it is a
+   *  plain number, so committing an unmoved one is a bail-out too. */
+  const commit = useCallback(() => {
+    setApplied(valuesRef.current);
+    setAppliedProxyEdge(edgeRef.current);
+  }, []);
 
   /** Set a value *and* render it, in one gesture.
    *
@@ -198,6 +241,13 @@ export function useValues(
     // one; the server rescales lengths by the linear ratio, but only if it is
     // told what size the values were authored at.
     setReferenceMp(p.reference_mp ?? null);
+    // So does the proxy edge the look was judged on (2026-08-29, on request).
+    // Absence is a value here rather than "leave it alone", the same rule the
+    // LUT follows: a look that names no edge is a look dialled in at the
+    // default, and inheriting the last preset's edge would render it at a
+    // texture its author never saw. `setProxyEdgeNow` because picking a preset
+    // is a discrete action with no pointer release to wait for.
+    setProxyEdgeNow(p.proxy_edge ?? PROXY_EDGE_FALLBACK.def);
     // The LUT is part of the look, so it comes along -- including its absence.
     // A preset with no LUT has to *clear* one that is selected, or the last
     // look's grade would keep riding under the new one.
@@ -227,6 +277,7 @@ export function useValues(
     setValues(schema.neutral);
     setApplied(schema.neutral);
     setReferenceMp(start.referenceMp);
+    setProxyEdgeNow(start.proxyEdge);
     setLut(start.lut);
     setAuthor(start.author);
     setMuted(muteAll(schema, start.values));
@@ -322,6 +373,14 @@ export function useValues(
 
   // Placed after every mutator on purpose: it observes rather than being
   // called, so nothing above it has to know the history exists.
+  //
+  // The proxy edge is deliberately not in the snapshot, even though a preset
+  // sets it. Undo walks the *content* of the look; this is the resolution it is
+  // being judged at, so every nudge of the slider would push a step that
+  // changes no value in the picture -- the same reason the supersample and the
+  // mount are not in here. Undoing back past a preset therefore leaves the edge
+  // where the last gesture put it, which is what every other view control in
+  // the app already does.
   const history = useHistory(
     { values: applied, muted, referenceMp, lut, author },
     restore,
@@ -330,6 +389,12 @@ export function useValues(
 
   return {
     values, applied, muted, referenceMp, lut, author, valuesRef,
+    // Live and committed, and the callers are not interchangeable: the slider
+    // and the export read `proxyEdge` (what you asked for), the preview and
+    // every size readout read `appliedProxyEdge` (what is on screen). An export
+    // is a click, so a release has always already committed by the time it
+    // fires and the two agree.
+    proxyEdge, appliedProxyEdge, setProxyEdge, setProxyEdgeNow,
     setReferenceMp, setLut, setAuthor, setValue, setValueNow, commit,
     liveFor, randomizeSeeds, applyPreset, resetAll, showOriginal,
     toggleGroup, resetGroup, applyValues,

@@ -26,6 +26,13 @@ export interface Preset {
   values: Record<string, number>;
   /** Megapixels the preset was dialled in on, if it says. */
   reference_mp: number | null;
+  /** Long edge of the proxy tier the look was judged on, if it says. A sibling
+   *  of the values for the reason `reference_mp` is: it is not a quantity the
+   *  engine reads, it is how finely the frame it was dialled in on had been
+   *  resolved — and the export renders that same tier, so it decides the file's
+   *  texture. Null → the default edge, which is what the server falls back to
+   *  for the same file. */
+  proxy_edge: number | null;
   /** 3D LUT the look wants, by id. A sibling of the values rather than one of
    *  them: a LUT is a resource identified by name, not a quantity, so it cannot
    *  be a number in the schema — see server/lut.py. */
@@ -82,13 +89,17 @@ export interface ImageMeta {
   width: number;
   height: number;
   megapixels: number;
-  proxy_width: number;
-  proxy_height: number;
-  /** `PROXY_LONG_EDGE` itself, so the client can work out the proxy of a
-   *  *prescaled* frame. `proxy_width` cannot give it: on a photograph smaller
-   *  than the ceiling it is the photograph's own width. See
-   *  `models/prescale.ts`. */
-  proxy_long_edge: number;
+  /** The proxy long edge a request that names none is answered at, and the
+   *  range one may ask for. Bounds rather than this photograph's proxy size:
+   *  the edge is a property of the *request* now, so there is no single proxy
+   *  to measure, and `proxyOf` in `models/prescale.ts` derives the dimensions
+   *  from whichever edge the session is asking for. Reported by the server
+   *  rather than hard-coded here so the slider's range and `_clamp_edge` cannot
+   *  drift apart. */
+  proxy_edge_default: number;
+  proxy_edge_min: number;
+  proxy_edge_max: number;
+  proxy_edge_step: number;
 }
 
 /** No view geometry: the server renders the whole frame and the browser does
@@ -99,6 +110,10 @@ export interface ViewRequest {
   params: Record<string, number>;
   supersample: number;
   full?: boolean;
+  /** Long edge of the proxy tier. Cost goes roughly as its square, and
+   *  `/api/export` renders the same tier, so this is a quality decision and not
+   *  only a preview one. Ignored when `full` is set. */
+  proxy_edge?: number;
   /** Megapixels of the image these values were dialled in on. The server
    *  rescales every length by the *linear* ratio to the current image, so a
    *  preset keeps its look on a bigger or smaller photo. Omit for no scaling. */
@@ -317,6 +332,10 @@ export async function startExport(body: {
   quality: number;
   reference_mp?: number | null;
   lut?: string | null;
+  /** The edge the preview was rendered at. Five of the six entries render the
+   *  proxy tier, so omitting it here would write a file that does not match the
+   *  picture it was judged on. */
+  proxy_edge?: number;
 }): Promise<string> {
   const r = await fetch("/api/export", {
     method: "POST",

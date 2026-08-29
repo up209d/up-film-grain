@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-from ..models.upload import Frame, Upload
+from ..models.upload import PROXY_LONG_EDGE, Frame, Upload
 from ..runtime import ENGINE
 
 
 def render_tier(fr: Upload | Frame, p: dict, ss: float, full: bool,
+                edge: int = PROXY_LONG_EDGE,
                 progress=None, should_cancel=None):
     """Render one of the two tiers. The single place either tier is rendered.
 
     ``fr`` is what ``models.upload.params_for`` handed back: the photograph at
     the working resolution these parameters asked for. It is the ``Upload``
     itself when Prescaling Source is off and a ``Frame`` when it is on, and
-    nothing here can tell the difference -- both carry ``arr``, ``proxy``,
-    ``proxy_scale`` and an ``id``, which is the whole interface this needs.
+    nothing here can tell the difference -- both carry ``arr``, ``proxy_at``
+    and an ``id``, which is the whole interface this needs.
 
     ``/api/preview`` and ``/api/export`` both come through here, and that is
     deliberate rather than tidy: an export is supposed to be **byte-for-byte**
@@ -28,8 +29,12 @@ def render_tier(fr: Upload | Frame, p: dict, ss: float, full: bool,
     ``ss`` is a float, not an int: the menu offers 0.5 and 1.5 alongside the
     whole factors, and ``render_supersampled`` handles the fractional ones by
     rounding the working grid to whole pixels rather than the factor.
+
+    ``edge`` is the proxy's long edge, already clamped by ``_clamp_edge``. It is
+    ignored when ``full`` is set, which renders the frame itself at scale 1.0 and
+    never touches a proxy.
     """
-    src, sc = (fr.arr, 1.0) if full else (fr.proxy, fr.proxy_scale)
+    src, sc = (fr.arr, 1.0) if full else fr.proxy_at(edge)
     # Tile size from `ENGINE.tile_for`, not a constant. Per-tile overlap is fixed
     # padding that gets rendered and thrown away, so wider tiles are strictly
     # less work -- but the ceiling is memory, and the right ceiling differs per
@@ -45,6 +50,14 @@ def render_tier(fr: Upload | Frame, p: dict, ss: float, full: bool,
     # working scale is in the key too, but only via `sc`, which is 1.0 for both
     # an untouched full-res source and the full tier -- hence naming the tier
     # outright.
+    #
+    # The proxy `edge` needs no place in the id, and that is worth stating rather
+    # than leaving to be rediscovered. The engine's own key carries `scale` and
+    # the tile's `h`/`w`, and a different edge moves all three -- so two edges can
+    # never collide, and the entries for an edge the user has moved off simply
+    # become unreachable and age out under the byte cap. A miss, never a wrong
+    # picture. The one case where two edges *do* key identically is when both sit
+    # at or past the frame's long side, and there they are the same render.
     return ENGINE.render_image(
         src, p, sc, tile=tile, supersample=ss, progress=progress,
         should_cancel=should_cancel,

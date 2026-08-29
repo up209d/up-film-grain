@@ -47,25 +47,30 @@ function target(values: Values): number | null {
   return mp > 0 ? mp : null;
 }
 
-function proxyOf(meta: ImageMeta, h: number, w: number): [number, number] {
-  // The long edge is reported by `/api/upload` rather than inferred, because
-  // `proxy_width` alone cannot give it: on a photograph smaller than the
-  // ceiling that number is the photograph's own width and says nothing about
-  // where the ceiling is.
-  const edge = meta.proxy_long_edge || Math.max(meta.proxy_width, meta.proxy_height);
+function proxyOf(edge: number, h: number, w: number): [number, number] {
+  // Mirrors `proxy_scale_at` on both `Upload` and `Frame`. The edge is a
+  // property of the request rather than of the photograph, so it is passed in:
+  // there is no single proxy on the server to read a size off, and a
+  // photograph smaller than the edge is its own proxy at scale 1.
   const s = Math.min(1, edge / Math.max(h, w));
   return [Math.round(w * s), Math.round(h * s)];
 }
 
-export function prescaleGeom(meta: ImageMeta | null, values: Values): Geom | null {
+export function prescaleGeom(
+  meta: ImageMeta | null,
+  values: Values,
+  proxyEdge?: number,
+): Geom | null {
   if (!meta) return null;
+  const edge = proxyEdge ?? meta.proxy_edge_default;
   const mp = target(values);
+  const [ipw, iph] = proxyOf(edge, meta.height, meta.width);
   const identity: Geom = {
     width: meta.width,
     height: meta.height,
     megapixels: meta.megapixels,
-    proxyWidth: meta.proxy_width,
-    proxyHeight: meta.proxy_height,
+    proxyWidth: ipw,
+    proxyHeight: iph,
     factor: 1,
     prescaled: false,
   };
@@ -79,7 +84,7 @@ export function prescaleGeom(meta: ImageMeta | null, values: Values): Geom | nul
   // frame is the file and saying otherwise in the UI would be a lie.
   if (w === meta.width && h === meta.height) return identity;
 
-  const [pw, ph] = proxyOf(meta, h, w);
+  const [pw, ph] = proxyOf(edge, h, w);
   return {
     width: w,
     height: h,

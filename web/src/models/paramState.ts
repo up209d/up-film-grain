@@ -6,6 +6,7 @@
  *  hooks in `../controllers` own the state; this owns the arithmetic.
  */
 
+import { PROXY_EDGE_FALLBACK } from "./constants";
 import type { Schema } from "../services/api";
 import type { Author, Values } from "./types";
 
@@ -18,13 +19,18 @@ export function startingValues(
 ): {
   values: Values;
   referenceMp: number | null;
+  /** Never null, unlike the rest: the session always renders at *some* edge,
+   *  so a preset that names none starts at the default the server would have
+   *  used for the same file rather than at nothing. */
+  proxyEdge: number;
   lut: string | null;
   author: Author | null;
 } {
   const v: Values = {};
   for (const p of s.params) v[p.key] = p.default;
   const preset = s.presets.find((x) => x.name === s.default_preset);
-  // The reference size travels with the values, and so does the LUT name.
+  // The reference size travels with the values, and so do the LUT name and the
+  // proxy edge the look was judged on.
   // Returning them here rather than only in applyPreset is the point: boot
   // and Reset go through this path, so without it the app opened on Stock
   // with size scaling inert until you re-picked Stock from the dropdown by
@@ -33,10 +39,17 @@ export function startingValues(
     ? {
         values: { ...v, ...preset.values },
         referenceMp: preset.reference_mp,
+        proxyEdge: preset.proxy_edge ?? PROXY_EDGE_FALLBACK.def,
         lut: preset.lut ?? null,
         author: presetAuthor(preset),
       }
-    : { values: v, referenceMp: null, lut: null, author: null };
+    : {
+        values: v,
+        referenceMp: null,
+        proxyEdge: PROXY_EDGE_FALLBACK.def,
+        lut: null,
+        author: null,
+      };
 }
 
 /** The credit a preset carries, or null when it names nobody.

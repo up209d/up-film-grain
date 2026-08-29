@@ -364,7 +364,9 @@ function Stage(props: {
   // The proxy resolves detail only up to its own resolution; past that the
   // browser is enlarging it and grain is not being shown honestly. Say so
   // rather than letting a soft preview read as a soft result.
-  const proxyLimit = (props.geom?.proxyWidth ?? meta?.proxy_width ?? 0) / iw;
+  // `geom` is the only source now: the proxy's size follows the edge this
+  // session is rendering at, so there is nothing on `meta` to fall back to.
+  const proxyLimit = (props.geom?.proxyWidth ?? 0) / iw;
   const softened = !previewFull && eff > proxyLimit * 1.05;
 
   // Whether the picture is actually being *reduced* on the way to the display,
@@ -374,7 +376,7 @@ function Stage(props: {
   // in overlay mode, so the toggle is gated on this rather than always present.
   const dpr = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
   const natural =
-    previewFull ? 1 : (props.geom?.proxyWidth ?? meta?.proxy_width ?? iw) / iw;
+    previewFull ? 1 : (props.geom?.proxyWidth ?? iw) / iw;
   const downscaling = eff * dpr < natural * 0.999;
 
   // One bar for compare mode, the wipe, the zoom and the mount -- grouped left
@@ -675,6 +677,18 @@ function Stage(props: {
               className="divider"
               style={{
                 left: `${(place().left as number) + (1 - split) * dw}px`,
+                // Down the photograph, not down the pane. `top`/`bottom: 0` drew
+                // it over the whole stage -- across both overlay bars and the
+                // chequerboard above and below the picture -- which reads as a
+                // stray line on the app rather than as the edge of the wipe,
+                // and lands nowhere near the edge it is marking once the frame
+                // is fitted. Clamped to the pane so a zoomed-in photograph does
+                // not push it past the visible area at either end.
+                top: `${Math.max(0, place().top as number)}px`,
+                height: `${
+                  Math.min(pane.h, (place().top as number) + dh) -
+                  Math.max(0, place().top as number)
+                }px`,
               }}
             />
           )}

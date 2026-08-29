@@ -45,7 +45,9 @@ from server.controllers import export as export_ctl
 from server.engine.grain_engine import GrainEngine
 from server.models import upload as up_model
 from server.models.export_job import JOBS
-from server.models.upload import PROXY_LONG_EDGE, Upload, prescale_dims
+from server.models.upload import (PROXY_EDGE_MAX, PROXY_EDGE_MIN,
+                                  PROXY_LONG_EDGE, Upload, _clamp_edge,
+                                  prescale_dims)
 from server.services.render import render_tier
 from tests.harness import Ctx, check, suite
 from tests.scene import scene
@@ -153,6 +155,15 @@ def run(cx: Ctx) -> None:
         for _ in range(3):
             _ = up.at(1.0).arr
         full_calls = len(calls) - proxy_calls
+        # A *different* edge is a second resample and must not be a third: the
+        # slot is rebuilt, not added to. 400px is below this frame's long side
+        # where the default is not, so this is the branch that actually resizes.
+        for _ in range(3):
+            _ = up.at(1.0).proxy_at(400)
+        edge_calls = len(calls) - proxy_calls - full_calls
+        back = len(calls)
+        _ = up.at(1.0).proxy_at(400)
+        held_calls = len(calls) - back
     finally:
         iio.resize_to = real
     check(
@@ -163,9 +174,26 @@ def run(cx: Ctx) -> None:
         "four proxy reads are one resample", proxy_calls == 1,
         f"{proxy_calls} resample(s) for 4 reads, at {calls[0]}",
     )
+    # This frame is smaller than the default proxy edge, so its proxy *is* its
+    # own array -- one resample answered both loops above, and `arr` was already
+    # built by the time the second one asked. That aliasing is the point rather
+    # than an accident: writing a second file of identical pixels is a wasted
+    # write and a second thing to keep in step, which is the same argument
+    # `Upload` has always made about a photograph no larger than the edge.
     check(
-        "three full reads are one resample", full_calls == 1,
-        f"{full_calls} resample(s) for 3 reads",
+        "a proxy at or past the long side is the frame itself",
+        full_calls == 0 and fr.proxy_at(2400)[0] is fr.arr
+        and abs(fr.proxy_at(2400)[1] - 1.0) < 1e-12,
+        f"{full_calls} further resample(s) for 3 full reads; the proxy is the "
+        f"same object at scale 1.0",
+    )
+    check(
+        "three reads at one edge are one resample", edge_calls == 1,
+        f"{edge_calls} resample(s) for 3 reads at 400px",
+    )
+    check(
+        "the edge slot is rebuilt, not accumulated", held_calls == 0,
+        "re-reading the held edge resamples nothing",
     )
     check(
         "changing the target rebuilds", up.at(0.5) is not fr
@@ -430,6 +458,218 @@ def run(cx: Ctx) -> None:
             job["filename"],
         )
     up_model.UPLOADS.pop(ex.id, None)
+
+    # -- the proxy long edge is a request, not a constant --------------------
+    # Added 2026-08-29 on request, and it is the same *kind* of thing as the
+    # section above it: a working resolution decided outside the engine, where
+    # everything that can go wrong is bookkeeping rather than pixels. It is
+    # filed here for that reason and because it is the other half of one
+    # question -- prescaling moves the photograph to fit the parameters, this
+    # moves how much of it the fast tier resolves.
+    #
+    # The trap it is aimed at is specific: two edges are two working
+    # resolutions of one photograph, which is precisely the stale-checkpoint
+    # failure this module already calls the worst one in the codebase.
+    print("\nthe proxy long edge is clamped, snapped and honoured")
+    check(
+        "junk and out-of-range clamp to something renderable",
+        _clamp_edge(None) == _clamp_edge("x") == PROXY_LONG_EDGE
+        and _clamp_edge(50) == PROXY_EDGE_MIN
+        and _clamp_edge(99999) == PROXY_EDGE_MAX
+        and _clamp_edge(float("nan")) == PROXY_LONG_EDGE,
+        f"junk -> {PROXY_LONG_EDGE}, 50 -> {_clamp_edge(50)}, "
+        f"99999 -> {_clamp_edge(99999)}",
+    )
+    check(
+        "the half-step rounds the way the client's does",
+        # `floor(x + 0.5)`, not Python's banker's `round`, which is the one
+        # case the two languages disagree on -- the same trap `prescale_dims`
+        # is written around. 1250 is exactly half a step.
+        _clamp_edge(1250) == 1300 and _clamp_edge(1234) == 1200
+        and _clamp_edge(1150) == 1200,
+        f"1250 -> {_clamp_edge(1250)}, 1234 -> {_clamp_edge(1234)}",
+    )
+
+    pe = _upload(400, 600, "pe")
+    # 300 and 500 both sit below the 600px long side, so both genuinely resample
+    # and neither is the identity path.
+    for edge in (300, 500):
+        arr, sc = pe.proxy_at(edge)
+        check(
+            f"a {edge}px proxy is {edge}px on its long side",
+            max(arr.shape[:2]) == edge
+            and abs(sc - edge / 600.0) < 1e-12
+            # Half a pixel per axis, the tolerance `prescale_dims` is held to:
+            # the aspect ratio is the thing a resample can silently drift.
+            and abs(arr.shape[0] - 400 * sc) <= 0.5,
+            f"{arr.shape[1]}x{arr.shape[0]} at scale {sc:.4f}",
+        )
+    # The identity path, and the property that matters is that it is the *same
+    # object* rather than a second code path returning equal pixels -- exactly
+    # what `at(None)` is checked for above.
+    same, sc1 = pe.proxy_at(PROXY_EDGE_MAX)
+    check(
+        "an edge past the long side is the photograph itself",
+        same is pe.arr and sc1 == 1.0,
+        "the same object at scale 1.0, not a second code path returning "
+        "equal pixels",
+    )
+    check(
+        "one edge is held, not one per edge ever asked for",
+        # Two edges were resampled above and the identity path ran after them;
+        # exactly one file is held, and it is the last one that needed a file.
+        pe._proxy is not None and pe._proxy[0] == 500,
+        f"holding edge {pe._proxy[0] if pe._proxy else None} after 300, 500 "
+        f"and {PROXY_EDGE_MAX}",
+    )
+
+    # -- no checkpoint is shared between two proxy edges ---------------------
+    # The engine's key carries `scale` and the tile's `h`/`w`, so a different
+    # edge moves all three and this is over-determined -- which is the right
+    # amount, for the reason the resolution check above says. Driven through
+    # `render_tier` rather than against `_ckpt_key`, because the tier is chosen
+    # there and that choice is the part that could go wrong.
+    print("\nswitching proxy edge cannot hit another edge's checkpoint")
+    qe = P.sanitize({"intensity": 40.0})
+    shapes = [render_tier(pe, qe, 1.0, False, e).shape[:2] for e in (300, 500)]
+    check(
+        "the two tiers are different sizes to begin with",
+        max(shapes[0]) == 300 and max(shapes[1]) == 500,
+        f"{shapes[0][1]}x{shapes[0][0]} vs {shapes[1][1]}x{shapes[1][0]}",
+    )
+    worst = 0.0
+    for edge in (300, 500, 300, 500):
+        got = render_tier(pe, qe, 1.0, False, edge)
+        cold = GrainEngine(cx.dev)
+        arr, sc = pe.proxy_at(edge)
+        want = cold.render_image(
+            arr, qe, sc, tile=cold.tile_for(qe, sc, *arr.shape[:2], 1.0),
+            supersample=1, checkpoint_id=f"{pe.id}:proxy",
+        )
+        worst = max(worst, float(np.abs(got - want).max()))
+        del cold
+    check(
+        "a warm cache renders each edge as a cold one does",
+        worst == 0.0, f"worst {worst:.2e} over four switches",
+    )
+
+    # -- the export renders the tier the preview was showing -----------------
+    # The whole reason this setting is shared rather than preview-only: five of
+    # the six export entries render this tier and enlarge it, so an export that
+    # ignored the edge would write a file that is not the picture the look was
+    # judged on. Measured as bit-equality against `render_tier`, which is the
+    # form the existing preview-equals-export claim already takes.
+    print("\nthe export renders the previewed proxy edge, not the default")
+    up_model.UPLOADS[pe.id] = pe
+    # Prescaling explicitly off: it defaults *on* at 24MP, and leaving it there
+    # would resample this 0.24MP photograph up to 6000x4000 and make the size
+    # assertion below a statement about the wrong feature.
+    body = {"id": pe.id, "format": "png8", "supersample": 1, "quality": 95,
+            "proxy_edge": 300,
+            "params": {"intensity": 30.0, "prescale": 0}}
+    job_id = export_ctl.export(body)["job"]
+    deadline = time.time() + 120
+    while JOBS[job_id]["status"] not in ("done", "error") and time.time() < deadline:
+        time.sleep(0.05)
+    job = JOBS[job_id]
+    check(
+        "a non-default edge is named in the filename",
+        job["status"] == "done" and "_px300" in job["filename"],
+        f"{job['filename']}{'' if job['status'] == 'done' else ' :: ' + str(job.get('error'))}",
+    )
+    # The file is still the frame's own dimensions -- the edge changes the
+    # texture and nothing else, which is exactly why the filename has to carry
+    # it: no folder listing could tell this from a default-edge export.
+    check(
+        "the file is full size regardless of the edge it was rendered at",
+        (job["height"], job["width"]) == (pe.h, pe.w),
+        f"{job['width']}x{job['height']} from a 300px proxy of a "
+        f"{pe.w}x{pe.h} photograph -- the edge changes the texture, not "
+        f"the dimensions",
+    )
+
+    # -- the edge a preset carries, and what beats it ------------------------
+    # Added 2026-08-29 on request: the proxy edge went into the preset file
+    # beside `reference_mp` and `lut`, so a look now records the tier it was
+    # judged on and an export reproduces it without being told. Three sources,
+    # in order -- the request, the preset, the default -- and the whole feature
+    # is that middle one, so each source is checked at the *filename tag*, which
+    # is the only place the resolved edge is observable from outside.
+    #
+    # `load_presets` is stubbed rather than a file being dropped into
+    # `presets/`: this is about the resolution order, not about disk, and a
+    # check that writes into the shipped library is a check that can leave the
+    # library changed when it fails.
+    print("\nthe proxy edge falls back to the preset's, and -e beats it")
+    real_load = export_ctl.load_presets
+    export_ctl.load_presets = lambda: [{
+        "name": "EdgeFixture", "values": {}, "reference_mp": None,
+        "proxy_edge": 500, "lut": None, "author": None, "author_link": None,
+    }]
+    try:
+        def _tag(body: dict) -> str:
+            jid = export_ctl.export({
+                "id": pe.id, "format": "png8", "supersample": 1, "quality": 95,
+                "params": {"intensity": 30.0, "prescale": 0}, **body,
+            })["job"]
+            end = time.time() + 120
+            while JOBS[jid]["status"] not in ("done", "error") and time.time() < end:
+                time.sleep(0.05)
+            j = JOBS[jid]
+            return j["filename"] if j["status"] == "done" else f"ERROR {j.get('error')}"
+
+        from_preset = _tag({"preset": "EdgeFixture"})
+        check(
+            "a preset's own edge is used when the request names none",
+            "_px500" in from_preset,
+            f"{from_preset} -- wanted the fixture's 500px, not the "
+            f"{PROXY_LONG_EDGE}px default",
+        )
+        overridden = _tag({"preset": "EdgeFixture", "proxy_edge": 300})
+        check(
+            "an explicit edge beats the preset's",
+            "_px300" in overridden and "_px500" not in overridden,
+            f"{overridden} -- the request asked for 300 over the preset's 500",
+        )
+        # No preset named and no edge in the body: the historic behaviour, and
+        # the tag's absence is the assertion -- it is only written when the edge
+        # is not the default.
+        plain = _tag({})
+        check(
+            "no request and no preset renders the default edge",
+            "_px" not in plain,
+            f"{plain} -- wanted no edge tag, meaning {PROXY_LONG_EDGE}px",
+        )
+        # A preset that predates the key, which is every preset file written
+        # before today. It has to behave exactly as it did then rather than
+        # raising on a missing key.
+        export_ctl.load_presets = lambda: [{
+            "name": "EdgeFixture", "values": {}, "reference_mp": None,
+            "proxy_edge": None, "lut": None, "author": None, "author_link": None,
+        }]
+        legacy = _tag({"preset": "EdgeFixture"})
+        check(
+            "a preset that names no edge falls through to the default",
+            "_px" not in legacy,
+            f"{legacy} -- a file written before `proxy_edge` existed must not "
+            f"change what it renders",
+        )
+    finally:
+        export_ctl.load_presets = real_load
+
+    # Every shipped preset carries the key, so the library speaks with one
+    # voice about the tier it was dialled in on -- a look that named none would
+    # render at whatever the server's default happened to be, which is the
+    # thing this whole ordering exists to stop being invisible.
+    lib = real_load()
+    missing = [pre["name"] for pre in lib if pre["proxy_edge"] is None]
+    check(
+        "every shipped preset records the proxy edge it was judged at",
+        bool(lib) and not missing,
+        f"{len(lib) - len(missing)}/{len(lib)} carry one"
+        + (f"; missing: {', '.join(missing)}" if missing else ""),
+    )
+    up_model.UPLOADS.pop(pe.id, None)
 
 
 def ENG_render(eng: GrainEngine, fr, q: dict) -> np.ndarray:

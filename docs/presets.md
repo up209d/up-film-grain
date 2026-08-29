@@ -177,3 +177,44 @@ Three details worth knowing:
 author reports one, and the link comes with it. The client's write-back has no
 automated check; it is a hand test (pick a preset, Save to file…, look at the
 first four keys).
+
+## The preset records which proxy tier it was judged on (2026-08-29)
+
+`proxy_edge` joined `reference_mp`, `lut` and the two author keys at the top
+level of a preset file, on request, and every shipped preset is stamped
+`"proxy_edge": 2400`. It is a sibling of the values and never one of them, for
+exactly the reason the other four are: the engine never reads it. It decides
+which *frame* the engine is handed, the way `reference_mp` decides which lengths
+it is handed.
+
+It is in the file rather than in the session because it is in the **output**.
+Five of the six export entries render the proxy tier and enlarge it
+(`docs/preview-and-export.md`), so two exports of the same values at two edges
+are two different pictures. A number that changes what comes out of the export
+cannot be a preference about this session — which is what it had been until
+today, and the note in that file that said so has been rewritten rather than
+deleted, because the reasoning that got it wrong is the useful part.
+
+**Precedence, resolved in `controllers/export.py` and nowhere else:** the
+request body's `proxy_edge` if it names one, else the named `preset`'s, else
+`PROXY_LONG_EDGE`. The CLI's `-e` therefore has no argparse default — `None` is
+what keeps "not declared" distinguishable from "declared as 2400", and a default
+would have made every `./export.sh` run silently override the preset it was
+given. `./export.sh photo.jpg -p Stock` renders Stock's edge; `-e 800` wins over
+it; a preset written before the key existed falls through to 2400 and renders
+what it always did.
+
+Client side it seeds the slider: `startingValues` returns it for boot and Reset,
+`applyPreset` sets it *including its absence* (a look that names no edge is a
+look dialled in at the default, so inheriting the last preset's edge would render
+it at a texture its author never saw), and `usePresetFile` writes it back out
+directly after `reference_mp` so a re-saved shipped preset still diffs on the
+values alone. Loading a hand-written file is the one asymmetric case: the key is
+read only when present, because `{"intensity": 40}` is a set of numbers rather
+than a whole look and dropping the session back to 2400 would re-render at a tier
+nobody asked for.
+
+`tests/checks/prescale.py` pins all four paths at the filename tag — the only
+place the resolved edge is observable from outside — with `load_presets` stubbed
+rather than a file dropped into `presets/`, plus one check that every shipped
+preset carries the key.

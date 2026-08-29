@@ -21,13 +21,15 @@ export function usePreview(opts: {
   meta: ImageMeta | null;
   applied: Values;
   supersample: number;
+  proxyEdge: number;
   referenceMp: number | null;
   scaleToRef: boolean;
   lut: string | null;
   onError: (msg: string | null) => void;
   onDevice: (d: string) => void;
 }) {
-  const { meta, applied, supersample, referenceMp, scaleToRef, lut } = opts;
+  const { meta, applied, supersample, proxyEdge, referenceMp, scaleToRef, lut } =
+    opts;
 
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [sourceUrl, setSourceUrl] = useState<string | null>(null);
@@ -78,10 +80,11 @@ export function usePreview(opts: {
       id: meta.id,
       params: applied,
       supersample,
+      proxy_edge: proxyEdge,
       reference_mp: scaleToRef ? referenceMp : null,
       lut,
     };
-  }, [meta, applied, supersample, referenceMp, scaleToRef, lut]);
+  }, [meta, applied, supersample, proxyEdge, referenceMp, scaleToRef, lut]);
 
   // The untouched image is the same bytes for the life of an upload, so it is
   // fetched once here rather than riding along with every render.

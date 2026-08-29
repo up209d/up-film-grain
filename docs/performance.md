@@ -382,6 +382,30 @@ rendered. That is load-bearing rather than tidy: a preview-scale export must be
 byte-for-byte the live preview, and once tile size became a *computed* value, two
 call sites agreeing about it was no longer something a comment could guarantee.
 
+#### Tile size is not a speed dial, and is deliberately not exposed (2026-08-29)
+
+Asked directly: would letting the client pick the tile — and picking powers of
+two, 64/128/1024/2048 — make previews faster? No, on all three counts, and the
+answer is worth writing down so it is not re-asked.
+
+* **There is no FFT anywhere in this pipeline.** Every blur is a separable
+  spatial convolution, so there is no radix-2 boundary to align to. A power of
+  two is not a special number here.
+* **The search already steps by 128** (`range(min(_TILE_MAX, longest),
+  _TILE_MIN, -128)`), so every tile it can pick is 128-aligned. Powers of two are
+  a *subset* of what it already chooses, not an addition to it.
+* **Small tiles are catastrophic, not fast.** `pad_for` is fixed overlap — ~178px
+  for an ordinary preset — so a 128px tile reads `(128 + 2*178)² = 484²` to keep
+  `128²`, about **14x overdraw**. That is what `_TILE_MIN = 768` is for, and the
+  table above measures the trend in the other direction: bigger is monotonically
+  faster, all the way to a single tile.
+
+The table's own numbers say it: tile size only ever *costs* time, and it is set
+where it is because memory, not speed, is the binding constraint. The dial the
+question was actually reaching for is the **proxy long edge**, which moves the
+pixel count of the whole frame rather than the overlap of one tile — and that one
+is now adjustable. See `docs/preview-and-export.md` for its measurements.
+
 ### The lattice is bigger than the pixel grid, not smaller
 
 `_lattice_np`'s docstring used to claim "the lattice is far smaller than the pixel
@@ -459,3 +483,48 @@ outweighs any of the above on a tiled export: dust softening used to reserve
 `dust_soften * 1.6 * dust_size` of overlap on every tile, so a 120px speck at
 full softness widened every tile's read window by 200px in each direction and
 the render then threw that overlap away.
+
+## The build spent five minutes compressing 1% (measured 2026-08-29)
+
+Not a render path, but it is the longest wait anyone attached to this repo sits
+through, and the cause was invisible from `build.sh`: the last line of the build
+appeared to hang after `shell: packaging`, with no output, for minutes.
+
+`electron-builder`'s `tar.gz` target is two serial passes over the 1.1GB `.app`.
+The first writes a plain `.tar` to a temp file with the JS `tar` package (~19s,
+and fine). The second hands that file to **7-Zip**, not to `gzip`, and
+`archive.js` picks `-mx=9` for everything that is not a zip. 7-Zip's `-mx=9`
+Deflate is not `gzip -9`; it is a far more exhaustive match search, and this
+payload — ~600MB of already-compressed torch dylibs — has almost nothing left in
+it to find. On the 353MB of `torch/lib` alone:
+
+| level | time | output |
+|---|---|---|
+| `-mx=9` | 98.2s | 82,240,020 |
+| `-mx=5` | 14.2s | 83,205,718 (+1.17%) |
+| `-mx=1` | 2.5s | 87,080,310 (+5.9%) |
+| system `gzip -9` | 11.5s | 84,167,316 |
+
+End to end on the whole app, `./build.sh --skip-client --skip-runtime`:
+**6m29s → 1m46s**, for 327,334,315 → 330,841,139 bytes (**+1.07%**). Seven times
+the compression time for one percent of the download.
+
+`build.sh` exports `ELECTRON_BUILDER_COMPRESSION_LEVEL=5` (the env var
+`compute7zCompressArgs` already reads) unless the caller sets one, so `=9`
+restores the old behaviour for a release where the megabytes matter more than
+the wait.
+
+Three things worth knowing before revisiting it:
+
+* **No amount of core count helps.** 7-Zip's gzip encoder is single-threaded;
+  the machine's other thirteen cores are idle at every level. `pigz` would fix
+  that outright, but it is not installed by default on macOS and the target
+  would have to stop being `tar.gz` in `electron-builder.yml` to use it —
+  a real dependency traded for ~40s.
+* **`store` is not the answer.** `-mx=0` finishes instantly and ships a 1.2GB
+  download; the compression is doing real work, just not four extra minutes of
+  it.
+* **The format itself must stay `tar.gz`.** The reason is in
+  `electron-builder.yml` and is about Gatekeeper quarantine, not size — a `.zip`
+  unpacked by Finder gets the app refused as "damaged". Whatever replaces the
+  compressor has to keep producing a gzipped tar.

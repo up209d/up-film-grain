@@ -25,6 +25,7 @@ import { useValues } from "../controllers/useValues";
 import {
   BOARD_LIGHT_DEFAULT,
   BOARD_LIGHT_MAX,
+  PROXY_EDGE_FALLBACK,
   sectionDomId,
 } from "../models/constants";
 import { groupedParams, isNeutral } from "../models/paramState";
@@ -98,12 +99,17 @@ export default function App() {
    *  from one reads this rather than `meta` -- see `models/prescale.ts`.
    *
    *  From `applied`, not `values`: it describes the render on screen, and a
-   *  half-finished drag of the target has not been rendered yet. The export
-   *  panel is the one exception, because `useExport` sends `values`. */
-  const geom = useMemo(() => prescaleGeom(meta, v.applied), [meta, v.applied]);
+   *  half-finished drag of the target has not been rendered yet. The proxy edge
+   *  is read the same way and for the same reason -- mid-drag it is a number
+   *  nothing has rendered at. The export panel is the one exception, because
+   *  `useExport` sends `values` and the edge the slider is showing. */
+  const geom = useMemo(
+    () => prescaleGeom(meta, v.applied, v.appliedProxyEdge),
+    [meta, v.applied, v.appliedProxyEdge],
+  );
   const outDims = useMemo(
-    () => exportDims(meta, prescaleGeom(meta, v.values), v.values),
-    [meta, v.values],
+    () => exportDims(meta, prescaleGeom(meta, v.values, v.proxyEdge), v.values),
+    [meta, v.values, v.proxyEdge],
   );
 
   /** The reference size the *render* uses, which is not always the one the
@@ -126,6 +132,7 @@ export default function App() {
     meta,
     applied: v.applied,
     supersample,
+    proxyEdge: v.appliedProxyEdge,
     referenceMp: renderReferenceMp,
     scaleToRef,
     lut: v.lut,
@@ -145,6 +152,7 @@ export default function App() {
     meta,
     values: v.values,
     supersample,
+    proxyEdge: v.proxyEdge,
     referenceMp: renderReferenceMp,
     scaleToRef,
     lut: v.lut,
@@ -179,9 +187,13 @@ export default function App() {
     values: v.values,
     frameMp: geom?.megapixels ?? null,
     referenceMp: v.referenceMp,
+    proxyEdge: v.proxyEdge,
     lut: v.lut,
     author: v.author,
     setReferenceMp: v.setReferenceMp,
+    // Loading a file is a discrete action, so the edge it names renders at
+    // once rather than waiting for a pointer release that will never come.
+    setProxyEdge: v.setProxyEdgeNow,
     setLut: v.setLut,
     setAuthor: v.setAuthor,
     applyValues: v.applyValues,
@@ -299,6 +311,7 @@ export default function App() {
             <ExportPanel
               meta={meta}
               outDims={outDims}
+              proxyEdge={v.proxyEdge}
               exportKey={exporter.exportKey}
               onExportKey={exporter.setExportKey}
               format={exporter.format}
@@ -420,6 +433,44 @@ export default function App() {
               title="Lightness of the chequerboard behind the photo"
             />
             <span className="val">{bgLightness}%</span>
+          </Field>
+
+          {/* Above the Quality menu because the two are one question asked at
+              two scales: this picks how much of the photograph is rendered, the
+              menu picks how finely each of those pixels is resolved. Cost goes
+              roughly as the square of this, which makes it the larger lever of
+              the two, so it reads first.
+
+              A range rather than a menu, unlike Quality: the supersample's
+              factors are each a different construction with no useful midpoint,
+              whereas every step of this is exactly as meaningful as the ones
+              either side. Bounds come from the server so they cannot drift from
+              `_clamp_edge`. */}
+          <Field label="Proxy size">
+            <input
+              type="range"
+              min={meta?.proxy_edge_min ?? PROXY_EDGE_FALLBACK.min}
+              max={meta?.proxy_edge_max ?? PROXY_EDGE_FALLBACK.max}
+              step={meta?.proxy_edge_step ?? PROXY_EDGE_FALLBACK.step}
+              value={v.proxyEdge}
+              // Live on the way in, rendered on release -- the same split every
+              // parameter slider makes, and the one this control was missing:
+              // a drag across it used to start a render per step, each of them
+              // a proxy resample and a full pipeline pass at a size nobody had
+              // stopped on. Pointer releases come from the window listener in
+              // `useValues`; these two cover the keyboard path, exactly as
+              // `ParamControl` does.
+              onChange={(e) => v.setProxyEdge(Number(e.target.value))}
+              onKeyUp={v.commit}
+              onBlur={v.commit}
+              title={
+                "Long edge of the proxy both the preview and the export render. " +
+                "Cost is roughly its square. Below the photograph's own size the " +
+                "grain is coarser relative to the frame than a 1:1 render's, and " +
+                "the exported file carries that same texture enlarged."
+              }
+            />
+            <span className="val">{v.proxyEdge}px</span>
           </Field>
 
           <Field label="Quality">

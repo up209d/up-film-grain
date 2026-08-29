@@ -44,7 +44,7 @@ different questions are being asked:
 * **`Spill`** — one array whose only copy is a file, mapped back copy-on-write
   when something reads it. A miss is *not* legal — the decoded photograph
   cannot be recomputed from anything the process still has. This is
-  `Upload.arr`, `Upload.proxy` and both of `Frame`'s.
+  `Upload.arr`, the one proxy `Upload.proxy_at` holds, and both of `Frame`'s.
 * **`Blob`** — encoded bytes on disk, handed to `FileResponse`. This is a
   finished export, which is the user's output rather than a cache at all; it
   moved for the same reason but is kept under different rules.

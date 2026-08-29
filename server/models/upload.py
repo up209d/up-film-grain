@@ -3,11 +3,17 @@ registry, and the per-request parameter resolution that depends on the size the
 image is being rendered at.
 
 Two things in here resize a photograph and they are answering different
-questions. ``Upload.proxy`` is a *fidelity* decision -- the same photograph,
-rendered smaller so a slider stays responsive. ``Frame`` is a *look* decision
--- a different working resolution for the photograph itself, so that the
-pipeline's lengths mean the same thing whatever came out of the camera. Every
-``Frame`` has a proxy of its own for exactly that reason.
+questions. ``proxy_at`` is a *fidelity* decision -- the same photograph,
+rendered smaller so a slider stays responsive, at whichever long edge the
+request asked for. ``Frame`` is a *look* decision -- a different working
+resolution for the photograph itself, so that the pipeline's lengths mean the
+same thing whatever came out of the camera. Every ``Frame`` has a proxy of its
+own for exactly that reason.
+
+The two are cached the same way and it is the same argument in both places: one
+slot, rebuilt when what is asked for changes, the outgoing file unlinked. A
+photograph is edited by dragging sliders, and neither the prescale target nor
+the proxy edge moves while that is happening.
 
 **None of these arrays is held in process memory** (2026-08-29). A 24MP source
 is 288MB of float32 and an `Upload` carries four such arrays once it has a
@@ -39,11 +45,35 @@ from ..engine.diskcache import Spill
 from ..engine.stages import normalize
 from ..runtime import DEVICE
 
-# Long edge of the working proxy used for live preview renders. Measured on a
-# 24MP source: a full-resolution 2x pass is 7.8s, this is 1.3s. That gap is the
-# whole reason the proxy exists -- it is what makes dragging a slider feel like
-# editing rather than batch processing.
+# Long edge of the working proxy used for live preview renders, and the value a
+# request that names none is answered at. Measured on a 24MP source: a
+# full-resolution 2x pass is 7.8s, this is 1.3s. That gap is the whole reason the
+# proxy exists -- it is what makes dragging a slider feel like editing rather
+# than batch processing.
 PROXY_LONG_EDGE = 2400
+
+# The range a request may move that edge over (2026-08-29, on request). Cost is
+# roughly the *square* of the edge, so this is the largest lever over render time
+# after the supersample, and it runs in both directions: below the default for a
+# slider that keeps up on a big photograph, above it for a proxy that resolves
+# more than the default does.
+#
+# A free number snapped to `PROXY_EDGE_STEP` rather than a menu, which is the
+# opposite of the bargain `SUPERSAMPLES` makes and deliberately so: the
+# supersample's factors are each a *different* construction with no useful
+# midpoint, whereas this is a plain resolution where every value in between is
+# exactly as meaningful as the ones either side of it. The step exists only to
+# bound how many distinct proxies one session can ask for, and because
+# `web/src/models/prescale.ts` mirrors this arithmetic client-side and the two
+# have to agree about the frame's geometry.
+#
+# **It is shared with the export, not preview-only.** Five of the six export
+# modes render the proxy tier and enlarge it (`models/export_job.py`), so this
+# number already set export texture quality before it was adjustable. Sharing it
+# is what keeps "export what I am looking at" literally true; the export menu
+# says which edge it is about to write so a small setting cannot ship a soft file
+# without saying so.
+PROXY_EDGE_MIN, PROXY_EDGE_MAX, PROXY_EDGE_STEP = 100, 4800, 100
 
 # The supersample factors the UI offers, and the only ones a request may ask
 # for. A menu rather than a free number because each is a different bargain and
@@ -66,6 +96,32 @@ def _clamp_ss(v) -> float:
     except (TypeError, ValueError):
         return 2.0
     return min(SUPERSAMPLES, key=lambda s: abs(s - f))
+
+
+def _clamp_edge(v) -> int:
+    """Nearest offered proxy long edge. Junk falls back to `PROXY_LONG_EDGE`.
+
+    The same doctrine as `_clamp_ss` and for the same reason: a request outside
+    the range is a client bug, and answering it at the nearest value it could
+    legitimately have asked for is more useful than either honouring it or
+    refusing it. Snapping to `PROXY_EDGE_STEP` as well as clamping, so the
+    per-photograph proxy cache sees a small set of edges rather than one entry
+    per pixel the pointer happened to cross.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return PROXY_LONG_EDGE
+    if f != f:  # NaN
+        return PROXY_LONG_EDGE
+    # `floor(x + 0.5)`, not `round`, for the reason `prescale_dims` writes it
+    # that way: Python's `round` is banker's and JavaScript's `Math.round` is
+    # not, and they disagree on exactly the half-step case. The slider only ever
+    # sends whole steps, but the CLI takes a free integer and the two sides have
+    # to snap it identically or the client's geometry and the server's frame
+    # disagree by a step.
+    snapped = math.floor(f / PROXY_EDGE_STEP + 0.5) * PROXY_EDGE_STEP
+    return max(PROXY_EDGE_MIN, min(PROXY_EDGE_MAX, snapped))
 
 
 def prescale_dims(h: int, w: int, target_mp: float) -> tuple[int, int]:
@@ -106,8 +162,8 @@ class Frame:
     """An upload resampled to a working resolution, resampled once.
 
     Everything downstream reads the same handful of attributes off this that it
-    used to read off ``Upload`` -- ``id``, ``h``, ``w``, ``arr``, ``proxy``,
-    ``proxy_scale``, ``norm_stats()`` -- so ``params_for`` and ``render_tier``
+    used to read off ``Upload`` -- ``id``, ``h``, ``w``, ``arr``,
+    ``proxy_at()``, ``norm_stats()`` -- so ``params_for`` and ``render_tier``
     neither know nor care which of the two they were handed. ``Upload.at(None)``
     returns the upload *itself* for exactly that reason: the original-resolution
     path is then not a parallel implementation that can drift out of step, it is
@@ -119,26 +175,20 @@ class Frame:
     independence and scale invariance are exactly the properties they were.
     """
 
-    __slots__ = ("id", "up", "target_mp", "h", "w", "proxy_scale",
-                 "_arr", "_proxy")
+    __slots__ = ("id", "up", "target_mp", "h", "w", "_arr", "_proxy")
 
     def __init__(self, up: "Upload", target_mp: float) -> None:
         self.up = up
         self.target_mp = target_mp
         self.h, self.w = prescale_dims(up.h, up.w, target_mp)
-        # From the *prescaled* dimensions, so the working scale the engine is
-        # handed is exactly the one a real photograph of this size would give
-        # it. This is most of what the feature buys: `proxy_scale` stops being
-        # a function of what came out of the camera, so the proxy's `_MIN_CELL`
-        # divergence from the 1:1 render is the same on every photograph.
-        self.proxy_scale = min(1.0, PROXY_LONG_EDGE / float(max(self.h, self.w)))
         # The checkpoint id has to say which working resolution this is: the
         # engine's cache also keys on `h`, `w` and `scale`, so this is belt and
         # braces -- which is the right amount for a cache whose stale hit is a
         # plausible but wrong *photograph*.
         self.id = f"{up.id}@{target_mp:g}mp"
         self._arr: Spill | None = None
-        self._proxy: Spill | None = None
+        # The one proxy edge currently held, as `(edge, Spill)`. See `proxy_at`.
+        self._proxy: tuple[int, Spill] | None = None
 
     @property
     def arr(self) -> np.ndarray:
@@ -159,24 +209,66 @@ class Frame:
             )
         return self._arr.array
 
+    def proxy_scale_at(self, edge: int) -> float:
+        """The working scale a proxy of long edge ``edge`` renders at.
+
+        Pure arithmetic, and measured from the *prescaled* dimensions so the
+        scale the engine is handed is exactly the one a real photograph of this
+        size would give it. This is most of what prescaling buys: the scale stops
+        being a function of what came out of the camera, so the proxy's
+        `_MIN_CELL` divergence from the 1:1 render is the same on every
+        photograph.
+        """
+        return min(1.0, edge / float(max(self.h, self.w)))
+
+    def proxy_at(self, edge: int) -> tuple[np.ndarray, float]:
+        """The working proxy at ``edge``, in **one** resample, and its scale.
+
+        Deliberately not `downscale(self.arr, sc)`. Going via `arr` would upscale
+        a 6MP photograph to 24MP and immediately throw 23.4MP of it away again --
+        288MB and a second interpolation, for pixels within rounding of what one
+        pass from the original gives. So the target size is computed from the
+        prescaled dimensions and the pixels come straight from the source.
+
+        A **single slot**, rebuilt when the edge changes, for the reason `at()`
+        holds one `Frame`: moving this is a deliberate act taken rarely next to
+        dragging a slider, and a dict would grow one array per edge the user
+        tried. The outgoing file is unlinked rather than forgotten -- see
+        `release`.
+
+        An edge at or past the long side is not a resample at all: the frame is
+        its own proxy, so this hands back `arr` itself rather than writing a
+        second copy of the same pixels. That is the same "no second code path"
+        property `at(None)` has, and it is why nothing here has to special-case
+        the aliased file the way this class's ancestor did.
+        """
+        sc = self.proxy_scale_at(edge)
+        if sc >= 1.0:
+            return self.arr, 1.0
+        if self._proxy is None or self._proxy[0] != edge:
+            self._drop_proxy()
+            ph = max(1, int(round(self.h * sc)))
+            pw = max(1, int(round(self.w * sc)))
+            self._proxy = (edge, Spill(
+                "frame-proxy", iio.resize_to(self.up.arr, ph, pw, DEVICE)
+            ))
+        return self._proxy[1].array, sc
+
+    def _drop_proxy(self) -> None:
+        """Unlink the held proxy, if any. Never touches `_arr`."""
+        if self._proxy is not None:
+            self._proxy[1].release()
+            self._proxy = None
+
+    @property
+    def proxy_scale(self) -> float:
+        """The default edge's working scale. One line over `proxy_scale_at`."""
+        return self.proxy_scale_at(PROXY_LONG_EDGE)
+
     @property
     def proxy(self) -> np.ndarray:
-        """The working proxy for this resolution, in **one** resample.
-
-        Deliberately not `downscale(self.arr, self.proxy_scale)`. Going via
-        `arr` would upscale a 6MP photograph to 24MP and immediately throw
-        23.4MP of it away again -- 288MB and a second interpolation, for pixels
-        within rounding of what one pass from the original gives. So the target
-        size is computed from the prescaled dimensions and the pixels come
-        straight from the source.
-        """
-        if self._proxy is None:
-            ph = max(1, int(round(self.h * self.proxy_scale)))
-            pw = max(1, int(round(self.w * self.proxy_scale)))
-            self._proxy = Spill(
-                "frame-proxy", iio.resize_to(self.up.arr, ph, pw, DEVICE)
-            )
-        return self._proxy.array
+        """The default edge's proxy. One line over `proxy_at`."""
+        return self.proxy_at(PROXY_LONG_EDGE)[0]
 
     def norm_stats(self) -> dict[str, float]:
         """Normalize's metering -- the upload's, shared, and not re-measured.
@@ -199,29 +291,27 @@ class Frame:
         user ever tried, which is exactly the unbounded growth the single-slot
         `Upload.frame` was written to avoid in memory.
         """
-        for sp in (self._arr, self._proxy):
-            if sp is not None:
-                sp.release()
-        self._arr = self._proxy = None
+        self._drop_proxy()
+        if self._arr is not None:
+            self._arr.release()
+        self._arr = None
 
 
 class Upload:
-    __slots__ = ("id", "name", "_arr", "h", "w", "_proxy", "proxy_scale",
+    __slots__ = ("id", "name", "_arr", "h", "w", "_proxy",
                  "src_enc", "norm", "frame", "touched")
 
     def __init__(self, uid: str, name: str, arr: np.ndarray) -> None:
         self.id = uid
         self.name = name
         self.h, self.w = arr.shape[:2]
-        self.proxy_scale = min(1.0, PROXY_LONG_EDGE / float(max(self.h, self.w)))
-        proxy = iio.downscale(arr, self.proxy_scale, DEVICE)
-        # Both go straight to the SSD; `arr` and `proxy` below map them back.
+        # Straight to the SSD; `arr` below maps it back.
         self._arr = Spill("source", arr)
-        # `downscale` hands back the input array itself when the scale is 1 --
-        # a photograph no larger than the proxy long edge is its own proxy. Share
-        # the one file in that case rather than writing a second copy of the same
-        # pixels, which is both a wasted write and a second thing to keep in step.
-        self._proxy = self._arr if proxy is arr else Spill("proxy", proxy)
+        # The one proxy edge currently held, as `(edge, Spill)`. Lazy rather than
+        # built here, because the edge is a property of the *request* now and
+        # nothing can know at upload time which one the first render will ask
+        # for. See `proxy_at`.
+        self._proxy: tuple[int, Spill] | None = None
         # The untouched image never changes, so it is encoded once and served
         # from here rather than re-encoded on every parameter change. Named for
         # "encoded" rather than a format: it follows `iio.encode_preview`, which
@@ -251,10 +341,50 @@ class Upload:
         """The decoded photograph, mapped from disk. See the module docstring."""
         return self._arr.array
 
+    def proxy_scale_at(self, edge: int) -> float:
+        """The working scale a proxy of long edge ``edge`` renders at."""
+        return min(1.0, edge / float(max(self.h, self.w)))
+
+    def proxy_at(self, edge: int) -> tuple[np.ndarray, float]:
+        """The working proxy at ``edge``, and the scale it renders at.
+
+        A **single slot**, rebuilt when the edge changes and the outgoing file
+        unlinked, for the reason `at()` holds one `Frame`: moving this is a
+        deliberate act taken rarely next to dragging a slider, and a dict would
+        grow one array per edge the user ever tried.
+
+        A photograph no larger than the requested edge **is** its own proxy, so
+        this hands back `arr` itself at scale 1.0 rather than writing a second
+        copy of the same pixels. That replaces the aliased `_proxy is _arr` file
+        this used to keep: the slot can now never hold the source, so
+        `_drop_proxy` is free to release whatever is in it without having to ask
+        whether it is about to delete the photograph.
+        """
+        sc = self.proxy_scale_at(edge)
+        if sc >= 1.0:
+            return self.arr, 1.0
+        if self._proxy is None or self._proxy[0] != edge:
+            self._drop_proxy()
+            self._proxy = (
+                edge, Spill("proxy", iio.downscale(self.arr, sc, DEVICE))
+            )
+        return self._proxy[1].array, sc
+
+    def _drop_proxy(self) -> None:
+        """Unlink the held proxy, if any. Never touches `_arr`."""
+        if self._proxy is not None:
+            self._proxy[1].release()
+            self._proxy = None
+
+    @property
+    def proxy_scale(self) -> float:
+        """The default edge's working scale. One line over `proxy_scale_at`."""
+        return self.proxy_scale_at(PROXY_LONG_EDGE)
+
     @property
     def proxy(self) -> np.ndarray:
-        """The working proxy, mapped from disk."""
-        return self._proxy.array
+        """The default edge's proxy. One line over `proxy_at`."""
+        return self.proxy_at(PROXY_LONG_EDGE)[0]
 
     def release(self) -> None:
         """Delete every file this upload owns. It is unusable afterwards.
@@ -268,9 +398,7 @@ class Upload:
         if self.frame is not None:
             self.frame[1].release()
             self.frame = None
-        # `_proxy` may be `_arr` -- see `__init__`. `Spill.release` is idempotent,
-        # so the aliased case needs no special handling here.
-        self._proxy.release()
+        self._drop_proxy()
         self._arr.release()
         self.src_enc = None
 

@@ -71,12 +71,25 @@ export default function ExportPanel(props: {
    *  answers come from `models/prescale.ts:exportDims`, so this panel's labels
    *  cannot disagree with what the server writes. */
   outDims?: { width: number; height: number } | null;
+  /** The proxy long edge both tiers are rendering at. Named in the label and
+   *  the help whenever it is not the default, because it changes the texture of
+   *  the file without changing a single one of its dimensions -- so the size in
+   *  the label, which is what anyone reads to tell two entries apart, says
+   *  nothing about it. A quality decision has to be visible where it is taken. */
+  proxyEdge?: number;
   /** Anything to sit at the right-hand end of the bar, past its separator.
    *  What goes in it is the caller's business. */
   headerAside?: React.ReactNode;
 }) {
   const { meta, job } = props;
   const opt = exportOption(props.exportKey);
+  // Absent meta means no photograph is open and there is no default to compare
+  // against, so nothing is called non-default.
+  const edgeOff =
+    meta != null &&
+    props.proxyEdge != null &&
+    props.proxyEdge !== meta.proxy_edge_default;
+  const edgeTag = edgeOff ? ` / ${props.proxyEdge}px proxy` : "";
   const exportSs = opt.ss;
   const out = props.outDims;
   const size = `${out?.width ?? meta?.width}×${out?.height ?? meta?.height}`;
@@ -87,6 +100,14 @@ export default function ExportPanel(props: {
   // sixth is the one that does not, and its help text has to say so plainly --
   // it is the only way to get a file whose grain the preview never showed.
   const enlarged = `, enlarged to ${size}`;
+  // Appended to every preview-tier entry's help, and to none of `full`'s: that
+  // one renders the frame at 1.0 and never touches a proxy.
+  const edgeNote = edgeOff
+    ? ` The proxy is set to ${props.proxyEdge}px rather than the usual ` +
+      `${meta!.proxy_edge_default}px, so this file carries that tier's ` +
+      "texture — coarser grain relative to the frame, and no detail beyond " +
+      "what the proxy resolved."
+    : "";
   const help = opt.full
     ? `A genuine ${size} render at 1× supersampling — the source's own grid, ` +
       "not the preview enlarged. It is the only entry whose pixels you have " +
@@ -102,19 +123,19 @@ export default function ExportPanel(props: {
         "is rendered above the preview's grid and integrated down, so each " +
         "clump gets genuine partial-pixel coverage instead of a hard, aliased " +
         "footprint. It adds no detail beyond what the preview resolves; that " +
-        "is the point — the file is the picture you judged."
+        "is the point — the file is the picture you judged." + edgeNote
       : exportSs > 2
         ? "Renders the previewed frame finer than 2× and integrates down" +
           enlarged + ". Costs roughly the square of the factor — 3× is 2.25× " +
           "the work of 2× — for a modest gain in how cleanly the smallest " +
-          "clumps resolve."
+          "clumps resolve." + edgeNote
         : exportSs === 1
           ? "Renders the previewed frame at its own grid" + enlarged +
             ". Fast, but grain gets a hard, aliased pixel footprint — the " +
-            "synthetic look supersampling exists to avoid."
+            "synthetic look supersampling exists to avoid." + edgeNote
           : "Renders *below* the previewed frame and scales up" + enlarged +
             ", so the file is full size but genuinely soft. For machines that " +
-            "cannot afford anything else, not a look.";
+            "cannot afford anything else, not a look." + edgeNote;
 
   const action = opt.full
     ? `Export a fresh ${size} render at 1× supersampling`
@@ -139,7 +160,7 @@ export default function ExportPanel(props: {
           value: o.key,
           label:
             `Full size${meta ? ` ${size}` : ""}` +
-            (o.full ? " / 1:1 SS 1×" : ` / SS ${o.ss}×`),
+            (o.full ? " / 1:1 SS 1×" : ` / SS ${o.ss}×${edgeTag}`),
         }))}
         value={props.exportKey}
         onPick={props.onExportKey}

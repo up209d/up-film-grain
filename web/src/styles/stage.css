@@ -59,8 +59,11 @@
   background: var(--mount);
 }
 
+/* `top` and `height` come from JS -- the line marks the edge of the wipe on
+   the *photograph*, so it is placed against the same rect the images are
+   rather than stretched down the pane. */
 .divider {
-  position: absolute; top: 0; bottom: 0; width: 1px;
+  position: absolute; width: 1px;
   background: rgba(255,255,255,.75);
   box-shadow: 0 0 0 1px rgba(0,0,0,.45);
   pointer-events: none;
