@@ -1,8 +1,12 @@
 /** The app bar: open a photo, the seed-on-open switch, and the render readout. */
 
+import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+
 import filmGrain1x1 from "../../assets/film-grain-1x1.jpg";
+import { FRONTEND_VERSION } from "../../models/constants";
 import type { Geom } from "../../models/prescale";
-import type { ImageMeta } from "../../services/api";
+import { getHealth, type HealthInfo, type ImageMeta } from "../../services/api";
 
 /** How long a preview may take before the bar says the config is heavy, in ms.
  *
@@ -44,8 +48,34 @@ export default function TopBar(props: {
   randomizeSeedOnOpen: boolean;
   onRandomizeSeedOnOpen: (v: boolean) => void;
   onRandomizeSeeds: () => void;
+  health?: HealthInfo | null;
 }) {
   const { meta } = props;
+  const [localHealth, setLocalHealth] = useState<HealthInfo | null>(null);
+  const [tooltipPos, setTooltipPos] = useState<{ top: number; right: number } | null>(null);
+  const statusRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!props.health) {
+      getHealth()
+        .then(setLocalHealth)
+        .catch(() => undefined);
+    }
+  }, [props.health]);
+
+  const health = props.health ?? localHealth;
+
+  const openTooltip = () => {
+    const r = statusRef.current?.getBoundingClientRect();
+    if (!r) return;
+    setTooltipPos({
+      top: r.bottom + 8,
+      right: Math.max(12, window.innerWidth - r.right),
+    });
+  };
+
+  const closeTooltip = () => setTooltipPos(null);
+
   // The device string is the server's own words ("Apple GPU (MPS)", "CUDA",
   // "CPU"), so match on the one that means no accelerator rather than trying to
   // enumerate the others.
@@ -151,28 +181,103 @@ export default function TopBar(props: {
         </button>
       )}
       <div className="spacer" />
-      <span className={`status ${props.rendering ? "busy" : ""}${slow ? " slow" : ""}`}>
-        {props.rendering && <div className="spinner" />}
-        {props.rendering ? "rendering…" : `${props.renderMs}ms`}
-      </span>
-      {slow && (
-        <span className="meta warn">
-          heavy config
-          {lower !== null && (
-            <>
-              {" — "}
-              <button
-                className="linkish"
-                onClick={() => props.onSupersample(lower)}
-                title={`Render at ${lower}× instead of ${props.supersample}×. Supersampling costs roughly its square, so this is about ${Math.round((props.supersample / lower) ** 2 * 10) / 10}× less work.`}
-              >
-                try {lower}×
-              </button>
-            </>
-          )}
+      <div
+        ref={statusRef}
+        className="status-cluster"
+        onMouseEnter={openTooltip}
+        onMouseLeave={closeTooltip}
+        onFocus={openTooltip}
+        onBlur={closeTooltip}
+        tabIndex={0}
+        role="region"
+        aria-label="System status and version information"
+      >
+        <span className={`status ${props.rendering ? "busy" : ""}${slow ? " slow" : ""}`}>
+          {props.rendering && <div className="spinner" />}
+          {props.rendering ? "rendering…" : `${props.renderMs}ms`}
         </span>
-      )}
-      <span className="meta">{props.device}</span>
+        {slow && (
+          <span className="meta warn">
+            heavy config
+            {lower !== null && (
+              <>
+                {" — "}
+                <button
+                  className="linkish"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    props.onSupersample(lower);
+                  }}
+                  title={`Render at ${lower}× instead of ${props.supersample}×. Supersampling costs roughly its square, so this is about ${Math.round((props.supersample / lower) ** 2 * 10) / 10}× less work.`}
+                >
+                  try {lower}×
+                </button>
+              </>
+            )}
+          </span>
+        )}
+        <span className="meta">{props.device || health?.device || "Ready"}</span>
+      </div>
+
+      {tooltipPos &&
+        createPortal(
+          <div
+            className="status-tip"
+            style={{ top: tooltipPos.top, right: tooltipPos.right }}
+            role="tooltip"
+            aria-live="polite"
+          >
+            <div className="status-tip-header">
+              <span className="status-tip-title">
+                <span className={`status-tip-indicator ${props.rendering ? "busy" : ""}`} />
+                System Info
+              </span>
+              <span className="status-tip-badge">
+                {props.rendering ? "RENDERING" : "READY"}
+              </span>
+            </div>
+            <div className="status-tip-grid">
+              <span className="status-tip-label">Frontend Version</span>
+              <span className="status-tip-val">v{FRONTEND_VERSION}</span>
+
+              <span className="status-tip-label">Backend Version</span>
+              <span className="status-tip-val">v{health?.version ?? FRONTEND_VERSION}</span>
+
+              <span className="status-tip-label">Exposed Port</span>
+              <span className="status-tip-val">{health?.port ?? 8000}</span>
+
+              <span className="status-tip-label">Backend Host</span>
+              <span className="status-tip-val">{health?.host ?? "127.0.0.1"}</span>
+
+              <span className="status-tip-label">Compute Device</span>
+              <span className="status-tip-val">{props.device || health?.device || "--"}</span>
+
+              <span className="status-tip-label">Environment</span>
+              <span className="status-tip-val">
+                {health?.env ?? (import.meta.env.DEV ? "development" : "production")}
+              </span>
+
+              {health?.python_version && (
+                <>
+                  <span className="status-tip-label">Python</span>
+                  <span className="status-tip-val">{health.python_version}</span>
+                </>
+              )}
+
+              {health?.torch_version && (
+                <>
+                  <span className="status-tip-label">PyTorch</span>
+                  <span className="status-tip-val">{health.torch_version}</span>
+                </>
+              )}
+            </div>
+            <div className="status-tip-footer">
+              <span>Latency: {props.rendering ? "rendering…" : `${props.renderMs}ms`}</span>
+              <span>Sampling: {props.supersample}×</span>
+            </div>
+          </div>,
+          document.body,
+        )}
     </header>
   );
 }

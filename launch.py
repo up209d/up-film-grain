@@ -377,6 +377,8 @@ def main(argv: list[str] | None = None) -> int:
     # get it so it can start polling.
     sock = bind_socket(args.host, args.port)
     host, port = sock.getsockname()[:2]
+    os.environ["FILM_GRAIN_HOST"] = str(host)
+    os.environ["FILM_GRAIN_PORT"] = str(port)
     url = f"http://{host}:{port}"
     print(f"{_URL_SENTINEL} {url}", flush=True)
 

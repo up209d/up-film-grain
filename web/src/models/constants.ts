@@ -3,6 +3,10 @@
  *  engine's parameters, which are lengths in full-resolution pixels and live
  *  in `params.py`. See docs/client-ui.md. */
 
+import pkg from "../../package.json";
+
+export const FRONTEND_VERSION: string = pkg.version;
+
 /** Renders are not started from the raw value stream -- see `applied` below --
  *  but pans, zooms and typed numbers still arrive in bursts, so requests wait
  *  this long to settle. Short, because a stale preview is worse than a late

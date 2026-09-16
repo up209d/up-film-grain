@@ -84,7 +84,7 @@ export default function App() {
    *  photo. On by default: a repeated seed is the surprising outcome. */
   const [randomizeSeedOnOpen, setRandomizeSeedOnOpen] = useState(true);
 
-  const { schema, device, setDevice, luts, setLuts, booted } = useSchema(setError);
+  const { schema, device, setDevice, health, luts, setLuts, booted } = useSchema(setError);
   // The photo's id is passed in so the edit history starts over when a
   // different one is opened -- a step describing a render that no longer
   // exists is not somewhere you can go back to.
@@ -274,6 +274,7 @@ export default function App() {
         meta={meta}
         geom={geom}
         device={device}
+        health={health}
         rendering={preview.rendering}
         renderMs={preview.renderMs}
         supersample={supersample}

@@ -4,19 +4,35 @@ schema the client builds its panel from, and the LUT registry.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+import os
+import platform
+import torch
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 
+from .. import __version__
 from .. import lut as lutlib
 from .. import params as P
 from ..engine import device_name, diskcache
-from ..runtime import DEVICE, ENGINE
+from ..runtime import DEVICE, ENGINE, IS_DEV
 
 router = APIRouter(prefix="/api")
 
 
 @router.get("/health")
-def health() -> dict:
-    return {"ok": True, "device": device_name(DEVICE)}
+def health(request: Request) -> dict:
+    server_info = request.scope.get("server")
+    host = server_info[0] if server_info else os.environ.get("FILM_GRAIN_HOST", "127.0.0.1")
+    port = server_info[1] if server_info else int(os.environ.get("FILM_GRAIN_PORT", os.environ.get("PORT", 8000)))
+    return {
+        "ok": True,
+        "device": device_name(DEVICE),
+        "version": __version__,
+        "host": host,
+        "port": port,
+        "env": "development" if IS_DEV else "production",
+        "python_version": platform.python_version(),
+        "torch_version": getattr(torch, "__version__", "unknown"),
+    }
 
 
 @router.get("/cache")

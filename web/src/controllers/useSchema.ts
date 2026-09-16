@@ -7,11 +7,19 @@
 
 import { useEffect, useState } from "react";
 
-import { getHealth, getLuts, getSchema, type LutInfo, type Schema } from "../services/api";
+import {
+  getHealth,
+  getLuts,
+  getSchema,
+  type HealthInfo,
+  type LutInfo,
+  type Schema,
+} from "../services/api";
 
 export function useSchema(onError: (msg: string) => void) {
   const [schema, setSchema] = useState<Schema | null>(null);
   const [device, setDevice] = useState("");
+  const [health, setHealth] = useState<HealthInfo | null>(null);
   const [luts, setLuts] = useState<LutInfo[]>([]);
   /** Set once, when the schema lands, so whoever owns the value state can seed
    *  itself from it without this hook needing to know about values at all. */
@@ -25,7 +33,10 @@ export function useSchema(onError: (msg: string) => void) {
       })
       .catch((e) => onError(String(e.message ?? e)));
     getHealth()
-      .then((h) => setDevice(h.device))
+      .then((h) => {
+        setDevice(h.device);
+        setHealth(h);
+      })
       .catch(() => undefined);
     getLuts()
       .then(setLuts)
@@ -34,5 +45,5 @@ export function useSchema(onError: (msg: string) => void) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return { schema, device, setDevice, luts, setLuts, booted };
+  return { schema, device, setDevice, health, luts, setLuts, booted };
 }

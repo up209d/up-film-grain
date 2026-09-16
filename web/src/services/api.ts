@@ -149,7 +149,18 @@ export async function getSchema(): Promise<Schema> {
   return r.json();
 }
 
-export async function getHealth(): Promise<{ device: string }> {
+export interface HealthInfo {
+  ok: boolean;
+  device: string;
+  version: string;
+  host: string;
+  port: number;
+  env: string;
+  python_version: string;
+  torch_version: string;
+}
+
+export async function getHealth(): Promise<HealthInfo> {
   const r = await fetch("/api/health");
   if (!r.ok) return fail(r);
   return r.json();
